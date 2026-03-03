@@ -1,0 +1,15 @@
+[package]
+name = "onboarding-server"
+version = "0.1.0"
+edition = "2021"
+
+# No external dependencies — only std.
+# This is intentional: every dependency adds to binary size, and we have a
+# hard 262144-byte compressed limit from the FCOS ISO initramfs.
+
+[profile.release]
+opt-level = "z"       # optimise for size, not speed
+lto = true            # link-time optimisation strips dead code
+codegen-units = 1     # required for full LTO
+strip = true          # strip all symbols
+panic = "abort"       # smaller panic handler, no unwinding machinery
