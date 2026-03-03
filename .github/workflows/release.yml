@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: node-onboarding-x86_64
+          - target: aarch64-unknown-linux-musl
+            asset: node-onboarding-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install cross-compile tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/node-onboarding ${{ matrix.asset }}
+
+      - name: Create Release and upload binary
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
