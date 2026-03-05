@@ -70,7 +70,7 @@ const SESSION_TTL_SECS: u64 = 86400;     // 24 h
 const UPDATE_INTERVAL_SECS: u64 = 3600;  // 1 h
 
 // ── Embedded zeroclaw skill ────────────────────────────────────────────────────
-const HOLO_NODE_SKILL: &str = include_str!("holo-node.md");
+const HOLO_NODE_SKILL: &str = include_str!("../holo-node.md");
 
 // ── Agent allowed commands — curl and wget removed ────────────────────────────
 const ALLOWED_COMMANDS: &str = concat!(
@@ -174,7 +174,7 @@ fn sha256_of(input: &str) -> String {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input.as_bytes());
     }
-    let out = child.wait_with_output().unwrap_or_default();
+    let out = child.wait_with_output().unwrap_or_else(|_| std::process::Output { status: std::process::ExitStatus::from_raw(1), stdout: vec![], stderr: vec![] });
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
