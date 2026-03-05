@@ -174,12 +174,10 @@ fn sha256_of(input: &str) -> String {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input.as_bytes());
     }
-    let out = child.wait_with_output().unwrap_or_else(|_| std::process::Output { status: std::process::ExitStatus::from(1), stdout: vec![], stderr: vec![] });
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    let stdout = child.wait_with_output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    stdout.split_whitespace().next().unwrap_or("").to_string()
 }
 
 /// Stored format: `sha256:<16-hex-salt>:<64-hex-sha256>`
