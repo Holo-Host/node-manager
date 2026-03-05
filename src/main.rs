@@ -1355,7 +1355,8 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
         <div id="pc-openrouter" class="pc">
           <label>OpenRouter API Key *</label><input type="password" id="pr-key" placeholder="sk-or-...">
           <div class="hint">Free key at <a href="https://openrouter.ai/keys" target="_blank">openrouter.ai</a></div>
-          <label>Model</label><select id="pr-mdl"><option value="openrouter/auto">auto (best available)</option><option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option><option value="anthropic/claude-sonnet-4-6">anthropic/claude-sonnet</option><option value="meta-llama/llama-3.3-70b-instruct">llama-3.3-70b (free)</option></select>
+          <label>Model ID *</label><input type="text" id="pr-mdl" placeholder="openrouter/auto" value="openrouter/auto">
+          <div class="hint">Leave as <code>openrouter/auto</code> for the best default, or enter a specific OpenRouter Model ID (e.g., <code>stepfun/step-3.5-flash:free</code>) if you are using strict API key guardrails.</div>
         </div>
         <div id="pc-ollama" class="pc">
           <div class="info-box">Ollama must be running on this node or local network. No API key needed.</div>
@@ -1723,7 +1724,8 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
           </div>
           <div id="mp-openrouter" class="provider-creds{vis_openrouter}">
             <label>OpenRouter API Key</label><input type="password" id="m-rkey" placeholder="sk-or-...">
-            <label>Model</label><select id="m-rmdl"><option value="openrouter/auto">auto</option><option value="google/gemini-2.5-flash">google/gemini-2.5-flash</option><option value="anthropic/claude-sonnet-4-6">anthropic/claude-sonnet</option></select>
+            <label>Model ID</label><input type="text" id="m-rmdl" placeholder="openrouter/auto">
+            <div class="hint" style="font-size: 11px; margin-top: 4px; color: #475569;">Use <code>openrouter/auto</code> or enter a specific Model ID to match your API guardrails.</div>
           </div>
           <div id="mp-ollama" class="provider-creds{vis_ollama}">
             <label>Ollama URL</label><input type="url" id="m-lurl" value="http://127.0.0.1:11434">
