@@ -1,4 +1,4 @@
-# node-onboarding
+# node-manager
 
 The onboarding and management server that ships inside every Holo Node.
 
@@ -25,7 +25,7 @@ It is a single Rust binary with zero external dependencies — no Tokio, no Axum
 ## How it fits into the system
 
 ```
-holo-host/holo-node-iso          holo-host/node-onboarding
+holo-host/holo-node-iso          holo-host/node-manager
         │                                  │
         │  Butane YAML + build scripts     │  source + release pipeline
         │                                  │
@@ -34,12 +34,12 @@ holo-host/holo-node-iso          holo-host/node-onboarding
         │                                  │  every version tag
         ▼                                  │
 ┌─────────────────────┐                    ▼
-│   Holo Node ISO     │       node-onboarding-x86_64
-│                     │       node-onboarding-aarch64
+│   Holo Node ISO     │       node-manager-x86_64
+│                     │       node-manager-aarch64
 │  node-setup.sh ─────┼──────────────────────────────►  downloaded at first boot
 │  (inlined script)   │
 │                     │
-│  node-onboarding    │   After first boot, the binary
+│  node-manager    │   After first boot, the binary
 │  .service (systemd) │   checks GitHub Releases hourly
 │                     │   and replaces itself in-place
 └─────────────────────┘   without needing a new ISO.
