@@ -56,7 +56,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.0.11";
+const VERSION: &str = "5.0.12";
 const STATE_FILE: &str = "/etc/node-onboarding/state";
 const AUTH_FILE: &str = "/etc/node-onboarding/auth";
 const PROVIDER_FILE: &str = "/etc/node-onboarding/provider";   // chmod 600
@@ -899,6 +899,33 @@ fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     }
     *state.hw_mode.lock().unwrap() = new_mode.to_string();
     update_state_key("hw_mode", new_mode);
+}
+
+fn write_zeroclaw_env(provider: &str, api_key: &str) {
+    let dropin_dir = "/etc/systemd/system/zeroclaw-daemon.service.d";
+    let conf_path = format!("{}/api-key.conf", dropin_dir);
+
+    // Match the correct env var for the chosen provider
+    let env_var = match provider {
+        "openrouter" => "OPENROUTER_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "google" => "GEMINI_API_KEY",
+        _ => {
+            // If Ollama or Holo (no API key needed), delete the override
+            let _ = fs::remove_file(&conf_path);
+            let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+            return;
+        }
+    };
+
+    // Write the systemd override
+    let _ = fs::create_dir_all(dropin_dir);
+    let dropin_content = format!("[Service]\nEnvironment=\"{}={}\"\n", env_var, api_key);
+    let _ = fs::write(&conf_path, dropin_content);
+    
+    // Reload systemd to apply the new environment variable
+    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 }
 
 // ── JSON / TOML / HTML helpers ─────────────────────────────────────────────────
@@ -2192,6 +2219,8 @@ fn handle_submit(
             return;
         }
 
+        write_zeroclaw_env(provider, api_key);
+
         let config = match fs::read_to_string("/etc/zeroclaw/config.toml") {
             Ok(c) => c,
             Err(e) => {
@@ -2413,6 +2442,8 @@ fn handle_provider_swap(stream: &mut TcpStream, req: &Req, state: &AppState) {
         send_json_err(stream, 500, &e);
         return;
     }
+
+    write_zeroclaw_env(provider, api_key);
 
     // Re-apply patches, preserving existing channel config
     let config = match fs::read_to_string("/etc/zeroclaw/config.toml") {
