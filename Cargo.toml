@@ -1,6 +1,6 @@
 [package]
 name = "node-onboarding"
-version = "5.0.10"
+version = "5.0.11"
 edition = "2021"
 
 # No external dependencies — only std.

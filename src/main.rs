@@ -56,7 +56,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.0.10";
+const VERSION: &str = "5.0.11";
 const STATE_FILE: &str = "/etc/node-onboarding/state";
 const AUTH_FILE: &str = "/etc/node-onboarding/auth";
 const PROVIDER_FILE: &str = "/etc/node-onboarding/provider";   // chmod 600
@@ -787,19 +787,20 @@ fn check_and_apply_update(repo: &str) {
 }
 
 fn find_asset_download_url(release_json: &str, asset_name: &str) -> String {
-    // Find the asset object by name, then grab browser_download_url nearby.
     let needle = format!("\"name\":\"{}\"", asset_name);
     let pos = match release_json.find(&needle) {
         Some(p) => p,
         None => return String::new(),
     };
-    let window_end = (pos + 600).min(release_json.len());
-    let window = &release_json[pos..window_end];
+    
+    let window = &release_json[pos..]; 
     let url_key = "\"browser_download_url\":\"";
+    
     let url_pos = match window.find(url_key) {
         Some(p) => p,
         None => return String::new(),
     };
+    
     let after = &window[url_pos + url_key.len()..];
     after[..after.find('"').unwrap_or(0)].to_string()
 }
