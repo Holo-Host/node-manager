@@ -1,4 +1,4 @@
-// Holo Node Manager Server — v5.1.1
+// Holo Node Manager Server — v5.1.2
 //
 // Changes from v5.0.x:
 //   - All 20 channels supported in onboarding and /manage:
@@ -53,7 +53,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.1.1";
+const VERSION: &str = "5.1.2";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
