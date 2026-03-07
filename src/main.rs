@@ -1,4 +1,4 @@
-// Holo Node Manager Server — v5.2.0
+// Holo Node Manager Server — v5.2.1
 //
 // Changes from v5.1.2:
 //   - /manage: new Autonomy section — view and switch agent autonomy level post-onboarding
@@ -41,7 +41,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.2.0";
+const VERSION: &str = "5.2.1";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
@@ -1734,18 +1734,15 @@ fn build_manage_html(state: &AppState) -> String {
         Err(_) => "supervised".to_string(),
     };
     let autonomy_display = match autonomy.as_str() {
-        "readonly" => "Read-Only",
-        "full" => "Full Autonomy",
-        _ => "Supervised",
+        "full" | "supervised" => "Operator",
+        _ => "Advisor",
     };
     let au_badge_class = match autonomy.as_str() {
-        "readonly" => "badge-gray",
-        "full" => "badge-orange",
-        _ => "badge-green",
+        "full" | "supervised" => "badge-green",
+        _ => "badge-gray",
     };
-    let sel_readonly = if autonomy == "readonly" { " sel" } else { "" };
-    let sel_supervised = if autonomy == "supervised" || (autonomy != "readonly" && autonomy != "full") { " sel" } else { "" };
-    let sel_full = if autonomy == "full" { " sel" } else { "" };
+    let sel_operator = if autonomy == "full" || autonomy == "supervised" { " sel" } else { "" };
+    let sel_advisor = if autonomy == "readonly" { " sel" } else { "" };
     let ssh_keys  = read_ssh_keys();
     let uptime_s  = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip        = get_local_ip();
@@ -1909,22 +1906,17 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
       <span class="section-arrow" id="arr-au">▼</span>
     </div>
     <div class="section-body" id="sec-au">
-      <div class="info-box" style="margin-top:0;margin-bottom:14px">Controls what the AI agent can do without asking first. Changes take effect after an agent restart.</div>
-      <div class="hw-opts" id="au-opts">
-        <div class="hw-opt{sel_readonly}" onclick="selAu('readonly',this)">
-          <div class="hw-opt-name">👁 Read-Only</div>
-          <div class="hw-opt-desc">Observe and answer. Cannot execute commands.</div>
+     <div class="hw-opts" id="au-opts">
+        <div class="hw-opt{sel_operator}" onclick="selAu('operator',this)">
+          <div class="hw-opt-name">⚡ Operator Autonomy</div>
+          <div class="hw-opt-desc">The human directs their agent who has permission to run the commands required to operate the node.</div>
         </div>
-        <div class="hw-opt{sel_supervised}" onclick="selAu('supervised',this)">
-          <div class="hw-opt-name">✋ Supervised</div>
-          <div class="hw-opt-desc">Plans actions, waits for your approval.</div>
-        </div>
-        <div class="hw-opt{sel_full}" onclick="selAu('full',this)">
-          <div class="hw-opt-name">⚡ Full Autonomy</div>
-          <div class="hw-opt-desc">Acts immediately, notifies after.</div>
+        <div class="hw-opt{sel_advisor}" onclick="selAu('advisor',this)">
+          <div class="hw-opt-name">🔒 Advisor Autonomy</div>
+          <div class="hw-opt-desc">The agent has read-only access, and the human chooses which commands to manually execute via SSH.</div>
         </div>
       </div>
-      <div class="fw" id="au-fw" style="display:{au_fw_vis}"><strong>⚠ Full Autonomy</strong> — the agent acts without asking first.<label><input type="checkbox" id="au-fc" onchange="chkAuSave()"> I understand and accept full autonomy</label></div>
+      <div class="info-box" id="au-info" style="margin-top:0;background:#0f1f2e;border-color:#1e3a5f;color:#93c5fd;display:{au_info_vis}"><strong>🛡 Risk surface is well contained.</strong> A strict command allowlist is already enforced — <code>curl</code> and <code>wget</code> are blocked. The agent can only write inside <code>/var/lib/zeroclaw/workspace</code> (enforced by <code>allowed_roots</code>) and cannot touch system files (enforced by <code>forbidden_paths</code>).</div>
       <div style="margin-top:12px"><button class="btn btn-primary" id="au-save-btn" onclick="saveAutonomy()">Save Autonomy</button></div>
     </div>
   </div>
@@ -2194,26 +2186,22 @@ function selHw(mode,el){{
   el.classList.add('sel');
 }}
 
-let mAu='{autonomy}';
+let mAu='{autonomy_key}';
 function selAu(lvl,el){{
   mAu=lvl;
   document.querySelectorAll('#au-opts .hw-opt').forEach(o=>o.classList.remove('sel'));
   el.classList.add('sel');
-  const fw=document.getElementById('au-fw');
-  fw.style.display=lvl==='full'?'block':'none';
-  if(lvl!=='full')document.getElementById('au-fc').checked=false;
-  chkAuSave();
-}}
-function chkAuSave(){{
-  document.getElementById('au-save-btn').disabled=(mAu==='full'&&!document.getElementById('au-fc').checked);
+  const info=document.getElementById('au-info');
+  if(info)info.style.display=lvl==='operator'?'block':'none';
 }}
 async function saveAutonomy(){{
+  const levelMap={{operator:'full',advisor:'readonly'}};
+  const nameMap={{operator:'Operator',advisor:'Advisor'}};
   try{{
-    await api('/manage/autonomy',{{level:mAu}});
-    const names={{readonly:'Read-Only',supervised:'Supervised',full:'Full Autonomy'}};
-    document.getElementById('badge-au').textContent=names[mAu]||mAu;
-    document.getElementById('badge-au').className='section-badge '+(mAu==='readonly'?'badge-gray':mAu==='full'?'badge-orange':'badge-green');
-    toast('Autonomy set to '+(names[mAu]||mAu)+' — agent restarting…',true);
+    await api('/manage/autonomy',{{level:levelMap[mAu]||mAu}});
+    document.getElementById('badge-au').textContent=nameMap[mAu]||mAu;
+    document.getElementById('badge-au').className='section-badge '+(mAu==='operator'?'badge-green':'badge-gray');
+    toast('Autonomy set to '+(nameMap[mAu]||mAu)+' — agent restarting…',true);
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
@@ -2283,11 +2271,10 @@ async function triggerUpdate(){{
         autonomy_section_vis = if agent_on { "" } else { "display:none" },
         au_badge_class    = au_badge_class,
         autonomy_display  = autonomy_display,
-        sel_readonly      = sel_readonly,
-        sel_supervised    = sel_supervised,
-        sel_full          = sel_full,
-        au_fw_vis         = if autonomy == "full" { "block" } else { "none" },
-        autonomy          = html_escape(&autonomy),
+        sel_operator         = sel_operator,
+        sel_advisor          = sel_advisor,
+        au_info_vis          = if autonomy == "full" || autonomy == "supervised" { "block" } else { "none" },
+        autonomy_key         = if autonomy == "readonly" { "advisor" } else { "operator" },
         vis_ollama        = vis("ollama"),
     )
 }
