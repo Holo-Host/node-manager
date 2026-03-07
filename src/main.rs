@@ -1,55 +1,47 @@
-// Holo Node Manager Server — v5
+// Holo Node Manager Server — v5.1.0
 //
-// Changes from v4:
-//   - Server stays running permanently. GET / redirects to /manage after onboarding.
-//   - Password-protected UI. Password is generated on first run, displayed on HDMI
-//     (/dev/tty1) with ANSI colours and the node's local IP address.
-//   - SSH key management for the `holo` user (/home/holo/.ssh/authorized_keys).
-//     Step 1 of onboarding collects node name + first SSH public key.
-//     /manage lets operators add/remove keys without USB access.
-//   - AI agent is 100% opt-in. Step 2 has a toggle (default OFF). If off, the
-//     OpenClaw fork is never installed; the node is SSH + container management only.
-//   - /manage page: SSH keys, agent toggle, provider hot-swap, hardware mode switch,
-//     password change, manual software update trigger. All operations functional.
-//   - Self-update: background thread polls GitHub Releases API hourly. On a new
-//     tag it downloads the arch-matched binary, atomically replaces the running
-//     binary and calls `systemctl restart node-manager.service`.
-//   - node_name replaces tgUid as the hostname slug.
-//     Wind-tunnel hostname: nomad-client-{node_name}
-//   - Wind-tunnel image also uses resolve_image() for ARM (prefix "latest-").
-//   - curl and wget removed from agent allowed_commands.
-//   - OpenClaw fork abstraction: OPENCLAW_FORKS / ACTIVE_OPENCLAW_FORK constants
-//     control which fork is active. patch_openclaw_update_script() rewrites
-//     /usr/local/bin/openclaw-update.sh on every startup so the hourly timer
-//     always pulls from the correct repo. Switching forks fleet-wide is a single
-//     constant change + release tag.
+// Changes from v5.0.x:
+//   - All 20 channels supported in onboarding and /manage:
+//     CLI, Telegram, Discord, Slack, WhatsApp, Signal, iMessage,
+//     Email, Mattermost, Nextcloud Talk, Linq, Webhook,
+//     Matrix, IRC, Nostr,
+//     DingTalk, QQ, Lark, Feishu
+//   - /manage: new Channels section — add or remove any channel
+//     at any time without re-onboarding.
+//   - New routes: POST /manage/channels/add, POST /manage/channels/remove
+//   - Bug fix: handle_submit checks for /usr/local/bin/openclaw before
+//     calling run_openclaw_onboard; if missing, triggers
+//     openclaw-update.service --wait so onboarding never races the
+//     OnBootSec=10min timer.
+//   - Bug fix: handle_provider_swap and handle_agent_toggle now save
+//     channel config BEFORE run_openclaw_onboard (which overwrites
+//     config.toml with a fresh skeleton), then reapply it after.
+//   - OpenClaw fork abstraction (unchanged from v5.0.x)
 //
 // Routes:
-//   GET  /              → onboarding wizard (pre-onboard) or redirect /manage
-//   POST /submit        → run onboarding
-//   GET  /login         → login page
-//   POST /login         → authenticate, set session cookie
-//   POST /logout        → clear session cookie
-//   GET  /manage        → management panel (auth required)
-//   GET  /manage/status → JSON current state (auth required)
-//   POST /manage/ssh/add    → add SSH public key
-//   POST /manage/ssh/remove → remove SSH key by index
-//   POST /manage/agent      → enable/disable agent
-//   POST /manage/provider   → hot-swap provider/model/key
-//   POST /manage/hardware   → switch STANDARD ↔ WIND_TUNNEL
-//   POST /manage/password   → change node password
-//   POST /manage/update     → trigger immediate update check
-//
-// Boot sequence:
-//   install-openclaw.service  (first boot, only if agent was enabled at onboarding)
-//        ↓ After=
-//   node-manager.service      (permanent — runs indefinitely)
+//   GET  /                      → wizard or redirect /manage
+//   POST /submit                → run onboarding
+//   GET  /login                 → login page
+//   POST /login                 → authenticate, set session cookie
+//   POST /logout                → clear session
+//   GET  /manage                → management panel (auth required)
+//   GET  /manage/status         → JSON state snapshot (auth required)
+//   POST /manage/ssh/add        → add SSH key
+//   POST /manage/ssh/remove     → remove SSH key by index
+//   POST /manage/agent          → enable/disable agent
+//   POST /manage/provider       → hot-swap provider/model/key
+//   POST /manage/hardware       → switch STANDARD ↔ WIND_TUNNEL
+//   POST /manage/password       → change node password
+//   POST /manage/update         → trigger immediate update check
+//   POST /manage/channels/add   → add or replace a channel config
+//   POST /manage/channels/remove → remove a channel config
 
 use std::{
     collections::HashMap,
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    path::Path,
     process::Command,
     sync::{
         Arc, Mutex,
@@ -61,37 +53,28 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.0.14";
+const VERSION: &str = "5.1.0";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
-const PROVIDER_FILE: &str = "/etc/node-manager/provider";   // chmod 600
+const PROVIDER_FILE: &str = "/etc/node-manager/provider";
 const SKILLS_DIR: &str = "/etc/openclaw/skills";
 const QUADLET_DIR: &str = "/etc/containers/systemd";
 const WORKSPACE_DIR: &str = "/var/lib/openclaw/workspace";
 const AUTHORIZED_KEYS: &str = "/home/holo/.ssh/authorized_keys";
+const OPENCLAW_CONFIG: &str = "/etc/openclaw/config.toml";
 const UPDATE_REPO_ENV: &str = "UPDATE_REPO";
 const UPDATE_REPO_DEFAULT: &str = "holo-host/node-manager";
-const SESSION_TTL_SECS: u64 = 86400;     // 24 h
-const UPDATE_INTERVAL_SECS: u64 = 3600;  // 1 h
+const SESSION_TTL_SECS: u64 = 86400;
+const UPDATE_INTERVAL_SECS: u64 = 3600;
 
 // ── OpenClaw fork abstraction ──────────────────────────────────────────────────
-//
-// To switch all nodes to a different OpenClaw fork:
-//   1. Add the fork to OPENCLAW_FORKS (or confirm it's already there).
-//   2. Change ACTIVE_OPENCLAW_FORK to its `id`.
-//   3. Bump VERSION, tag and push a release.
-//
-// patch_openclaw_update_script() runs on every startup and rewrites the fork
-// config block in /usr/local/bin/openclaw-update.sh from these constants.
-// The next openclaw-update.timer tick will then pull from the new fork.
-// No ISO rebuild or SSH access to nodes is required.
 
 struct OpenClawFork {
-    id:           &'static str, // stable key persisted to state file
-    display_name: &'static str, // shown in logs
-    repo:         &'static str, // GitHub "owner/repo"
-    asset_prefix: &'static str, // asset = {prefix}-{triple}.tar.gz
-    binary_name:  &'static str, // name of binary inside the tar
+    id:           &'static str,
+    display_name: &'static str,
+    repo:         &'static str,
+    asset_prefix: &'static str,
+    binary_name:  &'static str,
 }
 
 const OPENCLAW_FORKS: &[OpenClawFork] = &[
@@ -102,18 +85,9 @@ const OPENCLAW_FORKS: &[OpenClawFork] = &[
         asset_prefix: "zeroclaw",
         binary_name:  "zeroclaw",
     },
-    // future forks added here, e.g.:
-    // OpenClawFork {
-    //     id:           "somefork",
-    //     display_name: "SomeFork",
-    //     repo:         "some-org/somefork",
-    //     asset_prefix: "somefork",
-    //     binary_name:  "somefork",
-    // },
 ];
 
 const ACTIVE_OPENCLAW_FORK: &str = "zeroclaw";
-
 const OPENCLAW_UPDATE_SCRIPT: &str = "/usr/local/bin/openclaw-update.sh";
 
 fn active_fork() -> &'static OpenClawFork {
@@ -123,47 +97,31 @@ fn active_fork() -> &'static OpenClawFork {
         .expect("ACTIVE_OPENCLAW_FORK must match an entry in OPENCLAW_FORKS")
 }
 
-/// Rewrites the fork config block at the top of openclaw-update.sh from the
-/// compiled-in OPENCLAW_FORKS / ACTIVE_OPENCLAW_FORK constants. Called once on
-/// startup before the update checker spawns, so the hourly timer always pulls
-/// from whichever fork is active in this binary.
 fn patch_openclaw_update_script() {
     let fork = active_fork();
     let current = match fs::read_to_string(OPENCLAW_UPDATE_SCRIPT) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("[openclaw] Could not read {}: {}", OPENCLAW_UPDATE_SCRIPT, e);
-            return;
-        }
+        Err(e) => { eprintln!("[openclaw] Could not read {}: {}", OPENCLAW_UPDATE_SCRIPT, e); return; }
     };
-
-    let patched: String = current
-        .lines()
-        .map(|line| {
-            let t = line.trim_start();
-            if      t.starts_with("OPENCLAW_FORK_ID=")     { format!("OPENCLAW_FORK_ID=\"{}\"",     fork.id) }
-            else if t.starts_with("OPENCLAW_REPO=")         { format!("OPENCLAW_REPO=\"{}\"",         fork.repo) }
-            else if t.starts_with("OPENCLAW_ASSET_PREFIX=") { format!("OPENCLAW_ASSET_PREFIX=\"{}\"", fork.asset_prefix) }
-            else if t.starts_with("OPENCLAW_BINARY_NAME=")  { format!("OPENCLAW_BINARY_NAME=\"{}\"",  fork.binary_name) }
-            else { line.to_string() }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
+    let patched: String = current.lines().map(|line| {
+        let t = line.trim_start();
+        if      t.starts_with("OPENCLAW_FORK_ID=")     { format!("OPENCLAW_FORK_ID=\"{}\"",     fork.id) }
+        else if t.starts_with("OPENCLAW_REPO=")         { format!("OPENCLAW_REPO=\"{}\"",         fork.repo) }
+        else if t.starts_with("OPENCLAW_ASSET_PREFIX=") { format!("OPENCLAW_ASSET_PREFIX=\"{}\"", fork.asset_prefix) }
+        else if t.starts_with("OPENCLAW_BINARY_NAME=")  { format!("OPENCLAW_BINARY_NAME=\"{}\"",  fork.binary_name) }
+        else { line.to_string() }
+    }).collect::<Vec<_>>().join("\n");
     if patched != current {
         eprintln!("[openclaw] Patching {} → fork={}", OPENCLAW_UPDATE_SCRIPT, fork.display_name);
         let _ = fs::write(OPENCLAW_UPDATE_SCRIPT, &patched);
         let _ = Command::new("chmod").args(["+x", OPENCLAW_UPDATE_SCRIPT]).output();
-    } else {
-        eprintln!("[openclaw] Fork config already correct ({})", fork.display_name);
     }
 }
 
-// ── Embedded openclaw skill ────────────────────────────────────────────────────
-const HOLO_NODE_SKILL: &str = include_str!("../holo-node.md");
-const SOUL_SKILL: &str = include_str!("../soul.md");
+// ── Embedded skill + allowed commands ─────────────────────────────────────────
 
-// ── Agent allowed commands — curl and wget removed ────────────────────────────
+const HOLO_NODE_SKILL: &str = include_str!("../holo-node.md");
+
 const ALLOWED_COMMANDS: &str = concat!(
     r#"["ls", "cat", "grep", "find", "head", "tail", "wc", "echo", "#,
     r#""pwd", "date", "git", "#,
@@ -205,7 +163,7 @@ impl AppState {
     }
 }
 
-// ── State file helpers (key=value, one per line) ───────────────────────────────
+// ── State file helpers ─────────────────────────────────────────────────────────
 
 fn read_state_file() -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -230,13 +188,11 @@ fn update_state_key(key: &str, value: &str) {
     write_state_file(&kv);
 }
 
-// ── Crypto / random helpers ────────────────────────────────────────────────────
+// ── Crypto / auth helpers ──────────────────────────────────────────────────────
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
+    if let Ok(mut f) = fs::File::open("/dev/urandom") { let _ = f.read_exact(&mut buf); }
     buf
 }
 
@@ -244,13 +200,9 @@ fn random_hex(n: usize) -> String {
     random_bytes(n).iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// 12-char human-readable password; avoids ambiguous characters (0/O, 1/l/I).
 fn generate_password() -> String {
     let alpha: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-    random_bytes(12)
-        .iter()
-        .map(|&b| alpha[(b as usize) % alpha.len()] as char)
-        .collect()
+    random_bytes(12).iter().map(|&b| alpha[(b as usize) % alpha.len()] as char).collect()
 }
 
 fn sha256_of(input: &str) -> String {
@@ -258,20 +210,12 @@ fn sha256_of(input: &str) -> String {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input.as_bytes());
-    }
-    let stdout = child.wait_with_output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    stdout.split_whitespace().next().unwrap_or("").to_string()
+    { Ok(c) => c, Err(_) => return String::new() };
+    if let Some(mut s) = child.stdin.take() { let _ = s.write_all(input.as_bytes()); }
+    let out = child.wait_with_output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    out.split_whitespace().next().unwrap_or("").to_string()
 }
 
-/// Stored format: `sha256:<16-hex-salt>:<64-hex-sha256>`
 fn hash_password(password: &str) -> String {
     let salt = random_hex(8);
     let hash = sha256_of(&format!("{}:{}", salt, password));
@@ -280,21 +224,15 @@ fn hash_password(password: &str) -> String {
 
 fn verify_password(input: &str, stored: &str) -> bool {
     let parts: Vec<&str> = stored.trim().splitn(3, ':').collect();
-    if parts.len() != 3 || parts[0] != "sha256" {
-        return false;
-    }
+    if parts.len() != 3 || parts[0] != "sha256" { return false; }
     let actual = sha256_of(&format!("{}:{}", parts[1], input));
     !actual.is_empty() && actual == parts[2].trim()
 }
 
-// ── First-run auth: generate or load password hash ────────────────────────────
-
 fn load_or_create_auth() -> String {
     if let Ok(h) = fs::read_to_string(AUTH_FILE) {
         let h = h.trim().to_string();
-        if !h.is_empty() {
-            return h;
-        }
+        if !h.is_empty() { return h; }
     }
     let password = generate_password();
     let hash = hash_password(&password);
@@ -307,53 +245,31 @@ fn load_or_create_auth() -> String {
 
 fn get_local_ip() -> String {
     Command::new("sh")
-        .args(["-c",
-            "ip -4 addr show scope global | grep -oP '(?<=inet )\\d+\\.\\d+\\.\\d+\\.\\d+' | head -1"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() { None } else { Some(s) }
-        })
+        .args(["-c", "ip -4 addr show scope global | grep -oP '(?<=inet )\\d+\\.\\d+\\.\\d+\\.\\d+' | head -1"])
+        .output().ok()
+        .and_then(|o| { let s = String::from_utf8_lossy(&o.stdout).trim().to_string(); if s.is_empty() { None } else { Some(s) } })
         .unwrap_or_else(|| "<node-ip>".to_string())
 }
 
-/// Write password + access instructions to /dev/tty1 (HDMI) in colour.
-/// Also logged to stderr so it appears in the systemd journal.
 fn display_password_on_tty(password: &str) {
     let ip = get_local_ip();
     let msg = format!(
-        "\x1b[2J\x1b[H\
-         \n\
+        "\x1b[2J\x1b[H\n\
          \x1b[1;36m  ╔══════════════════════════════════════════╗\n\
-         \x1b[1;36m  ║      🜲  HOLO NODE SETUP        ║\n\
-         \x1b[1;36m  ╚══════════════════════════════════════════╝\x1b[0m\n\
-         \n\
+         \x1b[1;36m  ║      🜲  HOLO NODE SETUP                 ║\n\
+         \x1b[1;36m  ╚══════════════════════════════════════════╝\x1b[0m\n\n\
          \x1b[1m  Open a browser on your local network and visit:\x1b[0m\n\
-         \x1b[1;33m  http://{}:8080\x1b[0m\n\
-         \n\
+         \x1b[1;33m  http://{}:8080\x1b[0m\n\n\
          \x1b[1m  One-time setup password:\x1b[0m\n\
-         \x1b[1;32m  {}\x1b[0m\n\
-         \n\
-         \x1b[31m  ⚠  Write this password down and store it securely.\x1b[0m\n\
-         \x1b[31m     It will NOT show again after setup and CANNOT be recovered if lost.\x1b[0m\n\
-         \x1b[31m     You can change it later in the /manage panel.\x1b[0m\n\
-         \n",
+         \x1b[1;32m  {}\x1b[0m\n\n\
+         \x1b[31m  ⚠  Write this password down. It will NOT show again.\x1b[0m\n\n",
         ip, password
     );
-    if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty1") {
-        let _ = tty.write_all(msg.as_bytes());
-    }
-    let issue = format!(
-        "\n\x1b[1;36m╔══════════════════════════════════════════╗\x1b[0m\n         \x1b[1;36m║      HOLO NODE SETUP                     ║\x1b[0m\n         \x1b[1;36m╚══════════════════════════════════════════╝\x1b[0m\n         \x1b[1mURL:\x1b[0m      http://{}:8080\n         \x1b[1mPassword:\x1b[0m \x1b[1;32m{}\x1b[0m\n         \x1b[31m⚠  Write this down — it cannot be recovered.\x1b[0m\n\n",
-        ip, password
-    );
+    if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty1") { let _ = tty.write_all(msg.as_bytes()); }
+    let issue = format!("\n\x1b[1;36m╔═══════════════════════════════╗\x1b[0m\n\x1b[1;36m║  HOLO NODE SETUP              ║\x1b[0m\n\x1b[1;36m╚═══════════════════════════════╝\x1b[0m\n\x1b[1mURL:\x1b[0m      http://{}:8080\n\x1b[1mPassword:\x1b[0m \x1b[1;32m{}\x1b[0m\n\n", ip, password);
     let _ = fs::create_dir_all("/run/issue.d");
     let _ = fs::write("/run/issue.d/51-node-manager.issue", issue.as_bytes());
-    eprintln!(
-        "[onboard] *** SETUP PASSWORD: {} | URL: http://{}:8080 ***",
-        password, ip
-    );
+    eprintln!("[onboard] *** SETUP PASSWORD: {} | URL: http://{}:8080 ***", password, ip);
 }
 
 // ── Session management ─────────────────────────────────────────────────────────
@@ -368,44 +284,29 @@ fn create_session(state: &AppState) -> String {
 }
 
 fn is_authenticated(req: &Req, state: &AppState) -> bool {
-    let token = match get_cookie(&req.headers, "session") {
-        Some(t) => t,
-        None => return false,
-    };
+    let token = match get_cookie(&req.headers, "session") { Some(t) => t, None => return false };
     let mut sessions = state.sessions.lock().unwrap();
     match sessions.get(&token) {
         Some(&exp) if SystemTime::now() < exp => true,
-        Some(_) => {
-            sessions.remove(&token);
-            false
-        }
+        Some(_) => { sessions.remove(&token); false }
         None => false,
     }
 }
 
-fn session_cookie(token: &str) -> String {
-    format!("session={}; HttpOnly; SameSite=Strict; Path=/", token)
-}
-
-fn clear_cookie() -> String {
-    "session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".to_string()
-}
+fn session_cookie(token: &str) -> String { format!("session={}; HttpOnly; SameSite=Strict; Path=/", token) }
+fn clear_cookie() -> String { "session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".to_string() }
 
 // ── SSH key management ─────────────────────────────────────────────────────────
 
 fn read_ssh_keys() -> Vec<String> {
-    fs::read_to_string(AUTHORIZED_KEYS)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect()
+    fs::read_to_string(AUTHORIZED_KEYS).unwrap_or_default()
+        .lines().map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#')).collect()
 }
 
 fn write_ssh_keys(keys: &[String]) -> Result<(), String> {
     let _ = fs::create_dir_all("/home/holo/.ssh");
-    let content = keys.join("\n") + "\n";
-    fs::write(AUTHORIZED_KEYS, &content).map_err(|e| e.to_string())?;
+    fs::write(AUTHORIZED_KEYS, keys.join("\n") + "\n").map_err(|e| e.to_string())?;
     let _ = Command::new("chown").args(["-R", "holo:holo", "/home/holo/.ssh"]).output();
     let _ = Command::new("chmod").args(["700", "/home/holo/.ssh"]).output();
     let _ = Command::new("chmod").args(["600", AUTHORIZED_KEYS]).output();
@@ -414,107 +315,53 @@ fn write_ssh_keys(keys: &[String]) -> Result<(), String> {
 
 fn is_valid_ssh_pubkey(key: &str) -> bool {
     let k = key.trim();
-    k.starts_with("ssh-ed25519 ")
-        || k.starts_with("ssh-rsa ")
-        || k.starts_with("ecdsa-sha2-")
-        || k.starts_with("sk-ssh-")
+    k.starts_with("ssh-ed25519 ") || k.starts_with("ssh-rsa ") || k.starts_with("ecdsa-sha2-") || k.starts_with("sk-ssh-")
 }
 
 // ── Image resolvers ────────────────────────────────────────────────────────────
 
 fn detect_arch() -> String {
-    Command::new("uname")
-        .arg("-m")
-        .output()
+    Command::new("uname").arg("-m").output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "x86_64".to_string())
 }
 
 fn resolve_image(image_ref: &str, arm64_prefix: &str) -> String {
     let arch = detect_arch();
-    eprintln!("[onboard] arch={} image={}", arch, image_ref);
-
-    if arch != "aarch64" {
-        return format!("{}:latest", image_ref);
-    }
-
-    eprintln!("[onboard] aarch64 — inspecting :latest manifest");
+    if arch != "aarch64" { return format!("{}:latest", image_ref); }
     let manifest = Command::new("skopeo")
         .args(["inspect", "--raw", &format!("docker://{}:latest", image_ref)])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
-    if manifest.contains("arm64") || manifest.contains("aarch64") {
-        eprintln!("[onboard] {}:latest has arm64 manifest", image_ref);
-        return format!("{}:latest", image_ref);
-    }
-
-    eprintln!("[onboard] {}:latest is x86-only — querying GHCR tags", image_ref);
+        .output().ok().filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    if manifest.contains("arm64") || manifest.contains("aarch64") { return format!("{}:latest", image_ref); }
     let repo_path = image_ref.trim_start_matches("ghcr.io/");
-
     let token_json = Command::new("curl")
-        .args(["-sf",
-            &format!("https://ghcr.io/token?scope=repository:{}:pull&service=ghcr.io", repo_path)])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
+        .args(["-sf", &format!("https://ghcr.io/token?scope=repository:{}:pull&service=ghcr.io", repo_path)])
+        .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
     let token = extract_json_str(&token_json, "token");
-    if token.is_empty() {
-        eprintln!("[onboard] Warning: no GHCR token — using :latest");
-        return format!("{}:latest", image_ref);
-    }
-
+    if token.is_empty() { return format!("{}:latest", image_ref); }
     let tags_json = Command::new("curl")
         .args(["-sf", "-H", &format!("Authorization: Bearer {}", token),
             &format!("https://ghcr.io/v2/{}/tags/list", repo_path)])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
+        .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
     match pick_arm64_tag(&tags_json, arm64_prefix) {
-        Some(tag) => {
-            eprintln!("[onboard] arm64 tag for {}: {}", image_ref, tag);
-            format!("{}:{}", image_ref, tag)
-        }
-        None => {
-            eprintln!("[onboard] No arm64 tag found — using :latest");
-            format!("{}:latest", image_ref)
-        }
+        Some(tag) => format!("{}:{}", image_ref, tag),
+        None => format!("{}:latest", image_ref),
     }
 }
 
-fn resolve_edgenode_image() -> String {
-    resolve_image("ghcr.io/holo-host/edgenode", "latest-hc")
-}
-
-fn resolve_wind_tunnel_image() -> String {
-    resolve_image("ghcr.io/holochain/wind-tunnel-runner", "latest-")
-}
+fn resolve_edgenode_image() -> String { resolve_image("ghcr.io/holo-host/edgenode", "latest-hc") }
+fn resolve_wind_tunnel_image() -> String { resolve_image("ghcr.io/holochain/wind-tunnel-runner", "latest-") }
 
 fn extract_json_str<'a>(json: &'a str, key: &str) -> &'a str {
     let needle = format!("\"{}\":", key);
-    let pos = match json.find(&needle) {
-        Some(p) => p,
-        None => return "",
-    };
+    let pos = match json.find(&needle) { Some(p) => p, None => return "" };
     let after = json[pos + needle.len()..].trim_start();
-    if after.starts_with('"') {
-        let inner = &after[1..];
-        &inner[..inner.find('"').unwrap_or(0)]
-    } else {
-        ""
-    }
+    if after.starts_with('"') { let inner = &after[1..]; &inner[..inner.find('"').unwrap_or(0)] } else { "" }
 }
 
 fn pick_arm64_tag(tags_json: &str, prefix: &str) -> Option<String> {
-    let start = tags_json.find('[')?;
-    let end = tags_json.rfind(']')?;
+    let start = tags_json.find('[')?; let end = tags_json.rfind(']')?;
     let array = &tags_json[start + 1..end];
     let mut candidates = Vec::new();
     let mut rest = array;
@@ -522,13 +369,9 @@ fn pick_arm64_tag(tags_json: &str, prefix: &str) -> Option<String> {
         let after = &rest[q1 + 1..];
         if let Some(q2) = after.find('"') {
             let tag = &after[..q2];
-            if tag.starts_with(prefix) && tag != "latest" {
-                candidates.push(tag.to_string());
-            }
+            if tag.starts_with(prefix) && tag != "latest" { candidates.push(tag.to_string()); }
             rest = &after[q2 + 1..];
-        } else {
-            break;
-        }
+        } else { break; }
     }
     candidates.sort_by(|a, b| b.cmp(a));
     candidates.into_iter().next()
@@ -537,54 +380,333 @@ fn pick_arm64_tag(tags_json: &str, prefix: &str) -> Option<String> {
 // ── Quadlet builders ───────────────────────────────────────────────────────────
 
 fn build_edgenode_quadlet(image: &str) -> String {
-    format!(
-        r#"[Unit]
-Description=Holo EdgeNode
-After=network-online.target
-Conflicts=wind-tunnel.service
-
-[Container]
-Image={image}
-ContainerName=edgenode
-Volume=/var/lib/edgenode:/data:Z
-Label=io.containers.autoupdate=registry
-
-[Service]
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"#,
-        image = image
-    )
+    format!("[Unit]\nDescription=Holo EdgeNode\nAfter=network-online.target\nConflicts=wind-tunnel.service\n\n[Container]\nImage={image}\nContainerName=edgenode\nVolume=/var/lib/edgenode:/data:Z\nLabel=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n", image=image)
 }
 
 fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
-    format!(
-        r#"[Unit]
-Description=Holochain Wind Tunnel Runner
-After=network-online.target
-Conflicts=edgenode.service
+    format!("[Unit]\nDescription=Holochain Wind Tunnel Runner\nAfter=network-online.target\nConflicts=edgenode.service\n\n[Container]\nImage={image}\nContainerName=wind-tunnel\nHostName={hostname}\nNetwork=host\nPodmanArgs=--cgroupns=host --privileged\nLabel=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n", hostname=hostname, image=image)
+}
 
-[Container]
-Image={image}
-ContainerName=wind-tunnel
-HostName={hostname}
-Network=host
-PodmanArgs=--cgroupns=host --privileged
-Label=io.containers.autoupdate=registry
+// ── Channel config functions ───────────────────────────────────────────────────
 
-[Service]
-Restart=always
-RestartSec=5
+/// Core channel TOML builder. `get` maps a clean field name (e.g. "bot_token") to its value.
+/// Used by both build_channel_toml (onboarding, prefixed keys) and
+/// build_channel_section (manage endpoint, clean keys).
+fn build_channel_from_resolver<F>(channel_type: &str, get: F) -> String
+where F: Fn(&str) -> String
+{
+    macro_rules! e { ($k:expr) => { toml_escape(&get($k)) } }
+    macro_rules! a { ($k:expr) => { csv_to_toml_array(&get($k)) } }
+    macro_rules! p { ($k:expr, $d:expr) => { get($k).parse::<u16>().unwrap_or($d) } }
+    macro_rules! opt_str { ($buf:expr, $k:expr, $toml_key:expr) => {
+        let v = get($k); if !v.is_empty() { $buf.push_str(&format!("{} = \"{}\"\n", $toml_key, toml_escape(&v))); }
+    } }
 
-[Install]
-WantedBy=multi-user.target
-"#,
-        hostname = hostname,
-        image = image
-    )
+    match channel_type {
+        "cli" => String::new(), // handled via inject_cli_into_config
+
+        "telegram" => format!(
+            "[channels_config.telegram]\nbot_token = \"{}\"\nallowed_users = {}\n",
+            e!("bot_token"), a!("allowed_users")
+        ),
+
+        "discord" => {
+            let mut t = format!(
+                "[channels_config.discord]\nbot_token = \"{}\"\nallowed_users = {}\n",
+                e!("bot_token"), a!("allowed_users")
+            );
+            opt_str!(t, "guild_id", "guild_id");
+            t
+        },
+
+        "slack" => format!(
+            "[channels_config.slack]\nbot_token = \"{}\"\napp_token = \"{}\"\nallowed_users = {}\n",
+            e!("bot_token"), e!("app_token"), a!("allowed_users")
+        ),
+
+        "mattermost" => format!(
+            "[channels_config.mattermost]\nurl = \"{}\"\nbot_token = \"{}\"\nchannel_id = \"{}\"\nallowed_users = {}\n",
+            e!("url"), e!("bot_token"), e!("channel_id"), a!("allowed_users")
+        ),
+
+        "matrix" => {
+            let mut t = format!(
+                "[channels_config.matrix]\nhomeserver = \"{}\"\naccess_token = \"{}\"\nroom_id = \"{}\"\nallowed_users = {}\n",
+                e!("homeserver"), e!("access_token"), e!("room_id"), a!("allowed_users")
+            );
+            opt_str!(t, "user_id",   "user_id");
+            opt_str!(t, "device_id", "device_id");
+            t
+        },
+
+        "signal" => {
+            let mut t = format!(
+                "[channels_config.signal]\nhttp_url = \"{}\"\naccount = \"{}\"\nallowed_from = {}\n",
+                e!("http_url"), e!("account"), a!("allowed_from")
+            );
+            opt_str!(t, "group_id", "group_id");
+            t
+        },
+
+        "whatsapp" => format!(
+            "[channels_config.whatsapp]\naccess_token = \"{}\"\nphone_number_id = \"{}\"\nverify_token = \"{}\"\nallowed_numbers = {}\n",
+            e!("access_token"), e!("phone_number_id"), e!("verify_token"), a!("allowed_numbers")
+        ),
+
+        "webhook" => {
+            let port = p!("port", 8080);
+            let mut t = format!("[channels_config.webhook]\nport = {}\n", port);
+            opt_str!(t, "secret", "secret");
+            t
+        },
+
+        "email" => format!(
+            "[channels_config.email]\nimap_host = \"{}\"\nimap_port = {}\nimap_folder = \"INBOX\"\nsmtp_host = \"{}\"\nsmtp_port = {}\nsmtp_tls = true\nusername = \"{}\"\npassword = \"{}\"\nfrom_address = \"{}\"\npoll_interval_secs = 60\nallowed_senders = {}\n",
+            e!("imap_host"), p!("imap_port", 993),
+            e!("smtp_host"), p!("smtp_port", 465),
+            e!("username"), e!("password"), e!("from_address"),
+            a!("allowed_senders")
+        ),
+
+        "irc" => {
+            let irc_channels = csv_to_toml_array(&get("channels"));
+            let mut t = format!(
+                "[channels_config.irc]\nserver = \"{}\"\nport = {}\nnickname = \"{}\"\nchannels = {}\nallowed_users = {}\nverify_tls = true\n",
+                e!("server"), p!("port", 6697), e!("nickname"), irc_channels, a!("allowed_users")
+            );
+            opt_str!(t, "server_password",   "server_password");
+            opt_str!(t, "nickserv_password",  "nickserv_password");
+            opt_str!(t, "sasl_password",      "sasl_password");
+            t
+        },
+
+        "lark" => {
+            let rm = get("receive_mode");
+            let rm_val = if rm == "webhook" { "webhook" } else { "websocket" };
+            let mut t = format!(
+                "[channels_config.lark]\napp_id = \"{}\"\napp_secret = \"{}\"\nallowed_users = {}\nreceive_mode = \"{}\"\n",
+                e!("app_id"), e!("app_secret"), a!("allowed_users"), rm_val
+            );
+            if rm_val == "webhook" { t.push_str(&format!("port = {}\n", p!("port", 8081))); }
+            opt_str!(t, "encrypt_key",         "encrypt_key");
+            opt_str!(t, "verification_token",  "verification_token");
+            t
+        },
+
+        "feishu" => {
+            let rm = get("receive_mode");
+            let rm_val = if rm == "webhook" { "webhook" } else { "websocket" };
+            let mut t = format!(
+                "[channels_config.feishu]\napp_id = \"{}\"\napp_secret = \"{}\"\nallowed_users = {}\nreceive_mode = \"{}\"\n",
+                e!("app_id"), e!("app_secret"), a!("allowed_users"), rm_val
+            );
+            if rm_val == "webhook" { t.push_str(&format!("port = {}\n", p!("port", 8081))); }
+            opt_str!(t, "encrypt_key",        "encrypt_key");
+            opt_str!(t, "verification_token", "verification_token");
+            t
+        },
+
+        "nostr" => {
+            let mut t = format!(
+                "[channels_config.nostr]\nprivate_key = \"{}\"\nallowed_pubkeys = {}\n",
+                e!("private_key"), a!("allowed_pubkeys")
+            );
+            let relays = get("relays");
+            if !relays.is_empty() { t.push_str(&format!("relays = {}\n", csv_to_toml_array(&relays))); }
+            t
+        },
+
+        "dingtalk" => format!(
+            "[channels_config.dingtalk]\nclient_id = \"{}\"\nclient_secret = \"{}\"\nallowed_users = {}\n",
+            e!("client_id"), e!("client_secret"), a!("allowed_users")
+        ),
+
+        "qq" => format!(
+            "[channels_config.qq]\napp_id = \"{}\"\napp_secret = \"{}\"\nallowed_users = {}\n",
+            e!("app_id"), e!("app_secret"), a!("allowed_users")
+        ),
+
+        "nextcloud_talk" => {
+            let mut t = format!(
+                "[channels_config.nextcloud_talk]\nbase_url = \"{}\"\napp_token = \"{}\"\nallowed_users = {}\n",
+                e!("base_url"), e!("app_token"), a!("allowed_users")
+            );
+            opt_str!(t, "webhook_secret", "webhook_secret");
+            t
+        },
+
+        "linq" => {
+            let mut t = format!(
+                "[channels_config.linq]\napi_token = \"{}\"\nfrom_phone = \"{}\"\nallowed_senders = {}\n",
+                e!("api_token"), e!("from_phone"), a!("allowed_senders")
+            );
+            opt_str!(t, "signing_secret", "signing_secret");
+            t
+        },
+
+        "imessage" => format!(
+            "[channels_config.imessage]\nallowed_contacts = {}\n",
+            a!("allowed_contacts")
+        ),
+
+        _ => String::new(),
+    }
+}
+
+/// Build channel TOML for onboarding submission.
+/// Onboarding sends field names prefixed with channel type: `{channel_type}_{field}`.
+fn build_channel_toml(body: &str, channel: &str) -> String {
+    if channel == "cli" {
+        return String::new();
+    }
+    let pfx = channel.to_string();
+    build_channel_from_resolver(channel, move |field| {
+        json_str(body, &format!("{}_{}", pfx, field)).to_string()
+    })
+}
+
+/// Build channel TOML for the /manage/channels/add endpoint.
+/// Expects clean field names in the JSON body alongside `channel_type`.
+fn build_channel_section(channel_type: &str, body: &str) -> String {
+    build_channel_from_resolver(channel_type, |field| json_str(body, field).to_string())
+}
+
+/// Return list of channel names configured in config.toml.
+fn list_configured_channels(config: &str) -> Vec<String> {
+    let mut channels = Vec::new();
+    let mut in_channels_root = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if t == "[channels_config]" { in_channels_root = true; continue; }
+        if t.starts_with('[') { in_channels_root = false; }
+        if in_channels_root && (t == "cli = true" || t == "cli=true") {
+            if !channels.contains(&"cli".to_string()) { channels.insert(0, "cli".to_string()); }
+        }
+        if t.starts_with("[channels_config.") && t.ends_with(']') {
+            let name = t["[channels_config.".len()..t.len()-1].to_string();
+            channels.push(name);
+        }
+    }
+    channels
+}
+
+/// Extract all channel config sections (including cli) to reapply after openclaw onboard
+/// rewrites config.toml with a fresh skeleton.
+fn extract_channel_config(config: &str) -> String {
+    let mut result = String::new();
+    let mut cli_present = false;
+    let mut in_channels_root = false;
+    let mut in_channel_sub = false;
+
+    for line in config.lines() {
+        let t = line.trim();
+        if t == "[channels_config]" { in_channels_root = true; in_channel_sub = false; continue; }
+        if t.starts_with("[channels_config.") && t.ends_with(']') {
+            in_channels_root = false; in_channel_sub = true;
+        } else if t.starts_with('[') && !t.starts_with("[[") {
+            in_channels_root = false; in_channel_sub = false;
+        }
+        if in_channels_root && (t == "cli = true" || t == "cli=true") { cli_present = true; }
+        if in_channel_sub { result.push_str(line); result.push('\n'); }
+    }
+
+    let mut out = String::new();
+    if cli_present { out.push_str("\n[channels_config]\ncli = true\n\n"); }
+    out.push_str(&result);
+    out
+}
+
+/// Remove a channel section from config.toml by channel name.
+fn remove_channel_from_config(config: &str, channel_name: &str) -> String {
+    if channel_name == "cli" {
+        return config.lines()
+            .filter(|l| { let t = l.trim(); t != "cli = true" && t != "cli=true" })
+            .collect::<Vec<_>>().join("\n");
+    }
+    let target = format!("[channels_config.{}]", channel_name);
+    let mut out: Vec<&str> = Vec::new();
+    let mut skip = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if t == target { skip = true; continue; }
+        if skip && t.starts_with('[') && !t.starts_with("[[") { skip = false; }
+        if !skip { out.push(line); }
+    }
+    out.join("\n")
+}
+
+/// Add (or replace) a channel section in config.toml.
+fn add_channel_to_config(config: &str, channel_type: &str, channel_toml: &str) -> String {
+    let cleaned = remove_channel_from_config(config, channel_type);
+    if channel_type == "cli" {
+        // Inject cli=true under [channels_config] section
+        let mut out = Vec::new();
+        let mut added = false;
+        for line in cleaned.lines() {
+            out.push(line.to_string());
+            if line.trim() == "[channels_config]" && !added {
+                out.push("cli = true".to_string());
+                added = true;
+            }
+        }
+        if !added { out.push("\n[channels_config]\ncli = true".to_string()); }
+        return out.join("\n");
+    }
+    let mut result = cleaned.trim_end().to_string();
+    result.push_str("\n\n");
+    result.push_str(channel_toml.trim());
+    result.push('\n');
+    result
+}
+
+fn channel_display_name(name: &str) -> &'static str {
+    match name {
+        "cli"            => "CLI",
+        "telegram"       => "Telegram",
+        "discord"        => "Discord",
+        "slack"          => "Slack",
+        "mattermost"     => "Mattermost",
+        "matrix"         => "Matrix",
+        "signal"         => "Signal",
+        "whatsapp"       => "WhatsApp",
+        "webhook"        => "Webhook",
+        "email"          => "Email",
+        "irc"            => "IRC",
+        "lark"           => "Lark",
+        "feishu"         => "Feishu",
+        "nostr"          => "Nostr",
+        "dingtalk"       => "DingTalk",
+        "qq"             => "QQ",
+        "nextcloud_talk" => "Nextcloud Talk",
+        "linq"           => "Linq",
+        "imessage"       => "iMessage",
+        _                => name,
+    }
+}
+
+fn channel_icon(name: &str) -> &'static str {
+    match name {
+        "cli"            => "💻",
+        "telegram"       => "✈️",
+        "discord"        => "🎮",
+        "slack"          => "💼",
+        "mattermost"     => "🔵",
+        "matrix"         => "🔷",
+        "signal"         => "🔒",
+        "whatsapp"       => "💬",
+        "webhook"        => "🔗",
+        "email"          => "📧",
+        "irc"            => "🖥️",
+        "lark"           => "🦅",
+        "feishu"         => "🪶",
+        "nostr"          => "⚡",
+        "dingtalk"       => "🔔",
+        "qq"             => "🐧",
+        "nextcloud_talk" => "☁️",
+        "linq"           => "📱",
+        "imessage"       => "🍎",
+        _                => "💬",
+    }
 }
 
 // ── OpenClaw config patching ───────────────────────────────────────────────────
@@ -598,295 +720,124 @@ fn patch_openclaw_config(config: &str, level: &str) -> String {
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim_start();
-
         if trimmed.starts_with("allowed_commands") {
-            out.push_str("allowed_commands = ");
-            out.push_str(ALLOWED_COMMANDS);
-            out.push('\n');
-            if !trimmed.contains(']') {
-                for cont in lines.by_ref() {
-                    if cont.contains(']') { break; }
-                }
-            }
+            out.push_str("allowed_commands = "); out.push_str(ALLOWED_COMMANDS); out.push('\n');
+            if !trimmed.contains(']') { for cont in lines.by_ref() { if cont.contains(']') { break; } } }
             continue;
         }
-        if trimmed.starts_with("level = ") {
-            out.push_str(&format!("level = \"{level}\"\n"));
-            continue;
-        }
+        if trimmed.starts_with("level = ") { out.push_str(&format!("level = \"{level}\"\n")); continue; }
         if trimmed.starts_with("allowed_roots") {
             out.push_str(&format!("allowed_roots = [\"{WORKSPACE_DIR}\"]\n"));
-            if !trimmed.contains(']') {
-                for cont in lines.by_ref() {
-                    if cont.contains(']') { break; }
-                }
-            }
+            if !trimmed.contains(']') { for cont in lines.by_ref() { if cont.contains(']') { break; } } }
             continue;
         }
-        if trimmed.starts_with("require_pairing") {
-            out.push_str("require_pairing = false\n");
-            continue;
-        }
+        if trimmed.starts_with("require_pairing") { out.push_str("require_pairing = false\n"); continue; }
         if trimmed == "[skills]" {
-            in_skills = true;
-            skills_section_seen = true;
-            out.push_str(line);
-            out.push('\n');
-            continue;
+            in_skills = true; skills_section_seen = true;
+            out.push_str(line); out.push('\n'); continue;
         }
         if in_skills {
             if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-                if !skills_dir_written {
-                    out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n"));
-                }
+                if !skills_dir_written { out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n")); }
                 in_skills = false;
             } else {
-                if trimmed.starts_with("open_skills_enabled") {
-                    out.push_str("open_skills_enabled = true\n");
-                    continue;
-                }
+                if trimmed.starts_with("open_skills_enabled") { out.push_str("open_skills_enabled = true\n"); continue; }
                 if trimmed.starts_with("open_skills_dir") {
-                    out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n"));
-                    skills_dir_written = true;
-                    continue;
+                    out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n")); skills_dir_written = true; continue;
                 }
-                out.push_str(line);
-                out.push('\n');
-                continue;
+                out.push_str(line); out.push('\n'); continue;
             }
         }
-        out.push_str(line);
-        out.push('\n');
+        out.push_str(line); out.push('\n');
     }
-    if in_skills && !skills_dir_written {
-        out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n"));
-    }
-    if !skills_section_seen {
-        out.push_str(&format!(
-            "\n[skills]\nopen_skills_enabled = true\nopen_skills_dir = \"{SKILLS_DIR}\"\n"
-        ));
-    }
+    if in_skills && !skills_dir_written { out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n")); }
+    if !skills_section_seen { out.push_str(&format!("\n[skills]\nopen_skills_enabled = true\nopen_skills_dir = \"{SKILLS_DIR}\"\n")); }
     out
 }
 
-fn build_channel_toml(body: &str, channel: &str) -> String {
-    match channel {
-        "telegram" => {
-            let tok = toml_escape(json_str(body, "tgToken"));
-            let uid = toml_escape(json_str(body, "tgUid"));
-            format!("[channels_config.telegram]\nbot_token = \"{tok}\"\nallowed_users = [\"{uid}\"]\n")
-        }
-        "discord" => {
-            let tok = toml_escape(json_str(body, "dcToken"));
-            let uid = toml_escape(json_str(body, "dcUid"));
-            format!("[channels_config.discord]\nbot_token = \"{tok}\"\nallowed_users = [\"{uid}\"]\n")
-        }
-        "slack" => {
-            let bot = toml_escape(json_str(body, "slBot"));
-            let app = toml_escape(json_str(body, "slApp"));
-            let uid = toml_escape(json_str(body, "slUid"));
-            format!(
-                "[channels_config.slack]\nbot_token = \"{bot}\"\napp_token = \"{app}\"\nallowed_users = [\"{uid}\"]\n"
-            )
-        }
-        "signal" => {
-            let url = toml_escape(json_str(body, "sgUrl"));
-            let acct = toml_escape(json_str(body, "sgAcct"));
-            let alw = csv_to_toml_array(json_str(body, "sgAllowed"));
-            format!("[channels_config.signal]\nhttp_url = \"{url}\"\naccount = \"{acct}\"\nallowed_from = {alw}\n")
-        }
-        "matrix" => {
-            let hs = toml_escape(json_str(body, "mxHs"));
-            let tok = toml_escape(json_str(body, "mxTok"));
-            let room = toml_escape(json_str(body, "mxRoom"));
-            let uid = toml_escape(json_str(body, "mxUid"));
-            format!(
-                "[channels_config.matrix]\nhomeserver = \"{hs}\"\naccess_token = \"{tok}\"\nroom_id = \"{room}\"\nallowed_users = [\"{uid}\"]\n"
-            )
-        }
-        "whatsapp" => {
-            let pid = toml_escape(json_str(body, "waPid"));
-            let tok = toml_escape(json_str(body, "waTok"));
-            let alw = csv_to_toml_array(json_str(body, "waAllowed"));
-            format!(
-                "[channels_config.whatsapp]\nphone_number_id = \"{pid}\"\naccess_token = \"{tok}\"\nallowed_numbers = {alw}\n"
-            )
-        }
-        _ => String::new(),
-    }
-}
-
-fn extract_channel_config(config: &str) -> String {
-    let mut result = String::new();
-    let mut in_channel = false;
-    for line in config.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("[channels_config.") {
-            in_channel = true;
-        } else if trimmed.starts_with('[') && !trimmed.starts_with("[[") && in_channel {
-            in_channel = false;
-        }
-        if in_channel {
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
-    result
-}
-
-// ── Welcome message sender ─────────────────────────────────────────────────────
+// ── Welcome message (Telegram / Discord / Slack) ───────────────────────────────
 
 fn send_welcome_message(channel: &str, body: &str, hw_mode: &str) {
-    let mode_desc = if hw_mode == "WIND_TUNNEL" {
-        "Holochain Wind Tunnel stress-test runner"
-    } else {
-        "Holo EdgeNode — always-on Holochain peer"
-    };
-    let welcome = format!(
-        "Your Holo Node is online!\n\nI'm your on-device AI agent.\n\nCurrent mode: {}\n\nTry asking me:\n• what containers are running?\n• show me the node health\n• switch to wind tunnel mode\n\nI'll always ask for your approval before taking action. Type anything to get started.",
-        mode_desc
-    );
-    fn json_escape(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-    }
+    let mode_desc = if hw_mode == "WIND_TUNNEL" { "Holochain Wind Tunnel stress-test runner" } else { "Holo EdgeNode — always-on Holochain peer" };
+    let welcome = format!("Your Holo Node is online!\n\nI'm your on-device AI agent.\n\nCurrent mode: {}\n\nTry asking me:\n• what containers are running?\n• show me the node health\n• switch to wind tunnel mode\n\nI'll always ask for your approval before taking action.", mode_desc);
+    fn je(s: &str) -> String { s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n") }
     match channel {
         "telegram" => {
-            let tok = json_str(body, "tgToken");
-            let uid = json_str(body, "tgUid");
-            if tok.is_empty() || uid.is_empty() { return; }
-            let payload = format!(
-                "{{\"chat_id\":\"{}\",\"text\":\"{}\",\"parse_mode\":\"Markdown\"}}",
-                uid, json_escape(&welcome)
-            );
-            let _ = Command::new("curl")
-                .args(["-sf", "-X", "POST",
-                    &format!("https://api.telegram.org/bot{}/sendMessage", tok),
-                    "-H", "Content-Type: application/json", "-d", &payload])
-                .output();
-        }
+            let tok = json_str(body, "telegram_bot_token");
+            let uid_raw = json_str(body, "telegram_allowed_users");
+            let uid = uid_raw.split(',').next().unwrap_or("").trim();
+            if tok.is_empty() || uid.is_empty() || uid == "*" { return; }
+            let payload = format!("{{\"chat_id\":\"{}\",\"text\":\"{}\"}}", uid, je(&welcome));
+            let _ = Command::new("curl").args(["-sf", "-X", "POST",
+                &format!("https://api.telegram.org/bot{}/sendMessage", tok),
+                "-H", "Content-Type: application/json", "-d", &payload]).output();
+        },
         "discord" => {
-            let tok = json_str(body, "dcToken");
-            let uid = json_str(body, "dcUid");
-            if tok.is_empty() || uid.is_empty() { return; }
-            let dm_payload = format!("{{\"recipient_id\":\"{}\"}}", uid);
-            let ch_out = Command::new("curl")
-                .args(["-sf", "-X", "POST",
-                    "https://discord.com/api/v10/users/@me/channels",
-                    "-H", "Content-Type: application/json",
-                    "-H", &format!("Authorization: Bot {}", tok),
-                    "-d", &dm_payload])
-                .output().ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
+            let tok = json_str(body, "discord_bot_token");
+            let uid = json_str(body, "discord_allowed_users").split(',').next().unwrap_or("").trim().to_string();
+            if tok.is_empty() || uid.is_empty() || uid == "*" { return; }
+            let ch_payload = format!("{{\"recipient_id\":\"{}\"}}", uid);
+            let ch_out = Command::new("curl").args(["-sf", "-X", "POST",
+                "https://discord.com/api/v10/users/@me/channels",
+                "-H", "Content-Type: application/json",
+                "-H", &format!("Authorization: Bot {}", tok), "-d", &ch_payload])
+                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
             let dm_id = extract_json_str(&ch_out, "id");
             if dm_id.is_empty() { return; }
-            let msg_payload = format!("{{\"content\":\"{}\"}}", json_escape(&welcome));
-            let _ = Command::new("curl")
-                .args(["-sf", "-X", "POST",
-                    &format!("https://discord.com/api/v10/channels/{}/messages", dm_id),
-                    "-H", "Content-Type: application/json",
-                    "-H", &format!("Authorization: Bot {}", tok),
-                    "-d", &msg_payload])
-                .output();
-        }
+            let msg = format!("{{\"content\":\"{}\"}}", je(&welcome));
+            let _ = Command::new("curl").args(["-sf", "-X", "POST",
+                &format!("https://discord.com/api/v10/channels/{}/messages", dm_id),
+                "-H", "Content-Type: application/json",
+                "-H", &format!("Authorization: Bot {}", tok), "-d", &msg]).output();
+        },
         "slack" => {
-            let tok = json_str(body, "slBot");
-            let uid = json_str(body, "slUid");
-            if tok.is_empty() || uid.is_empty() { return; }
-            let payload = format!(
-                "{{\"channel\":\"{}\",\"text\":\"{}\"}}",
-                uid, json_escape(&welcome)
-            );
-            let _ = Command::new("curl")
-                .args(["-sf", "-X", "POST",
-                    "https://slack.com/api/chat.postMessage",
-                    "-H", "Content-Type: application/json",
-                    "-H", &format!("Authorization: Bearer {}", tok),
-                    "-d", &payload])
-                .output();
-        }
-        other => eprintln!("[onboard] Welcome not implemented for channel: {}", other),
+            let tok = json_str(body, "slack_bot_token");
+            let uid = json_str(body, "slack_allowed_users").split(',').next().unwrap_or("").trim().to_string();
+            if tok.is_empty() || uid.is_empty() || uid == "*" { return; }
+            let payload = format!("{{\"channel\":\"{}\",\"text\":\"{}\"}}", uid, je(&welcome));
+            let _ = Command::new("curl").args(["-sf", "-X", "POST",
+                "https://slack.com/api/chat.postMessage",
+                "-H", "Content-Type: application/json",
+                "-H", &format!("Authorization: Bearer {}", tok), "-d", &payload]).output();
+        },
+        other => eprintln!("[onboard] Welcome message not implemented for channel: {}", other),
     }
 }
 
 // ── Self-update ────────────────────────────────────────────────────────────────
 
 fn check_and_apply_update(repo: &str) {
-    eprintln!("[update] Checking {} for updates (current: v{})", repo, VERSION);
+    eprintln!("[update] Checking {} (current: v{})", repo, VERSION);
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-    let json = match Command::new("curl")
-        .args(["-sf", "-H", "Accept: application/vnd.github+json",
-            "-H", "User-Agent: holo-node-manager", &api_url])
-        .output()
-    {
+    let json = match Command::new("curl").args(["-sf", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: holo-node-manager", &api_url]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => {
-            eprintln!("[update] Could not reach GitHub Releases API");
-            return;
-        }
+        _ => { eprintln!("[update] Could not reach GitHub Releases API"); return; }
     };
-
     let tag = extract_json_str(&json, "tag_name");
-    if tag.is_empty() {
-        eprintln!("[update] Could not parse tag_name");
-        return;
-    }
+    if tag.is_empty() { eprintln!("[update] Could not parse tag_name"); return; }
     let tag_ver = tag.trim_start_matches('v');
-    if tag_ver == VERSION {
-        eprintln!("[update] Already at v{}", VERSION);
-        return;
-    }
+    if tag_ver == VERSION { eprintln!("[update] Already at v{}", VERSION); return; }
     eprintln!("[update] New version: {} (have: {})", tag_ver, VERSION);
-
     let arch = detect_arch();
     let asset_name = format!("node-manager-{}", arch);
     let download_url = find_asset_download_url(&json, &asset_name);
-    if download_url.is_empty() {
-        eprintln!("[update] No asset '{}' in release {}", asset_name, tag);
-        return;
-    }
-
+    if download_url.is_empty() { eprintln!("[update] No asset '{}' in release {}", asset_name, tag); return; }
     let tmp = "/usr/local/bin/node-manager-update";
-    eprintln!("[update] Downloading {}", download_url);
-    let ok = Command::new("curl")
-        .args(["-sfL", "-o", tmp, &download_url])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !ok {
-        eprintln!("[update] Download failed");
-        return;
-    }
-
+    let ok = Command::new("curl").args(["-sfL", "-o", tmp, &download_url]).output().map(|o| o.status.success()).unwrap_or(false);
+    if !ok { eprintln!("[update] Download failed"); return; }
     let _ = Command::new("chmod").args(["+x", tmp]).output();
-    let self_path = env::current_exe()
-        .unwrap_or_else(|_| "/usr/local/bin/node-manager".into());
-
-    if let Err(e) = fs::rename(tmp, &self_path) {
-        eprintln!("[update] Replace failed: {}", e);
-        return;
-    }
-    eprintln!("[update] Binary replaced. Triggering systemd restart...");
-    let _ = Command::new("systemctl")
-        .args(["restart", "node-manager.service"])
-        .output();
+    let self_path = env::current_exe().unwrap_or_else(|_| "/usr/local/bin/node-manager".into());
+    if let Err(e) = fs::rename(tmp, &self_path) { eprintln!("[update] Replace failed: {}", e); return; }
+    eprintln!("[update] Binary replaced. Restarting...");
+    let _ = Command::new("systemctl").args(["restart", "node-manager.service"]).output();
 }
 
 fn find_asset_download_url(release_json: &str, asset_name: &str) -> String {
     let needle = format!("\"name\":\"{}\"", asset_name);
-    let pos = match release_json.find(&needle) {
-        Some(p) => p,
-        None => return String::new(),
-    };
-
-    let window = &release_json[pos..];
+    let pos = match release_json.find(&needle) { Some(p) => p, None => return String::new() };
     let url_key = "\"browser_download_url\":\"";
-
-    let url_pos = match window.find(url_key) {
-        Some(p) => p,
-        None => return String::new(),
-    };
-
+    let window = &release_json[pos..];
+    let url_pos = match window.find(url_key) { Some(p) => p, None => return String::new() };
     let after = &window[url_pos + url_key.len()..];
     after[..after.find('"').unwrap_or(0)].to_string()
 }
@@ -894,79 +845,68 @@ fn find_asset_download_url(release_json: &str, asset_name: &str) -> String {
 fn spawn_update_checker(repo: String) {
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(90));
-        loop {
-            check_and_apply_update(&repo);
-            thread::sleep(Duration::from_secs(UPDATE_INTERVAL_SECS));
-        }
+        loop { check_and_apply_update(&repo); thread::sleep(Duration::from_secs(UPDATE_INTERVAL_SECS)); }
     });
 }
 
 // ── Node operations ────────────────────────────────────────────────────────────
 
-struct ProviderConfig {
-    id:    String,
-    model: String,
-    key:   String,
-}
+struct ProviderConfig { id: String, model: String, key: String }
 
 fn make_provider_config(provider: &str, model: &str, api_key: &str, api_url: &str) -> Option<ProviderConfig> {
     let (id, mdl, key) = match provider {
-        "holo" => (
-            "custom:https://llm.holo.com/v1".to_string(),
-            "swiss-ai".to_string(),
-            "holo-builtin".to_string(),
-        ),
-        "google" => (
-            "google".to_string(),
-            if model.is_empty() { "gemini-2.5-flash".to_string() } else { model.to_string() },
-            api_key.to_string(),
-        ),
-        "anthropic" => (
-            "anthropic".to_string(),
-            if model.is_empty() { "claude-haiku-4-5-20251001".to_string() } else { model.to_string() },
-            api_key.to_string(),
-        ),
-        "openai" => (
-            "openai".to_string(),
-            if model.is_empty() { "gpt-4o-mini".to_string() } else { model.to_string() },
-            api_key.to_string(),
-        ),
-        "openrouter" => (
-            "openrouter".to_string(),
-            if model.is_empty() { "openrouter/auto".to_string() } else { model.to_string() },
-            api_key.to_string(),
-        ),
-        "ollama" => {
+        "holo"       => ("custom:https://llm.holo.com/v1".into(), "swiss-ai".into(), "holo-builtin".into()),
+        "google"     => ("google".into(), if model.is_empty() { "gemini-2.5-flash".into() } else { model.into() }, api_key.into()),
+        "anthropic"  => ("anthropic".into(), if model.is_empty() { "claude-haiku-4-5-20251001".into() } else { model.into() }, api_key.into()),
+        "openai"     => ("openai".into(), if model.is_empty() { "gpt-4o-mini".into() } else { model.into() }, api_key.into()),
+        "openrouter" => ("openrouter".into(), if model.is_empty() { "openrouter/auto".into() } else { model.into() }, api_key.into()),
+        "ollama"     => {
             let url = if api_url.is_empty() { "http://127.0.0.1:11434" } else { api_url };
-            (
-                format!("custom:{}", url),
-                if model.is_empty() { "llama3.2".to_string() } else { model.to_string() },
-                "ollama".to_string(),
-            )
-        }
+            (format!("custom:{}", url), if model.is_empty() { "llama3.2".into() } else { model.into() }, "ollama".into())
+        },
         _ => return None,
     };
     Some(ProviderConfig { id, model: mdl, key })
 }
 
+/// Ensure the openclaw binary is present, triggering the update service if not.
+/// Returns Err with a message if the binary still can't be found after attempting install.
+fn ensure_openclaw_binary(stream: &mut TcpStream) -> bool {
+    if Path::new("/usr/local/bin/openclaw").exists() { return true; }
+    eprintln!("[onboard] openclaw binary missing — triggering openclaw-update.service");
+    match Command::new("systemctl").args(["start", "--wait", "openclaw-update.service"]).output() {
+        Ok(o) if o.status.success() => {
+            eprintln!("[onboard] openclaw-update.service completed");
+            if Path::new("/usr/local/bin/openclaw").exists() { return true; }
+            eprintln!("[onboard] Binary still absent after update service");
+            send_json_err(stream, 500, "openclaw binary not found after install attempt");
+            false
+        },
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            eprintln!("[onboard] openclaw-update.service failed: {}", err.trim());
+            send_json_err(stream, 500, "failed to install openclaw agent binary — check journalctl -u openclaw-update.service");
+            false
+        },
+        Err(e) => {
+            eprintln!("[onboard] could not start openclaw-update.service: {}", e);
+            send_json_err(stream, 500, "could not start openclaw-update.service");
+            false
+        }
+    }
+}
+
 fn run_openclaw_onboard(pv: &ProviderConfig) -> Result<(), String> {
-    let result = Command::new("/usr/local/bin/openclaw")
-        .args([
-            "--config-dir", "/etc/openclaw",
-            "onboard", "--force", "--memory", "sqlite",
-            "--provider", &pv.id,
-            "--model", &pv.model,
-            "--api-key", &pv.key,
-        ])
-        .env("HOME", "/root")
-        .output();
-    match result {
-        Err(e) => Err(format!("openclaw binary not found: {}", e)),
+    match Command::new("/usr/local/bin/openclaw")
+        .args(["--config-dir", "/etc/openclaw", "onboard", "--force", "--memory", "sqlite",
+               "--provider", &pv.id, "--model", &pv.model, "--api-key", &pv.key])
+        .env("HOME", "/root").output()
+    {
+        Err(e)                       => Err(format!("openclaw binary not found: {}", e)),
         Ok(o) if !o.status.success() => {
             let err = String::from_utf8_lossy(&o.stderr);
-            Err(format!("openclaw onboard failed: {}",
-                err.replace('"', "'").replace('\n', " ").chars().take(200).collect::<String>()))
-        }
+            Err(format!("openclaw onboard failed: {}", err.replace('"', "'").replace('\n', " ").chars().take(200).collect::<String>()))
+        },
         Ok(_) => Ok(()),
     }
 }
@@ -974,8 +914,7 @@ fn run_openclaw_onboard(pv: &ProviderConfig) -> Result<(), String> {
 fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     let current = state.hw_mode.lock().unwrap().clone();
     let stop_svc  = if current == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
-    let start_svc = if new_mode == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
-
+    let start_svc = if new_mode == "WIND_TUNNEL"  { "wind-tunnel.service" } else { "edgenode.service" };
     let _ = fs::write(format!("{}/mode_switch.txt", WORKSPACE_DIR), new_mode);
     if current != new_mode {
         eprintln!("[manage] Stopping {} → starting {}", stop_svc, start_svc);
@@ -989,91 +928,63 @@ fn apply_hardware_mode(new_mode: &str, state: &AppState) {
 fn write_openclaw_env(provider: &str, api_key: &str) {
     let dropin_dir = "/etc/systemd/system/openclaw-daemon.service.d";
     let conf_path  = format!("{}/api-key.conf", dropin_dir);
-
     let env_var = match provider {
         "openrouter" => "OPENROUTER_API_KEY",
         "openai"     => "OPENAI_API_KEY",
         "anthropic"  => "ANTHROPIC_API_KEY",
         "google"     => "GEMINI_API_KEY",
-        _ => {
-            // Ollama or Holo — no API key needed; remove any existing override
-            let _ = fs::remove_file(&conf_path);
-            let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-            return;
-        }
+        _ => { let _ = fs::remove_file(&conf_path); let _ = Command::new("systemctl").args(["daemon-reload"]).output(); return; }
     };
-
     let _ = fs::create_dir_all(dropin_dir);
-    let dropin_content = format!("[Service]\nEnvironment=\"{}={}\"\n", env_var, api_key);
-    let _ = fs::write(&conf_path, dropin_content);
+    let _ = fs::write(&conf_path, format!("[Service]\nEnvironment=\"{}={}\"\n", env_var, api_key));
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+}
+
+fn restart_openclaw_with_channel_config(channel_config: &str, autonomy: &str) {
+    if let Ok(config) = fs::read_to_string(OPENCLAW_CONFIG) {
+        let mut final_config = patch_openclaw_config(&config, autonomy);
+        final_config.push('\n');
+        final_config.push_str(channel_config);
+        let _ = fs::write(OPENCLAW_CONFIG, &final_config);
+        let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+    }
+    let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
 }
 
 // ── JSON / TOML / HTML helpers ─────────────────────────────────────────────────
 
 fn json_str<'a>(json: &'a str, key: &str) -> &'a str {
     let needle = format!("\"{}\"", key);
-    let pos = match json.find(&needle) {
-        Some(p) => p,
-        None => return "",
-    };
-    let after = json[pos + needle.len()..]
-        .splitn(2, ':')
-        .nth(1)
-        .unwrap_or("")
-        .trim_start();
-    if after.starts_with('"') {
-        let inner = &after[1..];
-        &inner[..inner.find('"').unwrap_or(0)]
-    } else {
-        ""
-    }
-}
-
-fn toml_escape(s: &str) -> String {
-    s.replace('\\', r"\\")
-        .replace('"', "\\\"")
-        .replace('\n', r"\n")
-        .replace('\r', r"\r")
-        .replace('\t', r"\t")
-}
-
-fn csv_to_toml_array(csv: &str) -> String {
-    if csv.trim().is_empty() {
-        return "[\"*\"]".to_string();
-    }
-    let items: Vec<String> = csv
-        .split(',')
-        .map(|s| format!("\"{}\"", toml_escape(s.trim())))
-        .collect();
-    format!("[{}]", items.join(", "))
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let pos = match json.find(&needle) { Some(p) => p, None => return "" };
+    let after = json[pos + needle.len()..].splitn(2, ':').nth(1).unwrap_or("").trim_start();
+    if after.starts_with('"') { let inner = &after[1..]; &inner[..inner.find('"').unwrap_or(0)] } else { "" }
 }
 
 fn json_bool(json: &str, key: &str) -> bool {
     let needle = format!("\"{}\":", key);
-    let pos = match json.find(&needle) {
-        Some(p) => p,
-        None => return false,
-    };
-    let after = json[pos + needle.len()..].trim_start();
-    after.starts_with("true")
+    let pos = match json.find(&needle) { Some(p) => p, None => return false };
+    json[pos + needle.len()..].trim_start().starts_with("true")
+}
+
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n").replace('\r', r"\r").replace('\t', r"\t")
+}
+
+fn csv_to_toml_array(csv: &str) -> String {
+    if csv.trim().is_empty() { return "[\"*\"]".to_string(); }
+    let items: Vec<String> = csv.split(',').map(|s| format!("\"{}\"", toml_escape(s.trim()))).collect();
+    format!("[{}]", items.join(", "))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 fn parse_form(body: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for pair in body.split('&') {
         if let Some(eq) = pair.find('=') {
-            map.insert(
-                url_decode(&pair[..eq]),
-                url_decode(&pair[eq + 1..]),
-            );
+            map.insert(url_decode(&pair[..eq]), url_decode(&pair[eq + 1..]));
         }
     }
     map
@@ -1083,17 +994,12 @@ fn url_decode(s: &str) -> String {
     let mut result = String::new();
     let mut bytes = s.bytes().peekable();
     while let Some(b) = bytes.next() {
-        if b == b'+' {
-            result.push(' ');
-        } else if b == b'%' {
+        if b == b'+' { result.push(' '); }
+        else if b == b'%' {
             let h1 = bytes.next().unwrap_or(b'0') as char;
             let h2 = bytes.next().unwrap_or(b'0') as char;
-            if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h1, h2), 16) {
-                result.push(byte as char);
-            }
-        } else {
-            result.push(b as char);
-        }
+            if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h1, h2), 16) { result.push(byte as char); }
+        } else { result.push(b as char); }
     }
     result
 }
@@ -1101,82 +1007,42 @@ fn url_decode(s: &str) -> String {
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 fn send_response(stream: &mut TcpStream, status: u16, reason: &str, ctype: &str, body: &[u8]) {
-    let hdr = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(hdr.as_bytes());
-    let _ = stream.write_all(body);
+    let hdr = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    let _ = stream.write_all(hdr.as_bytes()); let _ = stream.write_all(body);
 }
-
-fn send_html(stream: &mut TcpStream, html: &str) {
-    send_response(stream, 200, "OK", "text/html; charset=utf-8", html.as_bytes());
-}
-
-fn send_json_ok(stream: &mut TcpStream, body: &str) {
-    send_response(stream, 200, "OK", "application/json", body.as_bytes());
-}
-
+fn send_html(stream: &mut TcpStream, html: &str) { send_response(stream, 200, "OK", "text/html; charset=utf-8", html.as_bytes()); }
+fn send_json_ok(stream: &mut TcpStream, body: &str) { send_response(stream, 200, "OK", "application/json", body.as_bytes()); }
 fn send_json_err(stream: &mut TcpStream, status: u16, msg: &str) {
     let body = format!("{{\"error\":\"{}\"}}", msg.replace('"', "'"));
     send_response(stream, status, "Error", "application/json", body.as_bytes());
 }
-
 fn send_redirect(stream: &mut TcpStream, location: &str) {
-    let hdr = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        location
-    );
-    let _ = stream.write_all(hdr.as_bytes());
+    let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", location).as_bytes());
 }
-
 fn send_redirect_with_cookie(stream: &mut TcpStream, location: &str, cookie: &str) {
-    let hdr = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {}\r\nSet-Cookie: {}\r\n\
-         Content-Length: 0\r\nConnection: close\r\n\r\n",
-        location, cookie
-    );
-    let _ = stream.write_all(hdr.as_bytes());
+    let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nSet-Cookie: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", location, cookie).as_bytes());
 }
 
-struct Req {
-    method:  String,
-    path:    String,
-    headers: String,
-    body:    String,
-}
+struct Req { method: String, path: String, headers: String, body: String }
 
 fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut r = BufReader::new(stream.try_clone().ok()?);
-    let mut line0 = String::new();
-    r.read_line(&mut line0).ok()?;
+    let mut line0 = String::new(); r.read_line(&mut line0).ok()?;
     let mut parts = line0.trim().splitn(3, ' ');
     let method   = parts.next()?.to_string();
     let path_raw = parts.next()?.to_string();
     let path     = path_raw.split('?').next().unwrap_or(&path_raw).to_string();
-
-    let mut cl: usize = 0;
-    let mut headers = String::new();
+    let mut cl: usize = 0; let mut headers = String::new();
     loop {
-        let mut line = String::new();
-        r.read_line(&mut line).ok()?;
+        let mut line = String::new(); r.read_line(&mut line).ok()?;
         if line.trim().is_empty() { break; }
         let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            cl = lower["content-length:".len()..].trim().parse().unwrap_or(0);
-        }
+        if lower.starts_with("content-length:") { cl = lower["content-length:".len()..].trim().parse().unwrap_or(0); }
         headers.push_str(&line);
     }
-
     let mut body = vec![0u8; cl.min(1 << 20)];
     if cl > 0 { r.read_exact(&mut body).ok()?; }
-    Some(Req {
-        method,
-        path,
-        headers,
-        body: String::from_utf8_lossy(&body).into_owned(),
-    })
+    Some(Req { method, path, headers, body: String::from_utf8_lossy(&body).into_owned() })
 }
 
 fn get_cookie(headers: &str, name: &str) -> Option<String> {
@@ -1185,9 +1051,7 @@ fn get_cookie(headers: &str, name: &str) -> Option<String> {
             for pair in line["cookie:".len()..].trim().split(';') {
                 let p = pair.trim();
                 if let Some(eq) = p.find('=') {
-                    if p[..eq].trim() == name {
-                        return Some(p[eq + 1..].trim().to_string());
-                    }
+                    if p[..eq].trim() == name { return Some(p[eq + 1..].trim().to_string()); }
                 }
             }
         }
@@ -1195,19 +1059,26 @@ fn get_cookie(headers: &str, name: &str) -> Option<String> {
     None
 }
 
-// ── HTML pages ─────────────────────────────────────────────────────────────────
+fn fmt_uptime(secs: u64) -> String {
+    if secs < 60 { format!("{}s", secs) }
+    else if secs < 3600 { format!("{}m", secs / 60) }
+    else if secs < 86400 { format!("{}h {}m", secs / 3600, (secs % 3600) / 60) }
+    else { format!("{}d {}h", secs / 86400, (secs % 86400) / 3600) }
+}
+
+// ── Common CSS ─────────────────────────────────────────────────────────────────
 
 const COMMON_CSS: &str = r#"
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:32px 16px}
-.card{background:#1a1d27;border:1px solid #2d3148;border-radius:16px;width:100%;max-width:580px;overflow:hidden}
+.card{background:#1a1d27;border:1px solid #2d3148;border-radius:16px;width:100%;max-width:600px;overflow:hidden}
 .hdr{background:linear-gradient(135deg,#1e2d5a,#2d1e5a);padding:24px 32px}
 .hdr h1{font-size:20px;font-weight:700;color:#fff;letter-spacing:-.3px}
 .hdr p{color:#94a3b8;font-size:13px;margin-top:4px}
 .body{padding:28px 32px}
 label{display:block;font-size:13px;font-weight:600;color:#94a3b8;margin-bottom:5px;margin-top:14px}
 label:first-of-type{margin-top:0}
-input[type=text],input[type=password],input[type=url],textarea,select{width:100%;padding:10px 12px;background:#0f1117;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;font-size:14px;outline:none;transition:border-color .2s;font-family:inherit}
+input[type=text],input[type=password],input[type=url],input[type=number],textarea,select{width:100%;padding:10px 12px;background:#0f1117;border:1px solid #2d3148;border-radius:8px;color:#e2e8f0;font-size:14px;outline:none;transition:border-color .2s;font-family:inherit}
 textarea{resize:vertical;min-height:80px;font-size:12px;font-family:monospace}
 input:focus,textarea:focus,select:focus{border-color:#6366f1}
 select option{background:#1a1d27}
@@ -1225,40 +1096,30 @@ select option{background:#1a1d27}
 .btn-danger{background:#7f1d1d;border:1px solid #991b1b;color:#fca5a5}
 .btn-danger:hover{background:#991b1b}
 .divider{height:1px;background:#2d3148;margin:20px 0}
+code{background:#1e2740;padding:1px 5px;border-radius:4px;font-family:monospace;color:#a5b4fc;font-size:12px}
 "#;
 
+// ── Login page ─────────────────────────────────────────────────────────────────
+
 fn build_login_html(error: bool) -> String {
-    let err = if error {
-        r#"<div class="err-box">Incorrect password. Try again.</div>"#
-    } else {
-        ""
-    };
-    format!(r#"<!DOCTYPE html>
-<html lang="en"><head>
+    let err = if error { r#"<div class="err-box">Incorrect password. Try again.</div>"# } else { "" };
+    format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Holo Node — Login</title>
-<style>{css}
-body{{align-items:center}}
-.card{{max-width:400px}}
-.hdr{{text-align:center}}
-.icon{{font-size:42px;margin-bottom:10px}}
-form .btn{{width:100%;margin-top:18px}}
-</style></head><body>
+<style>{css}body{{align-items:center}}.card{{max-width:400px}}.hdr{{text-align:center}}.icon{{font-size:42px;margin-bottom:10px}}form .btn{{width:100%;margin-top:18px}}</style></head><body>
 <div class="card">
   <div class="hdr"><div class="icon">🜲</div><h1>Holo Node</h1><p>Enter your node password to continue.</p></div>
-  <div class="body">
-    {err}
+  <div class="body">{err}
     <form method="POST" action="/login">
       <label for="pw">Password</label>
       <input type="password" id="pw" name="password" autofocus autocomplete="current-password">
       <button type="submit" class="btn btn-primary">Unlock →</button>
     </form>
   </div>
-</div>
-</body></html>"#,
-        css = COMMON_CSS,
-        err = err)
+</div></body></html>"#, css=COMMON_CSS, err=err)
 }
+
+// ── Onboarding page ────────────────────────────────────────────────────────────
 
 fn build_onboarding_html(ap_mode: bool) -> String {
     let wifi_block = if ap_mode {
@@ -1269,159 +1130,114 @@ fn build_onboarding_html(ap_mode: bool) -> String {
         r#"<div class="ok-box">✓ Ethernet connected — you're online.</div>"#
     };
 
-    format!(r#"<!DOCTYPE html>
-<html lang="en"><head>
+    format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Holo Node Setup</title>
 <style>
 {css}
-.prog{{height:3px;background:#0f1117}}
-.prog-fill{{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .4s ease}}
+.prog{{height:3px;background:#0f1117}}.prog-fill{{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .4s ease}}
 .step{{display:none}}.step.active{{display:block}}
 .slbl{{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#6366f1;margin-bottom:12px}}
 .stit{{font-size:18px;font-weight:700;color:#f1f5f9;margin-bottom:5px}}
 .sdsc{{font-size:13px;color:#64748b;margin-bottom:20px;line-height:1.6}}
-.cg{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}}
-.cb{{padding:14px 10px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;text-align:center;transition:all .2s;color:#94a3b8}}
+.cat-lbl{{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#475569;margin:16px 0 8px}}
+.cg{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px}}
+.cb{{padding:12px 8px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;text-align:center;transition:all .2s;color:#94a3b8}}
 .cb:hover,.cb.sel{{border-color:#6366f1;color:#a5b4fc}}.cb.sel{{background:#1e1d3f}}
-.cb-icon{{font-size:22px;margin-bottom:6px}}.cb-name{{font-size:13px;font-weight:600}}.cb-desc{{font-size:11px;color:#475569;margin-top:2px}}
+.cb-icon{{font-size:20px;margin-bottom:4px}}.cb-name{{font-size:12px;font-weight:600}}
+.ch-form{{margin-top:16px;display:none}}.ch-form.vis{{display:block}}
+.inst{{background:#0f172a;border:1px solid #1e40af;border-radius:8px;padding:12px;margin-bottom:12px}}
+.inst b{{font-size:12px;color:#818cf8}}.inst ol{{padding-left:18px;margin-top:6px}}.inst li{{font-size:12px;color:#94a3b8;line-height:1.8}}
 .pl{{display:flex;flex-direction:column;gap:8px}}
-.pb{{padding:14px 16px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;display:flex;align-items:center;gap:14px;transition:all .2s;color:#94a3b8}}
+.pb{{padding:12px 14px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;display:flex;align-items:center;gap:12px;transition:all .2s;color:#94a3b8}}
 .pb:hover,.pb.sel{{border-color:#6366f1;color:#a5b4fc}}.pb.sel{{background:#1e1d3f}}
-.pi{{font-size:20px;flex-shrink:0}}.pn{{font-size:14px;font-weight:600}}.pd{{font-size:12px;color:#475569;margin-top:2px}}
-.pc{{margin-top:18px;display:none}}.pc.vis{{display:block}}
+.pi{{font-size:18px;flex-shrink:0}}.pn{{font-size:13px;font-weight:600}}.pd{{font-size:11px;color:#475569;margin-top:2px}}
+.pc{{margin-top:16px;display:none}}.pc.vis{{display:block}}
 .ao{{display:flex;flex-direction:column;gap:8px}}
-.ab{{padding:14px 16px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;display:flex;align-items:flex-start;gap:12px;transition:all .2s}}
+.ab{{padding:12px 14px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;display:flex;align-items:flex-start;gap:10px;transition:all .2s}}
 .ab:hover{{border-color:#6366f1}}.ab.sel{{border-color:#6366f1;background:#1e1d3f}}
 .ar{{width:18px;height:18px;border-radius:50%;border:2px solid #4b5563;flex-shrink:0;margin-top:2px;display:flex;align-items:center;justify-content:center}}
-.ab.sel .ar{{border-color:#6366f1;background:#6366f1}}
-.ab.sel .ar::after{{content:'';width:6px;height:6px;border-radius:50%;background:#fff}}
-.an{{font-size:14px;font-weight:600;color:#e2e8f0}}.ad{{font-size:12px;color:#64748b;margin-top:3px;line-height:1.5}}
-.inst{{background:#0f172a;border:1px solid #1e40af;border-radius:8px;padding:13px;margin-bottom:14px}}
-.inst b{{font-size:12px;color:#818cf8}}
-.inst ol{{padding-left:18px;margin-top:7px}}
-.inst li{{font-size:12px;color:#94a3b8;line-height:1.8}}
-.inst code{{background:#1e2740;padding:1px 4px;border-radius:4px;font-family:monospace;color:#a5b4fc}}
-.rt{{width:100%;border-collapse:collapse;font-size:13px}}
-.rt tr{{border-bottom:1px solid #2d3148}}.rt tr:last-child{{border-bottom:none}}
-.rt td{{padding:9px 0;vertical-align:top}}
-.rt td:first-child{{color:#64748b;width:140px;padding-right:12px}}
-.rt td:last-child{{color:#e2e8f0;font-weight:500;word-break:break-all}}
+.ab.sel .ar{{border-color:#6366f1;background:#6366f1}}.ab.sel .ar::after{{content:'';width:6px;height:6px;border-radius:50%;background:#fff}}
+.an{{font-size:13px;font-weight:600;color:#e2e8f0}}.ad{{font-size:12px;color:#64748b;margin-top:2px;line-height:1.5}}
 .toggle-row{{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:#0f1117;border:1px solid #2d3148;border-radius:10px;margin-bottom:14px}}
-.toggle-label{{font-size:14px;font-weight:600;color:#e2e8f0}}
-.toggle-sub{{font-size:12px;color:#64748b;margin-top:2px}}
-.toggle{{position:relative;width:48px;height:26px;flex-shrink:0}}
-.toggle input{{opacity:0;width:0;height:0}}
+.toggle-label{{font-size:14px;font-weight:600;color:#e2e8f0}}.toggle-sub{{font-size:12px;color:#64748b;margin-top:2px}}
+.toggle{{position:relative;width:48px;height:26px;flex-shrink:0}}.toggle input{{opacity:0;width:0;height:0}}
 .slider{{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#2d3148;border-radius:13px;transition:.3s}}
 .slider:before{{position:absolute;content:'';height:18px;width:18px;left:4px;bottom:4px;background:#64748b;border-radius:50%;transition:.3s}}
-input:checked+.slider{{background:#6366f1}}
-input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
-.agent-config{{display:none;margin-top:16px}}
-.agent-config.vis{{display:block}}
+input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
+.agent-config{{display:none;margin-top:16px}}.agent-config.vis{{display:block}}
 .fw{{display:none;background:#2d1515;border:1px solid #7f1d1d;border-radius:8px;padding:14px;margin-top:12px;font-size:12px;color:#fca5a5;line-height:1.6}}
-.fw.vis{{display:block}}
-.fw label{{color:#fca5a5;font-size:12px;font-weight:400;display:flex;align-items:flex-start;gap:8px;cursor:pointer;margin:10px 0 0}}
+.fw.vis{{display:block}}.fw label{{color:#fca5a5;font-size:12px;font-weight:400;display:flex;align-items:flex-start;gap:8px;cursor:pointer;margin:10px 0 0}}
 .fw input[type=checkbox]{{width:auto;flex-shrink:0;margin-top:2px}}
-.brow{{display:flex;gap:10px;margin-top:24px}}
-.brow .btn{{flex:1}}
+.brow{{display:flex;gap:10px;margin-top:24px}}.brow .btn{{flex:1}}
 .spin{{display:none;width:20px;height:20px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .6s linear infinite;margin:0 auto}}
 @keyframes sp{{to{{transform:rotate(360deg)}}}}
-.suc{{text-align:center;padding:24px 0}}
-.suc h2{{font-size:24px;font-weight:700;color:#86efac;margin-bottom:12px}}
-.suc p{{color:#64748b;font-size:14px;line-height:1.7}}
+.suc{{text-align:center;padding:24px 0}}.suc h2{{font-size:24px;font-weight:700;color:#86efac;margin-bottom:12px}}.suc p{{color:#64748b;font-size:14px;line-height:1.7}}
+.rt{{width:100%;border-collapse:collapse;font-size:13px}}.rt tr{{border-bottom:1px solid #2d3148}}.rt tr:last-child{{border-bottom:none}}
+.rt td{{padding:9px 0;vertical-align:top}}.rt td:first-child{{color:#64748b;width:130px;padding-right:12px}}.rt td:last-child{{color:#e2e8f0;font-weight:500;word-break:break-all}}
 </style></head><body>
 <div class="card">
-  <div class="hdr"><h1>Holo Node</h1><p>One-time setup — about 3 minutes.</p></div>
+  <div class="hdr"><h1>🜲 Holo Node</h1><p>One-time setup — about 3 minutes.</p></div>
   <div class="prog"><div class="prog-fill" id="prog" style="width:0%"></div></div>
   <div class="body">
     {wifi_block}
 
-    <!-- STEP 1: NODE SETUP -->
+    <!-- STEP 1: IDENTITY + SSH -->
     <div class="step active" id="s1">
       <div class="slbl">Step 1 of 4</div>
-      <div class="stit">Node identity & SSH access</div>
-      <div class="sdsc">Give your node a name and add your SSH public key for emergency access.</div>
+      <div class="stit">Node identity &amp; SSH access</div>
+      <div class="sdsc">Name your node and optionally add your SSH public key for emergency access.</div>
       <label>Node name *</label>
       <input type="text" id="nodeName" placeholder="e.g. alice, home-node-01" oninput="chkS1()">
-      <div class="hint">Used as the hostname slug. Lowercase letters, numbers and hyphens only.</div>
+      <div class="hint">Lowercase letters, numbers and hyphens only. Used as hostname slug.</div>
       <label>SSH public key <span style="color:#475569;font-weight:400">(recommended)</span></label>
-      <textarea id="sshKey" placeholder="ssh-ed25519 AAAA... or ssh-rsa AAAA...&#10;Leave blank to configure SSH keys later in /manage"></textarea>
-      <div class="hint">Paste your <code>~/.ssh/id_ed25519.pub</code> or <code>~/.ssh/id_rsa.pub</code>. Keys are written to <code>/home/holo/.ssh/authorized_keys</code>. Root login is disabled.</div>
+      <textarea id="sshKey" placeholder="ssh-ed25519 AAAA...&#10;Leave blank to add keys later in /manage"></textarea>
       <div class="brow"><button class="btn btn-primary" id="b1" onclick="gTo(2)" disabled>Continue →</button></div>
     </div>
 
-    <!-- STEP 2: AI AGENT -->
+    <!-- STEP 2: AI AGENT + CHANNEL -->
     <div class="step" id="s2">
       <div class="slbl">Step 2 of 4</div>
-      <div class="stit">AI agent</div>
-      <div class="sdsc">The AI agent lets you control this node via a chat app. It is completely optional — the node runs fine without it.</div>
+      <div class="stit">AI agent &amp; channel</div>
+      <div class="sdsc">The AI agent is completely optional. If enabled, pick a chat platform to control your node.</div>
       <div class="toggle-row">
-        <div><div class="toggle-label">Enable AI agent</div><div class="toggle-sub">Installs an OpenClaw agent and connects to your chat app</div></div>
+        <div><div class="toggle-label">Enable AI agent</div><div class="toggle-sub">Installs OpenClaw and connects to your chosen platform</div></div>
         <label class="toggle"><input type="checkbox" id="agentToggle" onchange="onAgentToggle()"><span class="slider"></span></label>
       </div>
       <div class="agent-config" id="agentConfig">
-        <label style="margin-top:0">Chat app</label>
+        <label style="margin-top:0">Chat platform</label>
+        <div class="cat-lbl">Messaging</div>
         <div class="cg">
-          <div class="cb" onclick="sCh('telegram',this)"><div class="cb-icon">✈️</div><div class="cb-name">Telegram</div><div class="cb-desc">Recommended</div></div>
-          <div class="cb" onclick="sCh('discord',this)"><div class="cb-icon">🎮</div><div class="cb-name">Discord</div><div class="cb-desc">Bot in server</div></div>
-          <div class="cb" onclick="sCh('slack',this)"><div class="cb-icon">💼</div><div class="cb-name">Slack</div><div class="cb-desc">Workspace</div></div>
-          <div class="cb" onclick="sCh('signal',this)"><div class="cb-icon">🔒</div><div class="cb-name">Signal</div><div class="cb-desc">Max privacy</div></div>
-          <div class="cb" onclick="sCh('matrix',this)"><div class="cb-icon">🔷</div><div class="cb-name">Matrix</div><div class="cb-desc">Decentralised</div></div>
-          <div class="cb" onclick="sCh('whatsapp',this)"><div class="cb-icon">💬</div><div class="cb-name">WhatsApp</div><div class="cb-desc">Meta API</div></div>
+          <div class="cb" onclick="sCh('telegram',this)"><div class="cb-icon">✈️</div><div class="cb-name">Telegram</div></div>
+          <div class="cb" onclick="sCh('discord',this)"><div class="cb-icon">🎮</div><div class="cb-name">Discord</div></div>
+          <div class="cb" onclick="sCh('whatsapp',this)"><div class="cb-icon">💬</div><div class="cb-name">WhatsApp</div></div>
+          <div class="cb" onclick="sCh('signal',this)"><div class="cb-icon">🔒</div><div class="cb-name">Signal</div></div>
+          <div class="cb" onclick="sCh('slack',this)"><div class="cb-icon">💼</div><div class="cb-name">Slack</div></div>
+          <div class="cb" onclick="sCh('imessage',this)"><div class="cb-icon">🍎</div><div class="cb-name">iMessage</div></div>
         </div>
-        <div id="cr-telegram" class="ch-cr" style="display:none">
-          <div class="inst"><b>Get Telegram credentials:</b><ol>
-            <li>Search <code>@BotFather</code> → send <code>/newbot</code> → copy the token</li>
-            <li>Message <code>@getmyid_bot</code> to find your numeric User ID</li>
-          </ol></div>
-          <label>Bot Token *</label><input type="password" id="tg-tok" placeholder="123456789:ABCDef...">
-          <label>Your Telegram User ID *</label><input type="text" id="tg-uid" placeholder="e.g. 7114750915">
-          <div class="hint">Numeric ID only — not your @username</div>
+        <div class="cat-lbl">Business / Productivity</div>
+        <div class="cg">
+          <div class="cb" onclick="sCh('email',this)"><div class="cb-icon">📧</div><div class="cb-name">Email</div></div>
+          <div class="cb" onclick="sCh('mattermost',this)"><div class="cb-icon">🔵</div><div class="cb-name">Mattermost</div></div>
+          <div class="cb" onclick="sCh('nextcloud_talk',this)"><div class="cb-icon">☁️</div><div class="cb-name">Nextcloud</div></div>
+          <div class="cb" onclick="sCh('linq',this)"><div class="cb-icon">📱</div><div class="cb-name">Linq</div></div>
+          <div class="cb" onclick="sCh('webhook',this)"><div class="cb-icon">🔗</div><div class="cb-name">Webhook</div></div>
         </div>
-        <div id="cr-discord" class="ch-cr" style="display:none">
-          <div class="inst"><b>Get Discord credentials:</b><ol>
-            <li><a href="https://discord.com/developers/applications" target="_blank">discord.com/developers/applications</a> → New App → Bot → Reset Token</li>
-            <li>Enable "Message Content Intent" under Privileged Gateway Intents</li>
-            <li>Your User ID: Settings → Advanced → Developer Mode → right-click name</li>
-          </ol></div>
-          <label>Bot Token *</label><input type="password" id="dc-tok" placeholder="MTxxxxxxxx...">
-          <label>Your Discord User ID *</label><input type="text" id="dc-uid" placeholder="123456789012345678">
+        <div class="cat-lbl">Open / Technical</div>
+        <div class="cg">
+          <div class="cb" onclick="sCh('matrix',this)"><div class="cb-icon">🔷</div><div class="cb-name">Matrix</div></div>
+          <div class="cb" onclick="sCh('irc',this)"><div class="cb-icon">🖥️</div><div class="cb-name">IRC</div></div>
+          <div class="cb" onclick="sCh('nostr',this)"><div class="cb-icon">⚡</div><div class="cb-name">Nostr</div></div>
+          <div class="cb" onclick="sCh('cli',this)"><div class="cb-icon">💻</div><div class="cb-name">CLI only</div></div>
         </div>
-        <div id="cr-slack" class="ch-cr" style="display:none">
-          <div class="inst"><b>Get Slack credentials:</b><ol>
-            <li><a href="https://api.slack.com/apps" target="_blank">api.slack.com/apps</a> → New App → add <code>chat:write</code> scope → Install → copy Bot Token</li>
-            <li>Socket Mode → Enable → generate App Token (<code>xapp-...</code>)</li>
-            <li>Your Member ID: Profile → ⋮ → Copy member ID</li>
-          </ol></div>
-          <label>Bot Token (xoxb-...) *</label><input type="password" id="sl-bot" placeholder="xoxb-...">
-          <label>App Token (xapp-...) *</label><input type="password" id="sl-app" placeholder="xapp-...">
-          <label>Your Slack Member ID *</label><input type="text" id="sl-uid" placeholder="U012AB3CD">
+        <div class="cat-lbl">Asian Platforms</div>
+        <div class="cg">
+          <div class="cb" onclick="sCh('dingtalk',this)"><div class="cb-icon">🔔</div><div class="cb-name">DingTalk</div></div>
+          <div class="cb" onclick="sCh('qq',this)"><div class="cb-icon">🐧</div><div class="cb-name">QQ</div></div>
+          <div class="cb" onclick="sCh('lark',this)"><div class="cb-icon">🦅</div><div class="cb-name">Lark</div></div>
+          <div class="cb" onclick="sCh('feishu',this)"><div class="cb-icon">🪶</div><div class="cb-name">Feishu</div></div>
         </div>
-        <div id="cr-signal" class="ch-cr" style="display:none">
-          <div class="inst"><b>Signal requires signal-cli:</b><ol>
-            <li>Install <a href="https://github.com/AsamK/signal-cli" target="_blank">signal-cli</a> and register your number</li>
-            <li>Start: <code>signal-cli -u +1234 daemon --http=127.0.0.1:8686</code></li>
-          </ol></div>
-          <label>signal-cli URL *</label><input type="url" id="sg-url" value="http://127.0.0.1:8686">
-          <label>Your Account Number *</label><input type="text" id="sg-acct" placeholder="+12345678901">
-          <label>Allowed Senders (comma-sep, blank = anyone)</label><input type="text" id="sg-alw" placeholder="+12345678901">
-        </div>
-        <div id="cr-matrix" class="ch-cr" style="display:none">
-          <label>Homeserver URL *</label><input type="url" id="mx-hs" placeholder="https://matrix.org">
-          <label>Bot Access Token *</label><input type="password" id="mx-tok" placeholder="syt_xxxxxxxxxx">
-          <div class="hint">Bot account → Element Settings → Help → Access Token</div>
-          <label>Room ID *</label><input type="text" id="mx-room" placeholder="!abc123:matrix.org">
-          <label>Your Matrix User ID *</label><input type="text" id="mx-uid" placeholder="@you:matrix.org">
-        </div>
-        <div id="cr-whatsapp" class="ch-cr" style="display:none">
-          <div class="inst"><b>Requires Meta Business account:</b><ol>
-            <li><a href="https://developers.facebook.com" target="_blank">developers.facebook.com</a> → New App → Business → Add WhatsApp</li>
-            <li>Copy Phone Number ID and temporary access token</li>
-          </ol></div>
-          <label>Phone Number ID *</label><input type="text" id="wa-pid" placeholder="123456789012345">
-          <label>Access Token *</label><input type="password" id="wa-tok" placeholder="EAAxxxxxxx...">
-          <label>Allowed Numbers (comma-sep, blank = anyone)</label><input type="text" id="wa-alw" placeholder="+12345678901">
-        </div>
+        <div id="chFormContainer"></div>
       </div>
       <div class="brow">
         <button class="btn btn-secondary" onclick="gTo(1)">← Back</button>
@@ -1429,58 +1245,33 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
       </div>
     </div>
 
-    <!-- STEP 3: PROVIDER + HARDWARE MODE -->
+    <!-- STEP 3: PROVIDER + HARDWARE -->
     <div class="step" id="s3">
       <div class="slbl">Step 3 of 4</div>
-      <div class="stit">AI engine & hardware mode</div>
-      <div class="sdsc">Configure the AI provider and choose the initial container mode.</div>
+      <div class="stit">AI engine &amp; hardware mode</div>
+      <div class="sdsc" id="s3desc">Configure the AI provider and choose the initial container mode.</div>
       <div id="providerSection" style="display:none">
         <label style="margin-top:0">AI Provider</label>
         <div class="pl">
           <div class="pb sel" onclick="sPv('ollama',this)"><div class="pi">🦙</div><div><div class="pn">Ollama (Local)</div><div class="pd">Private, no API cost</div></div></div>
           <div class="pb" onclick="sPv('google',this)"><div class="pi">✦</div><div><div class="pn">Google Gemini</div><div class="pd">Free tier available</div></div></div>
-          <div class="pb" onclick="sPv('anthropic',this)"><div class="pi">◆</div><div><div class="pn">Anthropic Claude</div><div class="pd">Best for reasoning tasks</div></div></div>
+          <div class="pb" onclick="sPv('anthropic',this)"><div class="pi">◆</div><div><div class="pn">Anthropic Claude</div><div class="pd">Best for reasoning</div></div></div>
           <div class="pb" onclick="sPv('openai',this)"><div class="pi">⬡</div><div><div class="pn">OpenAI</div><div class="pd">GPT-4o, o4-mini</div></div></div>
-          <div class="pb" onclick="sPv('openrouter',this)"><div class="pi">⇄</div><div><div class="pn">OpenRouter</div><div class="pd">One key, 300+ models</div></div></div>
+          <div class="pb" onclick="sPv('openrouter',this)"><div class="pi">⇄</div><div><div class="pn">OpenRouter</div><div class="pd">300+ models, one key</div></div></div>
         </div>
-        <div id="pc-google" class="pc">
-          <label>Gemini API Key *</label><input type="password" id="pg-key" placeholder="AIzaSy...">
-          <div class="hint">Free key at <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com</a></div>
-          <label>Model</label><select id="pg-mdl"><option value="gemini-2.5-flash">gemini-2.5-flash (Recommended)</option><option value="gemini-2.5-pro">gemini-2.5-pro</option><option value="gemini-2.0-flash">gemini-2.0-flash</option></select>
-        </div>
-        <div id="pc-anthropic" class="pc">
-          <label>Claude API Key *</label><input type="password" id="pa-key" placeholder="sk-ant-...">
-          <div class="hint">Key at <a href="https://console.anthropic.com" target="_blank">console.anthropic.com</a></div>
-          <label>Model</label><select id="pa-mdl"><option value="claude-haiku-4-5-20251001">claude-haiku (Fast)</option><option value="claude-sonnet-4-6">claude-sonnet (Recommended)</option></select>
-        </div>
-        <div id="pc-openai" class="pc">
-          <label>OpenAI API Key *</label><input type="password" id="po-key" placeholder="sk-...">
-          <div class="hint">Key at <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com</a></div>
-          <label>Model</label><select id="po-mdl"><option value="gpt-4o-mini">gpt-4o-mini</option><option value="gpt-4o">gpt-4o</option><option value="o4-mini">o4-mini</option></select>
-        </div>
-        <div id="pc-openrouter" class="pc">
-          <label>OpenRouter API Key *</label><input type="password" id="pr-key" placeholder="sk-or-...">
-          <div class="hint">Free key at <a href="https://openrouter.ai/keys" target="_blank">openrouter.ai</a></div>
-          <label>Model ID *</label><input type="text" id="pr-mdl" placeholder="openrouter/auto" value="openrouter/auto">
-          <div class="hint">Leave as <code>openrouter/auto</code> for the best default, or enter a specific OpenRouter Model ID (e.g., <code>stepfun/step-3.5-flash:free</code>) if you are using strict API key guardrails.</div>
-        </div>
-        <div id="pc-ollama" class="pc">
-          <div class="info-box">Ollama must be running on this node or local network. No API key needed.</div>
-          <label>Ollama URL</label><input type="url" id="pl-url" value="http://127.0.0.1:11434">
-          <label>Model name *</label><input type="text" id="pl-mdl" placeholder="e.g. llama3.2, mistral, phi4">
-        </div>
+        <div id="pc-google" class="pc"><label>Gemini API Key *</label><input type="password" id="pg-key" placeholder="AIzaSy..."><label>Model</label><select id="pg-mdl"><option value="gemini-2.5-flash">gemini-2.5-flash (Recommended)</option><option value="gemini-2.5-pro">gemini-2.5-pro</option><option value="gemini-2.0-flash">gemini-2.0-flash</option></select></div>
+        <div id="pc-anthropic" class="pc"><label>Claude API Key *</label><input type="password" id="pa-key" placeholder="sk-ant-..."><label>Model</label><select id="pa-mdl"><option value="claude-haiku-4-5-20251001">claude-haiku (Fast)</option><option value="claude-sonnet-4-6">claude-sonnet (Recommended)</option></select></div>
+        <div id="pc-openai" class="pc"><label>OpenAI API Key *</label><input type="password" id="po-key" placeholder="sk-..."><label>Model</label><select id="po-mdl"><option value="gpt-4o-mini">gpt-4o-mini</option><option value="gpt-4o">gpt-4o</option><option value="o4-mini">o4-mini</option></select></div>
+        <div id="pc-openrouter" class="pc"><label>OpenRouter API Key *</label><input type="password" id="pr-key" placeholder="sk-or-..."><label>Model ID</label><input type="text" id="pr-mdl" value="openrouter/auto" placeholder="openrouter/auto"></div>
+        <div id="pc-ollama" class="pc"><div class="info-box">Ollama must be running on this node or local network.</div><label>Ollama URL</label><input type="url" id="pl-url" value="http://127.0.0.1:11434"><label>Model name *</label><input type="text" id="pl-mdl" placeholder="llama3.2"></div>
         <div class="divider"></div>
         <label>Agent autonomy</label>
         <div class="ao">
-          <div class="ab" onclick="sAu('readonly',this)"><div class="ar"></div><div><div class="an">👁 Read-Only</div><div class="ad">Observe, read files, answer questions. Cannot execute commands.</div></div></div>
-          <div class="ab" onclick="sAu('supervised',this)"><div class="ar"></div><div><div class="an">✋ Supervised <span style="font-size:11px;color:#6366f1;margin-left:6px">Recommended</span></div><div class="ad">Plans actions and waits for your approval before executing.</div></div></div>
-          <div class="ab" onclick="sAu('full',this)"><div class="ar"></div><div><div class="an">⚡ Full Autonomy</div><div class="ad">Acts immediately, notifies you after. Best for background tasks.</div></div></div>
+          <div class="ab" onclick="sAu('readonly',this)"><div class="ar"></div><div><div class="an">👁 Read-Only</div><div class="ad">Observe and answer. Cannot execute commands.</div></div></div>
+          <div class="ab" onclick="sAu('supervised',this)"><div class="ar"></div><div><div class="an">✋ Supervised <span style="font-size:11px;color:#6366f1;margin-left:6px">Recommended</span></div><div class="ad">Plans actions, waits for your approval.</div></div></div>
+          <div class="ab" onclick="sAu('full',this)"><div class="ar"></div><div><div class="an">⚡ Full Autonomy</div><div class="ad">Acts immediately, notifies after.</div></div></div>
         </div>
-        <div class="fw" id="fw">
-          <strong>⚠ Full Autonomy — read before enabling</strong><br>
-          Agent acts without asking. It can run Podman/systemctl commands and manage node services.
-          <label><input type="checkbox" id="fc" onchange="chkS3()"> I understand and want the agent to act without approval</label>
-        </div>
+        <div class="fw" id="fw"><strong>⚠ Full Autonomy</strong> — the agent acts without asking first.<label><input type="checkbox" id="fc" onchange="chkS3()"> I understand and accept full autonomy</label></div>
         <div class="divider"></div>
       </div>
       <label>Hardware mode</label>
@@ -1497,7 +1288,7 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
     <!-- STEP 4: REVIEW -->
     <div class="step" id="s4">
       <div class="slbl">Step 4 of 4</div>
-      <div class="stit">Review & initialize</div>
+      <div class="stit">Review &amp; initialize</div>
       <div class="sdsc">Check your settings, then start the node.</div>
       <table class="rt">
         <tr><td>Node Name</td><td id="rv-nn">—</td></tr>
@@ -1508,13 +1299,12 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
         <tr><td>Model</td><td id="rv-md">—</td></tr>
         <tr><td>Autonomy</td><td id="rv-au">—</td></tr>
         <tr><td>Hardware Mode</td><td id="rv-hw">—</td></tr>
-        <tr><td>Container Runtime</td><td>Podman + crun</td></tr>
       </table>
-      <div class="info-box" style="margin-top:16px">After you click Initialize:<br>
-      1. SSH access is configured for the <code>holo</code> user<br>
-      2. Podman Quadlet services are registered with systemd<br>
-      3. If the AI agent is enabled, the OpenClaw agent connects within ~60 seconds<br>
-      4. This setup page redirects to the management panel</div>
+      <div class="info-box" style="margin-top:16px">After initialization:<br>
+        1. SSH access is configured for the <code>holo</code> user<br>
+        2. Podman Quadlet services are registered with systemd<br>
+        3. If the AI agent is enabled, OpenClaw connects within ~60 seconds<br>
+        4. You will be redirected to the management panel</div>
       <div class="brow">
         <button class="btn btn-secondary" onclick="gTo(3)">← Back</button>
         <button class="btn btn-primary" id="bsub" onclick="doSubmit()">
@@ -1525,36 +1315,153 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
     </div>
 
     <!-- SUCCESS -->
-    <div class="step" id="suc">
-      <div class="suc">
-        <div style="font-size:48px;margin-bottom:16px">🜲</div>
-        <h2>Node Initialized!</h2>
-        <p>Redirecting to the management panel…</p>
-      </div>
-    </div>
+    <div class="step" id="suc"><div class="suc"><div style="font-size:48px;margin-bottom:16px">🜲</div><h2>Node Initialized!</h2><p>Redirecting to the management panel…</p></div></div>
   </div>
 </div>
 <script>
-const S={{ch:null,pv:'ollama',au:null,agent:false}};
-const CHN={{telegram:'Telegram',discord:'Discord',slack:'Slack',signal:'Signal',matrix:'Matrix',whatsapp:'WhatsApp'}};
-const PVN={{holo:'Holo Intelligence Plus',google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
+// ── Channel schema (fields for each channel type) ─────────────────────────────
+const CH = {{
+  cli:{{name:'CLI',icon:'💻',fields:[]}},
+  telegram:{{name:'Telegram',icon:'✈️',hint:'<b>Setup:</b><ol><li>Search @BotFather → /newbot → copy token</li><li>Message @getmyid_bot for your numeric user ID</li></ol>',
+    fields:[{{id:'bot_token',label:'Bot Token',type:'password',req:true,ph:'123456789:ABC...'}},
+            {{id:'allowed_users',label:'Allowed User IDs (comma-sep, * = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  discord:{{name:'Discord',icon:'🎮',hint:'<b>Setup:</b><ol><li>discord.com/developers → New App → Bot → Reset Token</li><li>Enable Message Content Intent</li><li>Your User ID: Settings → Advanced → Developer Mode → right-click name</li></ol>',
+    fields:[{{id:'bot_token',label:'Bot Token',type:'password',req:true,ph:'MTxx...'}},
+            {{id:'guild_id',label:'Guild ID (optional)',type:'text',ph:''}},
+            {{id:'allowed_users',label:'Allowed User IDs (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  slack:{{name:'Slack',icon:'💼',hint:'<b>Setup:</b><ol><li>api.slack.com/apps → New App → add chat:write scope → Bot Token</li><li>Socket Mode → enable → App Token (xapp-...)</li><li>Your Member ID: Profile → ⋮ → Copy member ID</li></ol>',
+    fields:[{{id:'bot_token',label:'Bot Token (xoxb-...)',type:'password',req:true,ph:'xoxb-...'}},
+            {{id:'app_token',label:'App Token (xapp-...)',type:'password',req:true,ph:'xapp-...'}},
+            {{id:'allowed_users',label:'Allowed Member IDs (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  mattermost:{{name:'Mattermost',icon:'🔵',
+    fields:[{{id:'url',label:'Server URL',type:'url',req:true,ph:'https://mm.example.com'}},
+            {{id:'bot_token',label:'Bot Token',type:'password',req:true,ph:'...'}},
+            {{id:'channel_id',label:'Channel ID',type:'text',req:true,ph:'...'}},
+            {{id:'allowed_users',label:'Allowed Users (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  matrix:{{name:'Matrix',icon:'🔷',hint:'<b>Setup:</b><ol><li>Create a bot account on your homeserver</li><li>Get access token from Element: Settings → Help → Access Token</li><li>Invite bot to your room and get the Room ID</li></ol>',
+    fields:[{{id:'homeserver',label:'Homeserver URL',type:'url',req:true,ph:'https://matrix.org'}},
+            {{id:'access_token',label:'Bot Access Token',type:'password',req:true,ph:'syt_...'}},
+            {{id:'room_id',label:'Room ID',type:'text',req:true,ph:'!abc123:matrix.org'}},
+            {{id:'allowed_users',label:'Allowed Users (* = anyone)',type:'text',ph:'*',def:'*'}},
+            {{id:'user_id',label:'Bot User ID (optional, recommended for E2EE)',type:'text',ph:'@bot:matrix.org'}},
+            {{id:'device_id',label:'Device ID (optional, for E2EE)',type:'text',ph:'DEVICEID123'}}]}},
+  signal:{{name:'Signal',icon:'🔒',hint:'<b>Requires signal-cli:</b><ol><li>Install signal-cli and register your number</li><li>Start: <code>signal-cli -u +1234 daemon --http=127.0.0.1:8686</code></li></ol>',
+    fields:[{{id:'http_url',label:'signal-cli URL',type:'url',req:true,ph:'http://127.0.0.1:8686',def:'http://127.0.0.1:8686'}},
+            {{id:'account',label:'Registered Number',type:'text',req:true,ph:'+12345678901'}},
+            {{id:'allowed_from',label:'Allowed Senders (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  whatsapp:{{name:'WhatsApp',icon:'💬',hint:'<b>Requires Meta Business account:</b><ol><li>developers.facebook.com → New App → Business → Add WhatsApp</li><li>Copy Phone Number ID and access token</li><li>Set webhook URL in Meta dashboard to your node IP</li></ol>',
+    fields:[{{id:'access_token',label:'Access Token',type:'password',req:true,ph:'EAAB...'}},
+            {{id:'phone_number_id',label:'Phone Number ID',type:'text',req:true,ph:'123456789012345'}},
+            {{id:'verify_token',label:'Verify Token (your choice)',type:'text',req:true,ph:'my-secret-verify-token'}},
+            {{id:'allowed_numbers',label:'Allowed Numbers E.164 (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  webhook:{{name:'Webhook',icon:'🔗',
+    fields:[{{id:'port',label:'Port',type:'number',ph:'8080',def:'8080'}},
+            {{id:'secret',label:'Shared Secret (optional)',type:'password',ph:''}}]}},
+  email:{{name:'Email',icon:'📧',
+    fields:[{{id:'imap_host',label:'IMAP Host',type:'text',req:true,ph:'imap.example.com'}},
+            {{id:'imap_port',label:'IMAP Port',type:'number',req:false,ph:'993',def:'993'}},
+            {{id:'smtp_host',label:'SMTP Host',type:'text',req:true,ph:'smtp.example.com'}},
+            {{id:'smtp_port',label:'SMTP Port',type:'number',req:false,ph:'465',def:'465'}},
+            {{id:'username',label:'Username / Email',type:'text',req:true,ph:'bot@example.com'}},
+            {{id:'password',label:'Password',type:'password',req:true,ph:''}},
+            {{id:'from_address',label:'From Address',type:'text',req:true,ph:'bot@example.com'}},
+            {{id:'allowed_senders',label:'Allowed Senders (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  irc:{{name:'IRC',icon:'🖥️',
+    fields:[{{id:'server',label:'IRC Server',type:'text',req:true,ph:'irc.libera.chat'}},
+            {{id:'port',label:'Port',type:'number',ph:'6697',def:'6697'}},
+            {{id:'nickname',label:'Bot Nickname',type:'text',req:true,ph:'mybot'}},
+            {{id:'channels',label:'Channels (comma-sep)',type:'text',req:true,ph:'#mychannel,#other'}},
+            {{id:'allowed_users',label:'Allowed Nicks (* = anyone)',type:'text',ph:'*',def:'*'}},
+            {{id:'server_password',label:'Server Password (optional)',type:'password',ph:''}},
+            {{id:'nickserv_password',label:'NickServ Password (optional)',type:'password',ph:''}},
+            {{id:'sasl_password',label:'SASL Password (optional)',type:'password',ph:''}}]}},
+  lark:{{name:'Lark',icon:'🦅',hint:'<b>Setup:</b><ol><li>Open Lark Open Platform → Create Custom App</li><li>Enable Bot feature, copy App ID and App Secret</li><li>Subscribe to Message Received event</li></ol>',
+    fields:[{{id:'app_id',label:'App ID',type:'text',req:true,ph:'cli_...'}},
+            {{id:'app_secret',label:'App Secret',type:'password',req:true,ph:''}},
+            {{id:'allowed_users',label:'Allowed Open IDs (* = anyone)',type:'text',ph:'*',def:'*'}},
+            {{id:'receive_mode',label:'Receive Mode',type:'select',opts:[{{v:'websocket',l:'WebSocket (recommended)'}},{{v:'webhook',l:'Webhook'}}]}},
+            {{id:'port',label:'Webhook Port (only if webhook mode)',type:'number',ph:'8081',def:'8081'}},
+            {{id:'encrypt_key',label:'Encrypt Key (optional)',type:'password',ph:''}},
+            {{id:'verification_token',label:'Verification Token (optional)',type:'text',ph:''}}]}},
+  feishu:{{name:'Feishu',icon:'🪶',hint:'<b>Setup:</b><ol><li>Open Feishu Open Platform → Create App</li><li>Enable Bot, copy App ID and App Secret</li><li>Subscribe to Message Received event</li></ol>',
+    fields:[{{id:'app_id',label:'App ID',type:'text',req:true,ph:'cli_...'}},
+            {{id:'app_secret',label:'App Secret',type:'password',req:true,ph:''}},
+            {{id:'allowed_users',label:'Allowed Open IDs (* = anyone)',type:'text',ph:'*',def:'*'}},
+            {{id:'receive_mode',label:'Receive Mode',type:'select',opts:[{{v:'websocket',l:'WebSocket (recommended)'}},{{v:'webhook',l:'Webhook'}}]}},
+            {{id:'port',label:'Webhook Port (only if webhook mode)',type:'number',ph:'8081',def:'8081'}},
+            {{id:'encrypt_key',label:'Encrypt Key (optional)',type:'password',ph:''}},
+            {{id:'verification_token',label:'Verification Token (optional)',type:'text',ph:''}}]}},
+  nostr:{{name:'Nostr',icon:'⚡',hint:'<b>Setup:</b><ol><li>Generate a Nostr key pair (nsec / npub)</li><li>The agent listens for DMs on the configured relays</li></ol>',
+    fields:[{{id:'private_key',label:'Private Key (nsec or hex)',type:'password',req:true,ph:'nsec1...'}},
+            {{id:'allowed_pubkeys',label:'Allowed Pubkeys (* = anyone)',type:'text',ph:'*',def:'*'}},
+            {{id:'relays',label:'Relays (comma-sep)',type:'text',ph:'wss://relay.damus.io,wss://nos.lol',def:'wss://relay.damus.io,wss://nos.lol'}}]}},
+  dingtalk:{{name:'DingTalk',icon:'🔔',hint:'<b>Setup:</b><ol><li>Open DingTalk Open Platform → Create Internal App</li><li>Enable Robot, copy Client ID and Client Secret</li></ol>',
+    fields:[{{id:'client_id',label:'Client ID',type:'text',req:true,ph:'ding...'}},
+            {{id:'client_secret',label:'Client Secret',type:'password',req:true,ph:''}},
+            {{id:'allowed_users',label:'Allowed Staff IDs (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  qq:{{name:'QQ',icon:'🐧',hint:'<b>Setup:</b><ol><li>Register on QQ Open Platform</li><li>Create a bot, copy App ID and App Secret</li></ol>',
+    fields:[{{id:'app_id',label:'App ID',type:'text',req:true,ph:''}},
+            {{id:'app_secret',label:'App Secret',type:'password',req:true,ph:''}},
+            {{id:'allowed_users',label:'Allowed QQ IDs (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+  nextcloud_talk:{{name:'Nextcloud Talk',icon:'☁️',
+    fields:[{{id:'base_url',label:'Nextcloud URL',type:'url',req:true,ph:'https://cloud.example.com'}},
+            {{id:'app_token',label:'App Password / Token',type:'password',req:true,ph:''}},
+            {{id:'allowed_users',label:'Allowed Users (* = anyone)',type:'text',ph:'*',def:'*'}},
+            {{id:'webhook_secret',label:'Webhook Secret (optional)',type:'password',ph:''}}]}},
+  linq:{{name:'Linq',icon:'📱',
+    fields:[{{id:'api_token',label:'API Token',type:'password',req:true,ph:''}},
+            {{id:'from_phone',label:'From Phone (E.164)',type:'text',req:true,ph:'+12025551234'}},
+            {{id:'allowed_senders',label:'Allowed Senders (* = anyone)',type:'text',ph:'*',def:'*'}},
+            {{id:'signing_secret',label:'Signing Secret (optional)',type:'password',ph:''}}]}},
+  imessage:{{name:'iMessage',icon:'🍎',hint:'<b>Requires BlueBubbles or similar macOS bridge</b> accessible from this node.',
+    fields:[{{id:'allowed_contacts',label:'Allowed Contacts (* = anyone)',type:'text',ph:'*',def:'*'}}]}},
+}};
 
+// ── JS state ───────────────────────────────────────────────────────────────────
+const S={{agent:false,ch:'',pv:'ollama',au:'supervised'}};
+const PVN={{holo:'Holo (built-in)',google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
+
+// ── Dynamic channel form renderer ─────────────────────────────────────────────
+function renderChForm(ch){{
+  const cfg=CH[ch];
+  if(!cfg||!cfg.fields.length)return'';
+  let html='<div class="ch-form vis">';
+  if(cfg.hint)html+='<div class="inst">'+cfg.hint+'</div>';
+  for(const f of cfg.fields){{
+    html+='<label>'+f.label+'</label>';
+    if(f.opts){{
+      html+='<select id="ch_'+f.id+'">';
+      for(const o of f.opts)html+='<option value="'+o.v+'">'+o.l+'</option>';
+      html+='</select>';
+    }}else{{
+      html+='<input type="'+(f.type||'text')+'" id="ch_'+f.id+'" placeholder="'+(f.ph||'')+'" value="'+(f.def||'')+'">';
+    }}
+    if(f.hint)html+='<div class="hint">'+f.hint+'</div>';
+  }}
+  html+='</div>';
+  return html;
+}}
+
+// ── Step navigation ────────────────────────────────────────────────────────────
 function gTo(n){{
   document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
   document.getElementById(n===5?'suc':'s'+n).classList.add('active');
-  document.getElementById('prog').style.width=(n/4*100)+'%';
+  document.getElementById('prog').style.width=(Math.min(n,4)/4*100)+'%';
   if(n===4)bRev();
   window.scrollTo(0,0);
 }}
 
 function chkS1(){{
-  const ok=document.getElementById('nodeName').value.trim().length>0;
+  const ok=/^[a-z0-9-]+$/.test(document.getElementById('nodeName').value.trim());
   document.getElementById('b1').disabled=!ok;
 }}
 
 function onAgentToggle(){{
   S.agent=document.getElementById('agentToggle').checked;
   document.getElementById('agentConfig').classList.toggle('vis',S.agent);
+  document.getElementById('s3desc').textContent=S.agent
+    ?'Configure the AI provider and choose the initial container mode.'
+    :'Choose the initial container mode. You can enable the AI agent later from /manage.';
   document.getElementById('providerSection').style.display=S.agent?'block':'none';
   chkS3();
 }}
@@ -1563,8 +1470,9 @@ function sCh(ch,el){{
   S.ch=ch;
   document.querySelectorAll('.cb').forEach(b=>b.classList.remove('sel'));
   el.classList.add('sel');
-  document.querySelectorAll('.ch-cr').forEach(c=>c.style.display='none');
-  document.getElementById('cr-'+ch).style.display='block';
+  document.getElementById('chFormContainer').innerHTML=ch==='cli'
+    ?'<div class="info-box" style="margin-top:8px">CLI mode: interact via <code>openclaw</code> on the node shell. No chat credentials needed.</div>'
+    :renderChForm(ch);
 }}
 
 function sPv(pv,el){{
@@ -1606,12 +1514,12 @@ function bRev(){{
   else if(S.pv==='openrouter'){{key=v('pr-key');mdl=v('pr-mdl');}}
   else if(S.pv==='ollama'){{mdl=v('pl-mdl')||'llama3.2';}}
   const sk=v('sshKey');
-  const set=(id,t)=>document.getElementById(id).textContent=t;
+  const set=(id,t)=>{{const e=document.getElementById(id);if(e)e.textContent=t;}};
   set('rv-nn',v('nodeName')||'—');
-  set('rv-sk',sk?sk.split(' ')[0]+' ••••':  '(not provided)');
-  set('rv-ag',S.agent?'Enabled':'Disabled (SSH only)');
-  set('rv-ch',S.agent?(CHN[S.ch]||'—'):'—');
-  set('rv-pv',S.agent?(PVN[S.pv]||'—'):'—');
+  set('rv-sk',sk?sk.split(' ')[0]+' ••••':'(not provided)');
+  set('rv-ag',S.agent?'Enabled':'Disabled (SSH / container only)');
+  set('rv-ch',S.agent?(CH[S.ch]?CH[S.ch].name:'—'):'—');
+  set('rv-pv',S.agent?(PVN[S.pv]||S.pv||'—'):'—');
   set('rv-md',S.agent?(mdl||'(default)'):'—');
   set('rv-au',S.agent?({{readonly:'Read-Only',supervised:'Supervised',full:'Full Autonomy'}}[S.au]||'—'):'—');
   set('rv-hw',v('hw')==='WIND_TUNNEL'?'Wind Tunnel':'Standard EdgeNode');
@@ -1624,35 +1532,52 @@ async function doSubmit(){{
   if(!nodeName)return alert('Node name is required.');
   if(!/^[a-z0-9-]+$/.test(nodeName))return alert('Node name must be lowercase letters, numbers and hyphens only.');
   if(S.agent){{
-    if(!S.ch)return alert('Please choose a chat app.');
-    if(S.ch==='telegram'&&(!v('tg-tok')||!/^-?\d+$/.test(v('tg-uid'))))return alert('Fill in Telegram credentials.');
-    if(S.ch==='discord'&&(!v('dc-tok')||!v('dc-uid')))return alert('Fill in Discord credentials.');
-    if(S.ch==='slack'&&(!v('sl-bot')||!v('sl-app')||!v('sl-uid')))return alert('Fill in all Slack fields.');
-    if(S.ch==='signal'&&(!v('sg-url')||!v('sg-acct')))return alert('Fill in Signal credentials.');
-    if(S.ch==='matrix'&&(!v('mx-hs')||!v('mx-tok')||!v('mx-room')||!v('mx-uid')))return alert('Fill in all Matrix fields.');
-    if(S.ch==='whatsapp'&&(!v('wa-pid')||!v('wa-tok')))return alert('Fill in WhatsApp credentials.');
+    if(!S.ch)return alert('Please choose a chat platform.');
+    if(S.ch!=='cli'&&CH[S.ch]){{
+      for(const f of CH[S.ch].fields){{
+        if(f.req&&!v('ch_'+f.id)){{alert('Required field missing: '+f.label);return;}}
+      }}
+    }}
     const needKey=['google','anthropic','openai','openrouter'];
     const keyMap={{google:'pg-key',anthropic:'pa-key',openai:'po-key',openrouter:'pr-key'}};
-    if(needKey.includes(S.pv)&&!v(keyMap[S.pv]))return alert('Enter your API key.');
+    if(needKey.includes(S.pv)&&!v(keyMap[S.pv]))return alert('Enter your API key for '+(PVN[S.pv]||S.pv)+'.');
+    if(S.pv==='ollama'&&!v('pl-mdl'))return alert('Enter the Ollama model name.');
   }}
   const btn=document.getElementById('bsub');
   btn.disabled=true;
   document.getElementById('slbl').style.display='none';
   document.getElementById('spin').style.display='block';
-  const p={{
-    nodeName,sshKey:v('sshKey'),agentEnabled:S.agent,
-    channel:S.ch||'',provider:S.pv||'',autonomyLevel:S.au||'supervised',hwMode:v('hw'),
-    wifiSsid:v('wifiSsid'),wifiPass:v('wifiPass'),
-    tgToken:v('tg-tok'),tgUid:v('tg-uid'),
-    dcToken:v('dc-tok'),dcUid:v('dc-uid'),
-    slBot:v('sl-bot'),slApp:v('sl-app'),slUid:v('sl-uid'),
-    sgUrl:v('sg-url'),sgAcct:v('sg-acct'),sgAllowed:v('sg-alw'),
-    mxHs:v('mx-hs'),mxTok:v('mx-tok'),mxRoom:v('mx-room'),mxUid:v('mx-uid'),
-    waPid:v('wa-pid'),waTok:v('wa-tok'),waAllowed:v('wa-alw'),
-    apiKey:(()=>{{if(S.pv==='google')return v('pg-key');if(S.pv==='anthropic')return v('pa-key');if(S.pv==='openai')return v('po-key');if(S.pv==='openrouter')return v('pr-key');return '';}})(),
-    model:(()=>{{if(S.pv==='google')return v('pg-mdl');if(S.pv==='anthropic')return v('pa-mdl');if(S.pv==='openai')return v('po-mdl');if(S.pv==='openrouter')return v('pr-mdl');if(S.pv==='ollama')return v('pl-mdl')||'llama3.2';return '';}})(),
+  const chFields={{}};
+  if(S.ch&&S.ch!=='cli'&&CH[S.ch]){{
+    for(const f of CH[S.ch].fields){{chFields[S.ch+'_'+f.id]=v('ch_'+f.id);}}
+  }}
+  const p=Object.assign({{
+    nodeName,
+    sshKey:v('sshKey'),
+    agentEnabled:S.agent,
+    channel:S.ch||'',
+    provider:S.pv||'',
+    autonomyLevel:S.au||'supervised',
+    hwMode:v('hw'),
+    wifiSsid:v('wifiSsid'),
+    wifiPass:v('wifiPass'),
+    apiKey:(()=>{{
+      if(S.pv==='google')return v('pg-key');
+      if(S.pv==='anthropic')return v('pa-key');
+      if(S.pv==='openai')return v('po-key');
+      if(S.pv==='openrouter')return v('pr-key');
+      return '';
+    }})(),
+    model:(()=>{{
+      if(S.pv==='google')return v('pg-mdl');
+      if(S.pv==='anthropic')return v('pa-mdl');
+      if(S.pv==='openai')return v('po-mdl');
+      if(S.pv==='openrouter')return v('pr-mdl');
+      if(S.pv==='ollama')return v('pl-mdl')||'llama3.2';
+      return '';
+    }})(),
     apiUrl:S.pv==='ollama'?v('pl-url'):'',
-  }};
+  }},chFields);
   try{{
     const r=await fetch('/submit',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}});
     if(r.ok){{gTo(5);setTimeout(()=>window.location.href='/manage',2000);}}
@@ -1670,17 +1595,20 @@ async function doSubmit(){{
         wifi_block = wifi_block)
 }
 
-fn build_manage_html(state: &AppState) -> String {
-    let node_name  = state.node_name.lock().unwrap().clone();
-    let hw_mode    = state.hw_mode.lock().unwrap().clone();
-    let channel    = state.channel.lock().unwrap().clone();
-    let provider   = state.provider.lock().unwrap().clone();
-    let model      = state.model.lock().unwrap().clone();
-    let agent_on   = state.agent_enabled.load(Ordering::Relaxed);
-    let ssh_keys   = read_ssh_keys();
-    let uptime_s   = state.start_time.elapsed().unwrap_or_default().as_secs();
-    let ip         = get_local_ip();
+// ── build_manage_html ──────────────────────────────────────────────────────────
 
+fn build_manage_html(state: &AppState) -> String {
+    let node_name = state.node_name.lock().unwrap().clone();
+    let hw_mode   = state.hw_mode.lock().unwrap().clone();
+    let channel   = state.channel.lock().unwrap().clone();
+    let provider  = state.provider.lock().unwrap().clone();
+    let model     = state.model.lock().unwrap().clone();
+    let agent_on  = state.agent_enabled.load(Ordering::Relaxed);
+    let ssh_keys  = read_ssh_keys();
+    let uptime_s  = state.start_time.elapsed().unwrap_or_default().as_secs();
+    let ip        = get_local_ip();
+
+    // SSH key list HTML
     let keys_html: String = if ssh_keys.is_empty() {
         r#"<div class="no-keys">No SSH keys configured. Add one below to enable SSH access.</div>"#.to_string()
     } else {
@@ -1689,458 +1617,481 @@ fn build_manage_html(state: &AppState) -> String {
             format!(
                 r#"<div class="key-row"><span class="key-type">{}</span><span class="key-val">{}</span><button class="btn btn-danger btn-sm" onclick="removeKey({})">Remove</button></div>"#,
                 html_escape(k.split_whitespace().next().unwrap_or("key")),
-                html_escape(&short),
-                i
+                html_escape(&short), i
             )
         }).collect()
     };
 
-    let hw_std_sel  = if hw_mode != "WIND_TUNNEL" { " selected" } else { "" };
-    let hw_wt_sel   = if hw_mode == "WIND_TUNNEL"  { " selected" } else { "" };
-    let agent_chk   = if agent_on { " checked" } else { "" };
-    let agent_vis   = if agent_on { "" } else { "display:none" };
-    let fork_name   = active_fork().display_name;
+    // Configured channels — read from live openclaw config
+    let configured_channels = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c)  => list_configured_channels(&c),
+        Err(_) => Vec::new(),
+    };
+    let ch_chips_html: String = if configured_channels.is_empty() {
+        r#"<div class="no-keys" style="margin-bottom:0">No channels configured.</div>"#.to_string()
+    } else {
+        configured_channels.iter().map(|ch| format!(
+            r#"<div class="ch-chip">{} {}<button class="ch-remove" onclick="removeCh('{}')">✕</button></div>"#,
+            channel_icon(ch), channel_display_name(ch), html_escape(ch)
+        )).collect::<Vec<_>>().join("")
+    };
+    let ch_count_display = format!("{} active", configured_channels.len());
 
-    format!(r##"<!DOCTYPE html>
-<html lang="en"><head>
+    // Provider panel visibility
+    let vis      = |p: &str| if provider == p { " vis" } else { "" };
+    let sel_card = |p: &str| if provider == p { " sel" } else { "" };
+
+    // Hardware selectors
+    let sel_std = if hw_mode != "WIND_TUNNEL" { " sel" } else { "" };
+    let sel_wt  = if hw_mode == "WIND_TUNNEL"  { " sel" } else { "" };
+    let hw_mode_display = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" };
+
+    // Agent badge
+    let agent_badge       = if agent_on { "Enabled" } else { "Disabled" };
+    let agent_badge_class = if agent_on { "badge-green" } else { "badge-gray" };
+    let agent_chk         = if agent_on { " checked" } else { "" };
+    let agent_vis         = if agent_on { "" } else { "display:none" };
+
+    let ssh_count  = ssh_keys.len();
+    let ssh_plural = if ssh_count == 1 { "" } else { "s" };
+
+    let channel_display  = if channel.is_empty()  { "None".to_string() } else { channel_display_name(&channel).to_string() };
+    let provider_display = if provider.is_empty() { "None".to_string() } else { provider.clone() };
+
+    format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Holo Node — {node_name}</title>
 <style>
 {css}
-body{{align-items:flex-start}}
-.card{{max-width:680px}}
-.hdr{{display:flex;justify-content:space-between;align-items:center}}
-.hdr-info{{}}
-.hdr-meta{{font-size:12px;color:#6366f1;margin-top:4px}}
-.logout{{background:transparent;border:1px solid rgba(255,255,255,.15);color:#94a3b8;padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px;font-family:inherit}}
-.logout:hover{{border-color:#6366f1;color:#e2e8f0}}
-.section{{margin-bottom:24px}}
-.section-hdr{{display:flex;align-items:center;justify-content:space-between;cursor:pointer;padding:14px 16px;background:#0f1117;border:1px solid #2d3148;border-radius:10px;user-select:none}}
-.section-title{{font-size:14px;font-weight:700;color:#e2e8f0;display:flex;align-items:center;gap:10px}}
-.section-badge{{font-size:11px;padding:2px 8px;border-radius:20px;font-weight:600}}
-.badge-green{{background:#0d2618;color:#86efac;border:1px solid #166534}}
-.badge-gray{{background:#1a1d27;color:#64748b;border:1px solid #2d3148}}
-.section-arrow{{color:#475569;transition:transform .2s;font-size:12px}}
-.section-body{{padding:16px;border:1px solid #2d3148;border-top:none;border-radius:0 0 10px 10px;background:#13161f}}
-.key-row{{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #1e2130}}
-.key-row:last-child{{border-bottom:none}}
-.key-type{{font-size:11px;font-weight:700;color:#6366f1;background:#1e1d3f;padding:2px 6px;border-radius:4px;flex-shrink:0;font-family:monospace}}
-.key-val{{font-size:12px;color:#94a3b8;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace}}
-.no-keys{{font-size:13px;color:#475569;padding:10px 0}}
-.btn-sm{{padding:6px 12px;font-size:12px;flex-shrink:0}}
-.form-row{{display:flex;gap:10px;align-items:flex-end;margin-top:12px}}
-.form-row input,.form-row textarea{{flex:1;margin:0}}
-.form-row .btn{{flex-shrink:0}}
-.provider-grid{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}}
-.pcard{{padding:12px;background:#0f1117;border:2px solid #2d3148;border-radius:8px;cursor:pointer;transition:all .2s;color:#94a3b8}}
-.pcard:hover,.pcard.sel{{border-color:#6366f1;color:#a5b4fc}}.pcard.sel{{background:#1e1d3f}}
-.pcard-name{{font-size:13px;font-weight:600}}.pcard-desc{{font-size:11px;color:#475569;margin-top:2px}}
-.provider-creds{{display:none;margin-top:12px}}.provider-creds.vis{{display:block}}
-.toggle-row{{display:flex;align-items:center;justify-content:space-between;padding:12px 0}}
-.toggle-label{{font-size:14px;font-weight:600;color:#e2e8f0}}
-.toggle{{position:relative;width:48px;height:26px;flex-shrink:0}}
-.toggle input{{opacity:0;width:0;height:0}}
-.slider{{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#2d3148;border-radius:13px;transition:.3s}}
-.slider:before{{position:absolute;content:'';height:18px;width:18px;left:4px;bottom:4px;background:#64748b;border-radius:50%;transition:.3s}}
-input:checked+.slider{{background:#6366f1}}
-input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
-.toast{{position:fixed;bottom:24px;right:24px;padding:12px 18px;border-radius:10px;font-size:13px;font-weight:600;z-index:1000;opacity:0;transform:translateY(8px);transition:all .25s;pointer-events:none}}
-.toast.vis{{opacity:1;transform:translateY(0)}}
+.toast{{position:fixed;bottom:24px;right:24px;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:600;opacity:0;transform:translateY(8px);transition:all .3s;pointer-events:none;z-index:999}}
 .toast.ok{{background:#0d2618;border:1px solid #166534;color:#86efac}}
 .toast.err{{background:#2d1515;border:1px solid #7f1d1d;color:#fca5a5}}
-.info-row{{display:flex;gap:24px;padding:12px 0;border-bottom:1px solid #2d3148;margin-bottom:16px;flex-wrap:wrap}}
-.info-item{{font-size:12px;color:#64748b}}.info-item span{{color:#e2e8f0;font-weight:600;margin-left:4px}}
-.hw-opts{{display:flex;gap:10px;margin-top:10px}}
-.hw-opt{{flex:1;padding:14px;background:#0f1117;border:2px solid #2d3148;border-radius:8px;cursor:pointer;text-align:center;transition:all .2s;color:#94a3b8}}
-.hw-opt:hover,.hw-opt.sel{{border-color:#6366f1;color:#a5b4fc}}.hw-opt.sel{{background:#1e1d3f}}
-.hw-opt-name{{font-size:13px;font-weight:600}}.hw-opt-desc{{font-size:11px;color:#475569;margin-top:4px}}
-</style></head><body>
-<div id="toast" class="toast"></div>
-<div class="card">
-  <div class="hdr">
-    <div class="hdr-info">
+.toast.vis{{opacity:1;transform:none}}
+.page-hdr{{background:linear-gradient(135deg,#1e2d5a,#2d1e5a);padding:20px 32px;display:flex;align-items:center;justify-content:space-between}}
+.page-hdr h1{{font-size:18px;font-weight:700;color:#fff}}
+.page-hdr p{{color:#94a3b8;font-size:12px;margin-top:2px}}
+.logout{{background:transparent;border:1px solid #3d4468;color:#94a3b8;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit}}
+.logout:hover{{border-color:#6366f1;color:#e2e8f0}}
+.info-row{{display:flex;flex-wrap:wrap;gap:8px;padding:14px 32px;background:#13162a;border-bottom:1px solid #2d3148}}
+.info-item{{font-size:12px;color:#64748b;display:flex;align-items:center;gap:6px}}
+.info-item span{{background:#1a1d27;border:1px solid #2d3148;border-radius:6px;padding:2px 8px;color:#94a3b8;font-size:12px}}
+.section{{border-bottom:1px solid #2d3148}}
+.section:last-child{{border-bottom:none}}
+.section-hdr{{padding:16px 32px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none}}
+.section-hdr:hover{{background:#1e2030}}
+.section-title{{font-size:14px;font-weight:600;color:#e2e8f0;display:flex;align-items:center;gap:8px}}
+.section-badge{{font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px}}
+.badge-green{{background:#0d2618;border:1px solid #166534;color:#86efac}}
+.badge-gray{{background:#1a1d27;border:1px solid #3d4468;color:#64748b}}
+.section-arrow{{color:#475569;font-size:12px}}
+.section-body{{padding:4px 32px 20px;display:none}}
+.key-row{{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #1e2030}}
+.key-row:last-child{{border-bottom:none}}
+.key-type{{font-size:11px;font-weight:700;color:#6366f1;background:#1e1d3f;padding:2px 6px;border-radius:4px;flex-shrink:0}}
+.key-val{{flex:1;font-size:12px;font-family:monospace;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.btn-sm{{padding:5px 10px;font-size:12px}}
+.no-keys{{font-size:13px;color:#475569;padding:8px 0;margin-bottom:8px}}
+.toggle-row{{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#0f1117;border:1px solid #2d3148;border-radius:10px;margin-bottom:10px}}
+.toggle-label{{font-size:14px;font-weight:600;color:#e2e8f0}}
+.toggle{{position:relative;width:48px;height:26px;flex-shrink:0}}.toggle input{{opacity:0;width:0;height:0}}
+.slider{{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#2d3148;border-radius:13px;transition:.3s}}
+.slider:before{{position:absolute;content:'';height:18px;width:18px;left:4px;bottom:4px;background:#64748b;border-radius:50%;transition:.3s}}
+input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
+.provider-grid{{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}}
+.pcard{{padding:10px 14px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;display:flex;align-items:center;gap:10px;transition:all .2s;color:#94a3b8}}
+.pcard:hover,.pcard.sel{{border-color:#6366f1;color:#a5b4fc}}.pcard.sel{{background:#1e1d3f}}
+.pcard-name{{font-size:13px;font-weight:600}}.pcard-desc{{font-size:11px;color:#475569;margin-top:1px}}
+.provider-creds{{display:none;margin-top:8px}}.provider-creds.vis{{display:block}}
+.hw-opts{{display:flex;gap:8px;margin-bottom:10px}}
+.hw-opt{{flex:1;padding:12px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;transition:all .2s}}
+.hw-opt:hover,.hw-opt.sel{{border-color:#6366f1}}.hw-opt.sel{{background:#1e1d3f}}
+.hw-opt-name{{font-size:13px;font-weight:600;color:#e2e8f0}}.hw-opt-desc{{font-size:11px;color:#475569;margin-top:2px}}
+.ch-chips{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;min-height:24px}}
+.ch-chip{{display:inline-flex;align-items:center;gap:6px;background:#1a1d27;border:1px solid #2d3148;border-radius:20px;padding:5px 10px 5px 12px;font-size:13px;color:#e2e8f0}}
+.ch-remove{{background:none;border:none;color:#475569;cursor:pointer;font-size:15px;padding:0 0 0 4px;line-height:1}}.ch-remove:hover{{color:#fca5a5}}
+</style></head><body style="align-items:flex-start;padding:0">
+<div class="card" style="max-width:680px;border-radius:0 0 16px 16px;min-height:100vh">
+  <div class="page-hdr">
+    <div>
       <h1>🜲 {node_name}</h1>
-      <div class="hdr-meta">v{version} · {ip} · uptime {uptime}</div>
+      <p>Node Manager v{version} &nbsp;·&nbsp; {ip} &nbsp;·&nbsp; up {uptime}</p>
     </div>
     <form method="POST" action="/logout" style="margin:0"><button type="submit" class="logout">Log out</button></form>
   </div>
-  <div class="body" style="padding-top:0">
-    <div class="info-row">
-      <div class="info-item">Agent<span id="info-agent">{agent_badge}</span></div>
-      <div class="info-item">Hardware<span id="info-hw">{hw_mode_display}</span></div>
-      <div class="info-item">Channel<span id="info-ch">{channel_display}</span></div>
-      <div class="info-item">Provider<span id="info-pv">{provider_display}</span></div>
-    </div>
+  <div class="info-row">
+    <div class="info-item">Agent <span id="info-agent">{agent_badge}</span></div>
+    <div class="info-item">Hardware <span id="info-hw">{hw_mode_display}</span></div>
+    <div class="info-item">Channel <span>{channel_display}</span></div>
+    <div class="info-item">Provider <span>{provider_display}</span></div>
+    <div class="info-item">Model <span>{model_display}</span></div>
+  </div>
 
-    <!-- SSH KEYS -->
-    <div class="section">
-      <div class="section-hdr" onclick="toggleSection('ssh')">
-        <div class="section-title"><span>🔑</span> SSH Keys <span class="section-badge badge-green">{ssh_count} key{ssh_plural}</span></div>
-        <span class="section-arrow" id="arr-ssh">▼</span>
+  <!-- SSH KEYS -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('ssh')">
+      <div class="section-title"><span>🔑</span> SSH Keys <span class="section-badge badge-green">{ssh_count} key{ssh_plural}</span></div>
+      <span class="section-arrow" id="arr-ssh">▼</span>
+    </div>
+    <div class="section-body" id="sec-ssh" style="display:block">
+      <div id="key-list">{keys_html}</div>
+      <div style="margin-top:12px">
+        <label>Add SSH public key</label>
+        <textarea id="newKey" placeholder="ssh-ed25519 AAAA… or ssh-rsa AAAA…"></textarea>
+        <div style="margin-top:8px"><button class="btn btn-primary" onclick="addKey()">Add Key</button></div>
       </div>
-      <div class="section-body" id="sec-ssh">
-        <div id="key-list">{keys_html}</div>
-        <div style="margin-top:12px">
-          <label>Add SSH public key</label>
-          <textarea id="newKey" placeholder="ssh-ed25519 AAAA... or ssh-rsa AAAA..."></textarea>
-          <div style="margin-top:8px"><button class="btn btn-primary" onclick="addKey()">Add Key</button></div>
+    </div>
+  </div>
+
+  <!-- AI AGENT -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('agent')">
+      <div class="section-title"><span>🤖</span> AI Agent <span class="section-badge {agent_badge_class}" id="badge-agent">{agent_badge}</span></div>
+      <span class="section-arrow" id="arr-agent">▼</span>
+    </div>
+    <div class="section-body" id="sec-agent">
+      <div class="toggle-row">
+        <div class="toggle-label">Enable OpenClaw AI agent</div>
+        <label class="toggle"><input type="checkbox" id="agentToggle"{agent_chk} onchange="toggleAgent(this.checked)"><span class="slider"></span></label>
+      </div>
+      <div id="agentDetails" style="{agent_vis}">
+        <div class="info-box" style="margin-top:0">Agent is running. Use the Channels section below to add or remove integrations without re-onboarding, or the Provider section to hot-swap the AI engine.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CHANNELS -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('ch')">
+      <div class="section-title"><span>💬</span> Channels <span class="section-badge badge-gray" id="badge-ch">{ch_count_display}</span></div>
+      <span class="section-arrow" id="arr-ch">▼</span>
+    </div>
+    <div class="section-body" id="sec-ch">
+      <div class="ch-chips" id="ch-chips">{ch_chips_html}</div>
+      <div class="divider" style="margin:16px 0 12px"></div>
+      <label>Add or replace a channel</label>
+      <select id="new-ch-sel" onchange="onNewCh()">
+        <option value="">— select channel —</option>
+        <optgroup label="Messaging">
+          <option value="telegram">✈️ Telegram</option>
+          <option value="discord">🎮 Discord</option>
+          <option value="whatsapp">💬 WhatsApp</option>
+          <option value="signal">🔒 Signal</option>
+          <option value="slack">💼 Slack</option>
+          <option value="imessage">🍎 iMessage</option>
+        </optgroup>
+        <optgroup label="Business / Productivity">
+          <option value="email">📧 Email</option>
+          <option value="mattermost">🔵 Mattermost</option>
+          <option value="nextcloud_talk">☁️ Nextcloud Talk</option>
+          <option value="linq">📱 Linq</option>
+          <option value="webhook">🔗 Webhook</option>
+        </optgroup>
+        <optgroup label="Open / Technical">
+          <option value="matrix">🔷 Matrix</option>
+          <option value="irc">🖥️ IRC</option>
+          <option value="nostr">⚡ Nostr</option>
+          <option value="cli">💻 CLI</option>
+        </optgroup>
+        <optgroup label="Asian Platforms">
+          <option value="dingtalk">🔔 DingTalk</option>
+          <option value="qq">🐧 QQ</option>
+          <option value="lark">🦅 Lark</option>
+          <option value="feishu">🪶 Feishu</option>
+        </optgroup>
+      </select>
+      <div id="new-ch-fields" style="margin-top:8px"></div>
+      <div style="margin-top:12px">
+        <button class="btn btn-primary" id="new-ch-btn" onclick="addCh()" disabled>Add Channel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI PROVIDER -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('pv')">
+      <div class="section-title"><span>✦</span> AI Provider <span class="section-badge badge-gray">{provider_display}</span></div>
+      <span class="section-arrow" id="arr-pv">▼</span>
+    </div>
+    <div class="section-body" id="sec-pv">
+      <div class="provider-grid">
+        <div class="pcard{sel_holo}" onclick="selPv('holo',this)"><div><div class="pcard-name">🜲 Holo (built-in)</div><div class="pcard-desc">No API key needed</div></div></div>
+        <div class="pcard{sel_google}" onclick="selPv('google',this)"><div><div class="pcard-name">✦ Google Gemini</div><div class="pcard-desc">Free tier available</div></div></div>
+        <div class="pcard{sel_anthropic}" onclick="selPv('anthropic',this)"><div><div class="pcard-name">◆ Anthropic Claude</div><div class="pcard-desc">Best for reasoning</div></div></div>
+        <div class="pcard{sel_openai}" onclick="selPv('openai',this)"><div><div class="pcard-name">⬡ OpenAI</div><div class="pcard-desc">GPT-4o, o4-mini</div></div></div>
+        <div class="pcard{sel_openrouter}" onclick="selPv('openrouter',this)"><div><div class="pcard-name">⇄ OpenRouter</div><div class="pcard-desc">300+ models, one key</div></div></div>
+        <div class="pcard{sel_ollama}" onclick="selPv('ollama',this)"><div><div class="pcard-name">🦙 Ollama (Local)</div><div class="pcard-desc">Private, no API cost</div></div></div>
+      </div>
+      <div id="mp-holo" class="provider-creds{vis_holo}"><div class="info-box" style="margin-top:0">Using built-in Holo LLM endpoint. No configuration needed.</div></div>
+      <div id="mp-google" class="provider-creds{vis_google}"><label>Gemini API Key</label><input type="password" id="m-gkey" placeholder="AIzaSy..."><label>Model</label><select id="m-gmdl"><option value="gemini-2.5-flash">gemini-2.5-flash</option><option value="gemini-2.5-pro">gemini-2.5-pro</option><option value="gemini-2.0-flash">gemini-2.0-flash</option></select></div>
+      <div id="mp-anthropic" class="provider-creds{vis_anthropic}"><label>Claude API Key</label><input type="password" id="m-akey" placeholder="sk-ant-..."><label>Model</label><select id="m-amdl"><option value="claude-haiku-4-5-20251001">claude-haiku (Fast)</option><option value="claude-sonnet-4-6">claude-sonnet (Recommended)</option></select></div>
+      <div id="mp-openai" class="provider-creds{vis_openai}"><label>OpenAI API Key</label><input type="password" id="m-okey" placeholder="sk-..."><label>Model</label><select id="m-omdl"><option value="gpt-4o-mini">gpt-4o-mini</option><option value="gpt-4o">gpt-4o</option><option value="o4-mini">o4-mini</option></select></div>
+      <div id="mp-openrouter" class="provider-creds{vis_openrouter}"><label>OpenRouter API Key</label><input type="password" id="m-rkey" placeholder="sk-or-..."><label>Model ID</label><input type="text" id="m-rmdl" placeholder="openrouter/auto"></div>
+      <div id="mp-ollama" class="provider-creds{vis_ollama}"><label>Ollama URL</label><input type="url" id="m-lurl" value="http://127.0.0.1:11434"><label>Model name</label><input type="text" id="m-lmdl" placeholder="llama3.2"></div>
+      <div style="margin-top:14px"><button class="btn btn-primary" onclick="saveProvider()">Save &amp; Restart Agent</button></div>
+    </div>
+  </div>
+
+  <!-- HARDWARE MODE -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('hw')">
+      <div class="section-title"><span>⚙️</span> Hardware Mode <span class="section-badge badge-green" id="hw-badge">{hw_mode_display}</span></div>
+      <span class="section-arrow" id="arr-hw">▼</span>
+    </div>
+    <div class="section-body" id="sec-hw">
+      <div class="hw-opts">
+        <div class="hw-opt{sel_std}" onclick="selHw('STANDARD',this)">
+          <div class="hw-opt-name">🌐 Standard EdgeNode</div>
+          <div class="hw-opt-desc">Always-on Holochain peer</div>
+        </div>
+        <div class="hw-opt{sel_wt}" onclick="selHw('WIND_TUNNEL',this)">
+          <div class="hw-opt-name">🌀 Wind Tunnel</div>
+          <div class="hw-opt-desc">Network stress-tester</div>
         </div>
       </div>
+      <div style="margin-top:10px"><button class="btn btn-primary" onclick="saveHardware()">Apply Mode</button></div>
     </div>
+  </div>
 
-    <!-- AI AGENT -->
-    <div class="section">
-      <div class="section-hdr" onclick="toggleSection('agent')">
-        <div class="section-title"><span>🤖</span> AI Agent <span class="section-badge {agent_badge_class}">{agent_badge}</span></div>
-        <span class="section-arrow" id="arr-agent">▼</span>
-      </div>
-      <div class="section-body" id="sec-agent">
-        <div class="toggle-row">
-          <div><div class="toggle-label">Enable AI agent ({fork_name})</div></div>
-          <label class="toggle"><input type="checkbox" id="agentToggle"{agent_chk} onchange="toggleAgent(this.checked)"><span class="slider"></span></label>
-        </div>
-        <div id="agentDetails" style="{agent_vis}">
-          <div class="divider" style="margin:8px 0 16px"></div>
-          <label>AI Provider</label>
-          <div class="provider-grid">
-            <div class="pcard{sel_holo}" onclick="selPv('holo',this)"><div class="pcard-name">🜲 Holo Intelligence</div><div class="pcard-desc">Included</div></div>
-            <div class="pcard{sel_google}" onclick="selPv('google',this)"><div class="pcard-name">✦ Google Gemini</div><div class="pcard-desc">Free tier available</div></div>
-            <div class="pcard{sel_anthropic}" onclick="selPv('anthropic',this)"><div class="pcard-name">◆ Anthropic Claude</div><div class="pcard-desc">Best reasoning</div></div>
-            <div class="pcard{sel_openai}" onclick="selPv('openai',this)"><div class="pcard-name">⬡ OpenAI</div><div class="pcard-desc">GPT-4o, o4-mini</div></div>
-            <div class="pcard{sel_openrouter}" onclick="selPv('openrouter',this)"><div class="pcard-name">⇄ OpenRouter</div><div class="pcard-desc">300+ models</div></div>
-            <div class="pcard{sel_ollama}" onclick="selPv('ollama',this)"><div class="pcard-name">🦙 Ollama</div><div class="pcard-desc">Local / private</div></div>
-          </div>
-          <div id="mp-holo" class="provider-creds{vis_holo}"><div class="ok-box" style="margin-top:12px">✓ No API key required.</div></div>
-          <div id="mp-google" class="provider-creds{vis_google}">
-            <label>Gemini API Key</label><input type="password" id="m-gkey" placeholder="AIzaSy...">
-            <label>Model</label><select id="m-gmdl"><option>gemini-2.5-flash</option><option>gemini-2.5-pro</option><option>gemini-2.0-flash</option></select>
-          </div>
-          <div id="mp-anthropic" class="provider-creds{vis_anthropic}">
-            <label>Claude API Key</label><input type="password" id="m-akey" placeholder="sk-ant-...">
-            <label>Model</label><select id="m-amdl"><option value="claude-haiku-4-5-20251001">claude-haiku</option><option value="claude-sonnet-4-6">claude-sonnet</option></select>
-          </div>
-          <div id="mp-openai" class="provider-creds{vis_openai}">
-            <label>OpenAI API Key</label><input type="password" id="m-okey" placeholder="sk-...">
-            <label>Model</label><select id="m-omdl"><option>gpt-4o-mini</option><option>gpt-4o</option><option>o4-mini</option></select>
-          </div>
-          <div id="mp-openrouter" class="provider-creds{vis_openrouter}">
-            <label>OpenRouter API Key</label><input type="password" id="m-rkey" placeholder="sk-or-...">
-            <label>Model ID</label><input type="text" id="m-rmdl" placeholder="openrouter/auto">
-            <div class="hint" style="font-size: 11px; margin-top: 4px; color: #475569;">Use <code>openrouter/auto</code> or enter a specific Model ID to match your API guardrails.</div>
-          </div>
-          <div id="mp-ollama" class="provider-creds{vis_ollama}">
-            <label>Ollama URL</label><input type="url" id="m-lurl" value="http://127.0.0.1:11434">
-            <label>Model name</label><input type="text" id="m-lmdl" placeholder="llama3.2">
-          </div>
-          <div style="margin-top:14px"><button class="btn btn-primary" onclick="saveProvider()">Save Provider</button></div>
-        </div>
-      </div>
+  <!-- PASSWORD -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('pw')">
+      <div class="section-title"><span>🔐</span> Change Password</div>
+      <span class="section-arrow" id="arr-pw">▼</span>
     </div>
-
-    <!-- HARDWARE MODE -->
-    <div class="section">
-      <div class="section-hdr" onclick="toggleSection('hw')">
-        <div class="section-title"><span>⚙️</span> Hardware Mode <span class="section-badge badge-green" id="hw-badge">{hw_mode_display}</span></div>
-        <span class="section-arrow" id="arr-hw">▼</span>
-      </div>
-      <div class="section-body" id="sec-hw">
-        <div class="hw-opts">
-          <div class="hw-opt{sel_std}" id="hw-std" onclick="selHw('STANDARD',this)">
-            <div class="hw-opt-name">🌐 Standard EdgeNode</div>
-            <div class="hw-opt-desc">Always-on Holochain peer</div>
-          </div>
-          <div class="hw-opt{sel_wt}" id="hw-wt" onclick="selHw('WIND_TUNNEL',this)">
-            <div class="hw-opt-name">🌀 Wind Tunnel</div>
-            <div class="hw-opt-desc">Network stress-tester</div>
-          </div>
-        </div>
-        <div style="margin-top:14px"><button class="btn btn-primary" onclick="saveHardware()">Apply Mode</button></div>
-      </div>
+    <div class="section-body" id="sec-pw">
+      <div class="info-box" style="margin-top:0;margin-bottom:14px">Store your new password securely. It cannot be recovered if lost.</div>
+      <label>Current password</label><input type="password" id="pw-cur" autocomplete="current-password">
+      <label>New password</label><input type="password" id="pw-new" autocomplete="new-password">
+      <label>Confirm new password</label><input type="password" id="pw-cfm" autocomplete="new-password">
+      <div style="margin-top:14px"><button class="btn btn-primary" onclick="changePassword()">Update Password</button></div>
     </div>
+  </div>
 
-    <!-- PASSWORD -->
-    <div class="section">
-      <div class="section-hdr" onclick="toggleSection('pw')">
-        <div class="section-title"><span>🔐</span> Change Password</div>
-        <span class="section-arrow" id="arr-pw">▼</span>
-      </div>
-      <div class="section-body" id="sec-pw">
-        <div class="info-box" style="margin-top:0;margin-bottom:14px">Store your new password securely. It cannot be recovered if lost.</div>
-        <label>Current password</label><input type="password" id="pw-cur" autocomplete="current-password">
-        <label>New password</label><input type="password" id="pw-new" autocomplete="new-password">
-        <label>Confirm new password</label><input type="password" id="pw-cfm" autocomplete="new-password">
-        <div style="margin-top:14px"><button class="btn btn-primary" onclick="changePassword()">Update Password</button></div>
-      </div>
+  <!-- SOFTWARE UPDATE -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('upd')">
+      <div class="section-title"><span>🔄</span> Software Update <span class="section-badge badge-gray">v{version}</span></div>
+      <span class="section-arrow" id="arr-upd">▼</span>
     </div>
-
-    <!-- SOFTWARE UPDATE -->
-    <div class="section">
-      <div class="section-hdr" onclick="toggleSection('upd')">
-        <div class="section-title"><span>🔄</span> Software Update <span class="section-badge badge-gray">v{version}</span></div>
-        <span class="section-arrow" id="arr-upd">▼</span>
-      </div>
-      <div class="section-body" id="sec-upd">
-        <p style="font-size:13px;color:#64748b;margin-bottom:14px">The node checks for updates automatically every hour from GitHub Releases. You can also trigger an immediate check.</p>
-        <button class="btn btn-primary" onclick="triggerUpdate()" id="upd-btn">Check for Updates</button>
-        <div id="upd-msg" style="margin-top:10px;font-size:13px;color:#64748b;display:none"></div>
-      </div>
+    <div class="section-body" id="sec-upd">
+      <p style="font-size:13px;color:#64748b;margin-bottom:14px">Nodes check for updates automatically every hour from GitHub Releases. You can also trigger an immediate check.</p>
+      <button class="btn btn-primary" onclick="triggerUpdate()" id="upd-btn">Check for Updates Now</button>
+      <div id="upd-msg" style="margin-top:10px;font-size:13px;color:#64748b;display:none"></div>
     </div>
   </div>
 </div>
 
+<div class="toast" id="toast"></div>
 <script>
-let curPv = '{provider_js}';
-let curHw = '{hw_mode}';
+let curPv='{provider_js}';
+let curHw='{hw_mode}';
 
 function toggleSection(id){{
-  const body = document.getElementById('sec-'+id);
-  const arr  = document.getElementById('arr-'+id);
-  const open = body.style.display !== 'none';
-  body.style.display = open ? 'none' : 'block';
-  arr.textContent = open ? '▶' : '▼';
+  const body=document.getElementById('sec-'+id);
+  const arr=document.getElementById('arr-'+id);
+  if(!body)return;
+  const open=body.style.display==='block';
+  body.style.display=open?'none':'block';
+  arr.textContent=open?'▶':'▼';
 }}
-['agent','hw','pw','upd'].forEach(id=>toggleSection(id));
+['agent','ch','pv','hw','pw','upd'].forEach(id=>toggleSection(id));
 
-function toast(msg, ok){{
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast '+(ok?'ok':'err')+' vis';
-  clearTimeout(t._timer);
-  t._timer = setTimeout(()=>t.classList.remove('vis'), 3000);
+function toast(msg,ok){{
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.className='toast '+(ok?'ok':'err')+' vis';
+  clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('vis'),3000);
 }}
 
-async function api(path, payload){{
-  const r = await fetch(path, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload)}});
-  const text = await r.text();
-  if(!r.ok) throw new Error(text || 'Server error '+r.status);
+async function api(path,payload){{
+  const r=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
+  const text=await r.text();
+  if(!r.ok)throw new Error(text||'Server error '+r.status);
   return text;
 }}
 
-async function addKey(){{
-  const key = document.getElementById('newKey').value.trim();
-  if(!key) return toast('Paste a public key first', false);
-  try{{
-    await api('/manage/ssh/add', {{key}});
-    document.getElementById('newKey').value='';
-    toast('Key added — reloading…', true);
-    setTimeout(()=>location.reload(), 800);
-  }}catch(e){{toast('Error: '+e.message, false);}}
-}}
+function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
 
+async function addKey(){{
+  const key=document.getElementById('newKey').value.trim();
+  if(!key)return toast('Paste a public key first',false);
+  try{{await api('/manage/ssh/add',{{key}});document.getElementById('newKey').value='';toast('Key added — reloading…',true);setTimeout(()=>location.reload(),800);}}
+  catch(e){{toast('Error: '+e.message,false);}}
+}}
 async function removeKey(i){{
-  if(!confirm('Remove this SSH key?')) return;
-  try{{
-    await api('/manage/ssh/remove', {{index:i}});
-    toast('Key removed — reloading…', true);
-    setTimeout(()=>location.reload(), 800);
-  }}catch(e){{toast('Error: '+e.message, false);}}
+  if(!confirm('Remove this SSH key?'))return;
+  try{{await api('/manage/ssh/remove',{{index:i}});toast('Key removed — reloading…',true);setTimeout(()=>location.reload(),800);}}
+  catch(e){{toast('Error: '+e.message,false);}}
 }}
 
 function toggleAgent(on){{
-  document.getElementById('agentDetails').style.display = on ? 'block' : 'none';
-  api('/manage/agent', {{enabled:on}})
-    .then(()=>toast(on?'Agent enabled':'Agent disabled', true))
-    .catch(e=>toast('Error: '+e.message, false));
+  document.getElementById('agentDetails').style.display=on?'block':'none';
+  document.getElementById('badge-agent').textContent=on?'Enabled':'Disabled';
+  document.getElementById('badge-agent').className='section-badge '+(on?'badge-green':'badge-gray');
+  api('/manage/agent',{{enabled:on}})
+    .then(()=>toast(on?'Agent enabled — restarting…':'Agent disabled',true))
+    .catch(e=>toast('Error: '+e.message,false));
 }}
 
-function selPv(pv, el){{
-  curPv = pv;
+// ── Channels (field schema mirrors the onboarding CH object) ──────────────────
+const CH_F={{
+  cli:[],
+  telegram:[{{id:'bot_token',label:'Bot Token',type:'password',req:true,ph:'123456789:ABC...'}},{{id:'allowed_users',label:'Allowed User IDs (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  discord:[{{id:'bot_token',label:'Bot Token',type:'password',req:true,ph:'MTxx...'}},{{id:'guild_id',label:'Guild ID (optional)',type:'text',ph:''}},{{id:'allowed_users',label:'Allowed User IDs (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  slack:[{{id:'bot_token',label:'Bot Token (xoxb-...)',type:'password',req:true,ph:'xoxb-...'}},{{id:'app_token',label:'App Token (xapp-...)',type:'password',req:true,ph:'xapp-...'}},{{id:'allowed_users',label:'Allowed Member IDs (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  mattermost:[{{id:'url',label:'Server URL',type:'url',req:true,ph:'https://mm.example.com'}},{{id:'bot_token',label:'Bot Token',type:'password',req:true,ph:''}},{{id:'channel_id',label:'Channel ID',type:'text',req:true,ph:''}},{{id:'allowed_users',label:'Allowed Users (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  matrix:[{{id:'homeserver',label:'Homeserver URL',type:'url',req:true,ph:'https://matrix.org'}},{{id:'access_token',label:'Bot Access Token',type:'password',req:true,ph:'syt_...'}},{{id:'room_id',label:'Room ID',type:'text',req:true,ph:'!abc123:matrix.org'}},{{id:'allowed_users',label:'Allowed Users (* = anyone)',type:'text',ph:'*',def:'*'}},{{id:'user_id',label:'Bot User ID (optional)',type:'text',ph:'@bot:matrix.org'}},{{id:'device_id',label:'Device ID (optional, for E2EE)',type:'text',ph:''}}],
+  signal:[{{id:'http_url',label:'signal-cli URL',type:'url',req:true,ph:'http://127.0.0.1:8686',def:'http://127.0.0.1:8686'}},{{id:'account',label:'Registered Number',type:'text',req:true,ph:'+12345678901'}},{{id:'allowed_from',label:'Allowed Senders (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  whatsapp:[{{id:'access_token',label:'Access Token',type:'password',req:true,ph:'EAAB...'}},{{id:'phone_number_id',label:'Phone Number ID',type:'text',req:true,ph:'123456789012345'}},{{id:'verify_token',label:'Verify Token',type:'text',req:true,ph:'my-verify-token'}},{{id:'allowed_numbers',label:'Allowed Numbers E.164 (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  webhook:[{{id:'port',label:'Port',type:'number',ph:'8080',def:'8080'}},{{id:'secret',label:'Shared Secret (optional)',type:'password',ph:''}}],
+  email:[{{id:'imap_host',label:'IMAP Host',type:'text',req:true,ph:'imap.example.com'}},{{id:'imap_port',label:'IMAP Port',type:'number',ph:'993',def:'993'}},{{id:'smtp_host',label:'SMTP Host',type:'text',req:true,ph:'smtp.example.com'}},{{id:'smtp_port',label:'SMTP Port',type:'number',ph:'465',def:'465'}},{{id:'username',label:'Username',type:'text',req:true,ph:'bot@example.com'}},{{id:'password',label:'Password',type:'password',req:true,ph:''}},{{id:'from_address',label:'From Address',type:'text',req:true,ph:'bot@example.com'}},{{id:'allowed_senders',label:'Allowed Senders (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  irc:[{{id:'server',label:'IRC Server',type:'text',req:true,ph:'irc.libera.chat'}},{{id:'port',label:'Port',type:'number',ph:'6697',def:'6697'}},{{id:'nickname',label:'Bot Nickname',type:'text',req:true,ph:'mybot'}},{{id:'channels',label:'Channels (comma-sep)',type:'text',req:true,ph:'#mychannel'}},{{id:'allowed_users',label:'Allowed Nicks (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  lark:[{{id:'app_id',label:'App ID',type:'text',req:true,ph:'cli_...'}},{{id:'app_secret',label:'App Secret',type:'password',req:true,ph:''}},{{id:'allowed_users',label:'Allowed Open IDs (* = anyone)',type:'text',ph:'*',def:'*'}},{{id:'receive_mode',label:'Receive Mode',type:'select',opts:[{{v:'websocket',l:'WebSocket'}},{{v:'webhook',l:'Webhook'}}]}}],
+  feishu:[{{id:'app_id',label:'App ID',type:'text',req:true,ph:'cli_...'}},{{id:'app_secret',label:'App Secret',type:'password',req:true,ph:''}},{{id:'allowed_users',label:'Allowed Open IDs (* = anyone)',type:'text',ph:'*',def:'*'}},{{id:'receive_mode',label:'Receive Mode',type:'select',opts:[{{v:'websocket',l:'WebSocket'}},{{v:'webhook',l:'Webhook'}}]}}],
+  nostr:[{{id:'private_key',label:'Private Key (nsec or hex)',type:'password',req:true,ph:'nsec1...'}},{{id:'allowed_pubkeys',label:'Allowed Pubkeys (* = anyone)',type:'text',ph:'*',def:'*'}},{{id:'relays',label:'Relays (comma-sep)',type:'text',ph:'wss://relay.damus.io',def:'wss://relay.damus.io,wss://nos.lol'}}],
+  dingtalk:[{{id:'client_id',label:'Client ID',type:'text',req:true,ph:'ding...'}},{{id:'client_secret',label:'Client Secret',type:'password',req:true,ph:''}},{{id:'allowed_users',label:'Allowed Staff IDs (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  qq:[{{id:'app_id',label:'App ID',type:'text',req:true,ph:''}},{{id:'app_secret',label:'App Secret',type:'password',req:true,ph:''}},{{id:'allowed_users',label:'Allowed QQ IDs (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  nextcloud_talk:[{{id:'base_url',label:'Nextcloud URL',type:'url',req:true,ph:'https://cloud.example.com'}},{{id:'app_token',label:'App Token',type:'password',req:true,ph:''}},{{id:'allowed_users',label:'Allowed Users (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  linq:[{{id:'api_token',label:'API Token',type:'password',req:true,ph:''}},{{id:'from_phone',label:'From Phone (E.164)',type:'text',req:true,ph:'+12025551234'}},{{id:'allowed_senders',label:'Allowed Senders (* = anyone)',type:'text',ph:'*',def:'*'}}],
+  imessage:[{{id:'allowed_contacts',label:'Allowed Contacts (* = anyone)',type:'text',ph:'*',def:'*'}}],
+}};
+
+function onNewCh(){{
+  const t=document.getElementById('new-ch-sel').value;
+  document.getElementById('new-ch-btn').disabled=!t;
+  const div=document.getElementById('new-ch-fields');
+  if(!t){{div.innerHTML='';return;}}
+  if(!CH_F[t]||!CH_F[t].length){{div.innerHTML='<div class="info-box" style="margin-top:0">No credentials needed — just click Add Channel.</div>';return;}}
+  let html='';
+  for(const f of CH_F[t]){{
+    html+='<label>'+f.label+'</label>';
+    if(f.opts){{
+      html+='<select id="nf_'+f.id+'">';
+      for(const o of f.opts)html+='<option value="'+o.v+'">'+o.l+'</option>';
+      html+='</select>';
+    }}else{{
+      html+='<input type="'+(f.type||'text')+'" id="nf_'+f.id+'" placeholder="'+(f.ph||'')+'" value="'+(f.def||'')+'">';
+    }}
+  }}
+  div.innerHTML=html;
+}}
+
+async function addCh(){{
+  const t=document.getElementById('new-ch-sel').value;
+  if(!t)return;
+  const payload={{channel_type:t}};
+  if(CH_F[t]){{for(const f of CH_F[t])payload[f.id]=(document.getElementById('nf_'+f.id)||{{}}).value||'';}}
+  try{{
+    await api('/manage/channels/add',payload);
+    toast('Channel added — agent restarting…',true);
+    setTimeout(()=>location.reload(),1200);
+  }}catch(e){{toast('Error: '+e.message,false);}}
+}}
+
+async function removeCh(name){{
+  if(!confirm('Remove '+name+' channel? The agent will restart.'))return;
+  try{{
+    await api('/manage/channels/remove',{{channel:name}});
+    toast('Channel removed — agent restarting…',true);
+    setTimeout(()=>location.reload(),1200);
+  }}catch(e){{toast('Error: '+e.message,false);}}
+}}
+
+function selPv(pv,el){{
+  curPv=pv;
   document.querySelectorAll('.pcard').forEach(c=>c.classList.remove('sel'));
   el.classList.add('sel');
   document.querySelectorAll('.provider-creds').forEach(c=>c.classList.remove('vis'));
   document.getElementById('mp-'+pv).classList.add('vis');
 }}
 
-function v(id){{ const e=document.getElementById(id); return e?e.value.trim():''; }}
-
 async function saveProvider(){{
-  let key='', model='', apiUrl='';
-  if(curPv==='google')     {{key=v('m-gkey'); model=v('m-gmdl');}}
-  else if(curPv==='anthropic') {{key=v('m-akey'); model=v('m-amdl');}}
-  else if(curPv==='openai')    {{key=v('m-okey'); model=v('m-omdl');}}
-  else if(curPv==='openrouter'){{key=v('m-rkey'); model=v('m-rmdl');}}
-  else if(curPv==='ollama')    {{apiUrl=v('m-lurl'); model=v('m-lmdl');}}
+  let key='',model='',apiUrl='';
+  if(curPv==='google'){{key=v('m-gkey');model=v('m-gmdl');}}
+  else if(curPv==='anthropic'){{key=v('m-akey');model=v('m-amdl');}}
+  else if(curPv==='openai'){{key=v('m-okey');model=v('m-omdl');}}
+  else if(curPv==='openrouter'){{key=v('m-rkey');model=v('m-rmdl');}}
+  else if(curPv==='ollama'){{apiUrl=v('m-lurl');model=v('m-lmdl');}}
   try{{
-    await api('/manage/provider', {{provider:curPv, model, apiKey:key, apiUrl}});
-    toast('Provider updated — agent restarting…', true);
-    setTimeout(()=>location.reload(), 1500);
-  }}catch(e){{toast('Error: '+e.message, false);}}
+    await api('/manage/provider',{{provider:curPv,model,apiKey:key,apiUrl}});
+    toast('Provider updated — agent restarting…',true);
+    setTimeout(()=>location.reload(),1500);
+  }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
-function selHw(mode, el){{
-  curHw = mode;
+function selHw(mode,el){{
+  curHw=mode;
   document.querySelectorAll('.hw-opt').forEach(o=>o.classList.remove('sel'));
   el.classList.add('sel');
 }}
 
 async function saveHardware(){{
   try{{
-    await api('/manage/hardware', {{mode:curHw}});
-    document.getElementById('hw-badge').textContent = curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
-    document.getElementById('info-hw').textContent  = curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
-    toast('Hardware mode switching…', true);
-  }}catch(e){{toast('Error: '+e.message, false);}}
+    await api('/manage/hardware',{{mode:curHw}});
+    document.getElementById('hw-badge').textContent=curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
+    toast('Hardware mode updated',true);
+  }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
 async function changePassword(){{
-  const cur = v('pw-cur'), nw = v('pw-new'), cfm = v('pw-cfm');
-  if(!cur||!nw) return toast('Fill in all password fields', false);
-  if(nw !== cfm) return toast('New passwords do not match', false);
-  if(nw.length < 8) return toast('New password must be at least 8 characters', false);
+  const cur=v('pw-cur'),nw=v('pw-new'),cfm=v('pw-cfm');
+  if(!cur||!nw)return toast('Fill in all password fields',false);
+  if(nw!==cfm)return toast('New passwords do not match',false);
+  if(nw.length<8)return toast('Password must be at least 8 characters',false);
   try{{
-    await api('/manage/password', {{current:cur, newPassword:nw}});
-    document.getElementById('pw-cur').value='';
-    document.getElementById('pw-new').value='';
-    document.getElementById('pw-cfm').value='';
-    toast('Password updated', true);
-  }}catch(e){{toast('Error: '+e.message, false);}}
+    await api('/manage/password',{{current:cur,newPassword:nw}});
+    ['pw-cur','pw-new','pw-cfm'].forEach(id=>document.getElementById(id).value='');
+    toast('Password updated',true);
+  }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
 async function triggerUpdate(){{
-  const btn = document.getElementById('upd-btn');
-  const msg = document.getElementById('upd-msg');
-  btn.disabled = true;
-  btn.textContent = 'Checking…';
-  msg.style.display='block';
-  msg.textContent='Querying GitHub Releases…';
+  const btn=document.getElementById('upd-btn');
+  const msg=document.getElementById('upd-msg');
+  btn.disabled=true;btn.textContent='Checking…';msg.style.display='none';
   try{{
-    await api('/manage/update', {{}});
-    msg.textContent='Update check triggered. If a newer version was found, the node will restart automatically within 60 seconds.';
-    toast('Update check started', true);
-  }}catch(e){{
-    msg.textContent='Error: '+e.message;
-    toast('Update check failed', false);
-  }}finally{{
-    btn.disabled=false;
-    btn.textContent='Check for Updates';
-  }}
+    await api('/manage/update',{{}});
+    msg.textContent='Update check triggered. If a newer version is found the node will restart automatically.';
+    msg.style.display='block';
+  }}catch(e){{msg.textContent='Error: '+e.message;msg.style.display='block';}}
+  finally{{btn.disabled=false;btn.textContent='Check for Updates Now';}}
 }}
 </script>
-</body></html>"##,
-        css              = COMMON_CSS,
-        node_name        = html_escape(&node_name),
-        version          = VERSION,
-        ip               = ip,
-        uptime           = fmt_uptime(uptime_s),
-        agent_badge      = if agent_on { "Enabled" } else { "Disabled" },
-        agent_badge_class = if agent_on { "badge-green" } else { "badge-gray" },
-        agent_chk        = agent_chk,
-        agent_vis        = agent_vis,
-        fork_name        = fork_name,
-        hw_mode_display  = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" },
-        hw_mode          = hw_mode,
-        channel_display  = if channel.is_empty()  { "—".to_string() } else { channel.clone() },
-        provider_display = if provider.is_empty() { "—".to_string() } else { provider.clone() },
-        provider_js      = html_escape(&provider),
-        keys_html        = keys_html,
-        ssh_count        = ssh_keys.len(),
-        ssh_plural       = if ssh_keys.len() == 1 { "" } else { "s" },
-        sel_std          = if hw_mode != "WIND_TUNNEL" { " sel" } else { "" },
-        sel_wt           = if hw_mode == "WIND_TUNNEL"  { " sel" } else { "" },
-        sel_holo         = if provider == "holo"        { " sel" } else { "" },
-        sel_google       = if provider == "google"      { " sel" } else { "" },
-        sel_anthropic    = if provider == "anthropic"   { " sel" } else { "" },
-        sel_openai       = if provider == "openai"      { " sel" } else { "" },
-        sel_openrouter   = if provider == "openrouter"  { " sel" } else { "" },
-        sel_ollama       = if provider == "ollama"      { " sel" } else { "" },
-        vis_holo         = if provider == "holo"        { " vis" } else { "" },
-        vis_google       = if provider == "google"      { " vis" } else { "" },
-        vis_anthropic    = if provider == "anthropic"   { " vis" } else { "" },
-        vis_openai       = if provider == "openai"      { " vis" } else { "" },
-        vis_openrouter   = if provider == "openrouter"  { " vis" } else { "" },
-        vis_ollama       = if provider == "ollama"      { " vis" } else { "" },
+</body></html>"#,
+        css               = COMMON_CSS,
+        node_name         = html_escape(&node_name),
+        version           = VERSION,
+        ip                = html_escape(&ip),
+        uptime            = fmt_uptime(uptime_s),
+        keys_html         = keys_html,
+        ssh_count         = ssh_count,
+        ssh_plural        = ssh_plural,
+        ch_chips_html     = ch_chips_html,
+        ch_count_display  = ch_count_display,
+        agent_badge       = agent_badge,
+        agent_badge_class = agent_badge_class,
+        agent_chk         = agent_chk,
+        agent_vis         = agent_vis,
+        provider_display  = html_escape(&provider_display),
+        provider_js       = html_escape(&provider),
+        model_display     = html_escape(&model),
+        channel_display   = html_escape(&channel_display),
+        hw_mode           = hw_mode,
+        hw_mode_display   = hw_mode_display,
+        sel_std           = sel_std,
+        sel_wt            = sel_wt,
+        sel_holo          = sel_card("holo"),
+        sel_google        = sel_card("google"),
+        sel_anthropic     = sel_card("anthropic"),
+        sel_openai        = sel_card("openai"),
+        sel_openrouter    = sel_card("openrouter"),
+        sel_ollama        = sel_card("ollama"),
+        vis_holo          = vis("holo"),
+        vis_google        = vis("google"),
+        vis_anthropic     = vis("anthropic"),
+        vis_openai        = vis("openai"),
+        vis_openrouter    = vis("openrouter"),
+        vis_ollama        = vis("ollama"),
     )
-}
-
-fn fmt_uptime(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
-    }
-}
-
-// ── Request dispatcher ─────────────────────────────────────────────────────────
-
-fn handle(stream: &mut TcpStream, state: Arc<AppState>, auth_hash: Arc<Mutex<String>>) {
-    let req = match read_request(stream) {
-        Some(r) => r,
-        None => return,
-    };
-
-    let path   = req.path.as_str();
-    let method = req.method.as_str();
-
-    match (method, path) {
-        ("GET", "/login") => {
-            send_html(stream, &build_login_html(false));
-            return;
-        }
-        ("POST", "/login") => {
-            let form     = parse_form(&req.body);
-            let password = form.get("password").map(|s| s.as_str()).unwrap_or("");
-            let hash     = auth_hash.lock().unwrap().clone();
-            if verify_password(password, &hash) {
-                let token = create_session(&state);
-                send_redirect_with_cookie(stream, "/manage", &session_cookie(&token));
-            } else {
-                send_html(stream, &build_login_html(true));
-            }
-            return;
-        }
-        ("POST", "/logout") => {
-            if let Some(token) = get_cookie(&req.headers, "session") {
-                state.sessions.lock().unwrap().remove(&token);
-            }
-            let hdr = format!(
-                "HTTP/1.1 302 Found\r\nLocation: /login\r\nSet-Cookie: {}\r\n\
-                 Content-Length: 0\r\nConnection: close\r\n\r\n",
-                clear_cookie()
-            );
-            let _ = stream.write_all(hdr.as_bytes());
-            return;
-        }
-        ("GET", "/") => {
-            if state.onboarded.load(Ordering::Relaxed) {
-                send_redirect(stream, "/manage");
-            } else {
-                send_html(stream, &build_onboarding_html(state.ap_mode));
-            }
-            return;
-        }
-        ("POST", "/submit") => {
-            handle_submit(stream, &req, &state, &auth_hash);
-            return;
-        }
-        _ => {}
-    }
-
-    if !is_authenticated(&req, &state) {
-        send_redirect(stream, "/login");
-        return;
-    }
-
-    match (method, path) {
-        ("GET",  "/manage")          => { send_html(stream, &build_manage_html(&state)); }
-        ("GET",  "/manage/status")   => { handle_manage_status(stream, &state); }
-        ("POST", "/manage/ssh/add")  => { handle_ssh_add(stream, &req); }
-        ("POST", "/manage/ssh/remove") => { handle_ssh_remove(stream, &req); }
-        ("POST", "/manage/agent")    => { handle_agent_toggle(stream, &req, &state); }
-        ("POST", "/manage/provider") => { handle_provider_swap(stream, &req, &state); }
-        ("POST", "/manage/hardware") => { handle_hardware_switch(stream, &req, &state); }
-        ("POST", "/manage/password") => { handle_password_change(stream, &req, &auth_hash); }
-        ("POST", "/manage/update")   => {
-            let repo = env::var(UPDATE_REPO_ENV)
-                .unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
-            thread::spawn(move || check_and_apply_update(&repo));
-            send_json_ok(stream, r#"{"status":"update check triggered"}"#);
-        }
-        _ => { send_response(stream, 404, "Not Found", "text/plain", b"Not Found"); }
-    }
 }
 
 // ── Route handlers ─────────────────────────────────────────────────────────────
@@ -2151,26 +2102,24 @@ fn handle_submit(
     state: &AppState,
     _auth_hash: &Arc<Mutex<String>>,
 ) {
-    let body        = &req.body;
-    let node_name   = json_str(body, "nodeName");
-    let ssh_key     = json_str(body, "sshKey");
-    let agent_on    = json_bool(body, "agentEnabled");
-    let channel     = json_str(body, "channel");
-    let provider    = json_str(body, "provider");
-    let api_key     = json_str(body, "apiKey");
-    let model       = json_str(body, "model");
-    let api_url     = json_str(body, "apiUrl");
-    let hw_mode     = json_str(body, "hwMode");
-    let level       = match json_str(body, "autonomyLevel") {
+    let body      = &req.body;
+    let node_name = json_str(body, "nodeName");
+    let ssh_key   = json_str(body, "sshKey");
+    let agent_on  = json_bool(body, "agentEnabled");
+    let channel   = json_str(body, "channel");
+    let provider  = json_str(body, "provider");
+    let api_key   = json_str(body, "apiKey");
+    let model     = json_str(body, "model");
+    let api_url   = json_str(body, "apiUrl");
+    let hw_mode   = json_str(body, "hwMode");
+    let level     = match json_str(body, "autonomyLevel") {
         "readonly" | "full" => json_str(body, "autonomyLevel"),
-        _ => "supervised",
+        _                   => "supervised",
     };
 
-    if node_name.is_empty() {
-        send_json_err(stream, 400, "nodeName is required");
-        return;
-    }
+    if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
 
+    // ── WiFi (AP mode) ───────────────────────────────────────────────────────
     let wifi_ssid = json_str(body, "wifiSsid");
     let wifi_pass = json_str(body, "wifiPass");
     if !wifi_ssid.is_empty() && !wifi_pass.is_empty() {
@@ -2181,137 +2130,108 @@ fn handle_submit(
         thread::sleep(Duration::from_secs(4));
     }
 
-    for dir in &[
-        "/etc/node-manager",
-        SKILLS_DIR,
-        QUADLET_DIR,
-        WORKSPACE_DIR,
-        "/var/lib/edgenode",
-        "/home/holo/.ssh",
-    ] {
+    // ── Ensure directories ───────────────────────────────────────────────────
+    for dir in &["/etc/node-manager", SKILLS_DIR, QUADLET_DIR, WORKSPACE_DIR,
+                 "/var/lib/edgenode", "/home/holo/.ssh"] {
         let _ = fs::create_dir_all(dir);
     }
 
+    // ── SSH keys ─────────────────────────────────────────────────────────────
     if !ssh_key.trim().is_empty() {
         if !is_valid_ssh_pubkey(ssh_key) {
-            send_json_err(stream, 400, "Invalid SSH public key format");
-            return;
+            send_json_err(stream, 400, "Invalid SSH public key format"); return;
         }
         if let Err(e) = write_ssh_keys(&[ssh_key.to_string()]) {
-            send_json_err(stream, 500, &format!("Failed to write SSH key: {}", e));
-            return;
+            send_json_err(stream, 500, &format!("Failed to write SSH key: {}", e)); return;
         }
-        eprintln!("[onboard] SSH key written for holo user");
+        eprintln!("[onboard] SSH key written");
     }
 
+    // ── Quadlets ─────────────────────────────────────────────────────────────
     let wt_hostname    = format!("nomad-client-{}", node_name);
     let edgenode_image = resolve_edgenode_image();
     let wt_image       = resolve_wind_tunnel_image();
-    eprintln!("[onboard] edgenode image: {}", edgenode_image);
-    eprintln!("[onboard] wind-tunnel image: {}", wt_image);
-
-    let _ = fs::write(
-        format!("{}/edgenode.container", QUADLET_DIR),
-        build_edgenode_quadlet(&edgenode_image),
-    );
-    let _ = fs::write(
-        format!("{}/wind-tunnel.container", QUADLET_DIR),
-        build_wind_tunnel_quadlet(&wt_hostname, &wt_image),
-    );
+    let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR),    build_edgenode_quadlet(&edgenode_image));
+    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&wt_hostname, &wt_image));
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 
-    let _ = fs::write(
-        format!("{}/mode_switch.txt", WORKSPACE_DIR),
-        if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" },
-    );
-
+    let _ = fs::write(format!("{}/mode_switch.txt", WORKSPACE_DIR),
+        if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" });
     let initial_svc = if hw_mode == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
-    eprintln!("[onboard] Starting {}", initial_svc);
     let _ = Command::new("systemctl").args(["start", initial_svc]).output();
 
+    // ── Agent (optional) ─────────────────────────────────────────────────────
     if agent_on {
         if channel.is_empty() || provider.is_empty() {
-            send_json_err(stream, 400, "channel and provider required when agent is enabled");
-            return;
+            send_json_err(stream, 400, "channel and provider required when agent is enabled"); return;
         }
         let pv_cfg = match make_provider_config(provider, model, api_key, api_url) {
             Some(c) => c,
-            None => {
-                send_json_err(stream, 400, "unknown provider");
-                return;
-            }
+            None    => { send_json_err(stream, 400, "unknown provider"); return; }
         };
 
-        eprintln!("[onboard] Running openclaw onboard (fork: {})", active_fork().display_name);
-        if let Err(e) = run_openclaw_onboard(&pv_cfg) {
-            send_json_err(stream, 500, &e);
-            return;
-        }
+        // BUG FIX v5.1.0: ensure openclaw binary is present before calling onboard.
+        // If missing, triggers openclaw-update.service --wait so onboarding never
+        // races the OnBootSec=10min timer.
+        if !ensure_openclaw_binary(stream) { return; }
 
+        eprintln!("[onboard] Running openclaw onboard");
+        if let Err(e) = run_openclaw_onboard(&pv_cfg) { send_json_err(stream, 500, &e); return; }
         write_openclaw_env(provider, api_key);
 
-        let config = match fs::read_to_string("/etc/openclaw/config.toml") {
-            Ok(c) => c,
-            Err(e) => {
-                send_json_err(stream, 500, &format!("config not found: {}", e));
-                return;
-            }
+        let config = match fs::read_to_string(OPENCLAW_CONFIG) {
+            Ok(c)  => c,
+            Err(e) => { send_json_err(stream, 500, &format!("config not found: {}", e)); return; }
         };
-
+        // Build channel TOML; payload uses {channel_type}_{field_id} key names.
+        let channel_toml = build_channel_toml(body, channel);
         let mut final_config = patch_openclaw_config(&config, level);
         final_config.push('\n');
-        final_config.push_str(&build_channel_toml(body, channel));
-
-        if let Err(e) = fs::write("/etc/openclaw/config.toml", &final_config) {
-            send_json_err(stream, 500, &format!("failed to write config: {}", e));
-            return;
+        if channel == "cli" {
+            // CLI requires inject via add_channel_to_config (sets cli=true flag)
+            final_config = add_channel_to_config(&final_config, "cli", "");
+        } else {
+            final_config.push_str(&channel_toml);
         }
-        let _ = Command::new("chmod").args(["600", "/etc/openclaw/config.toml"]).output();
+        if let Err(e) = fs::write(OPENCLAW_CONFIG, &final_config) {
+            send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
+        }
+        let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
 
-        let _ = fs::write(
-            PROVIDER_FILE,
-            format!(
-                "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
-                toml_escape(provider), toml_escape(&pv_cfg.model),
-                toml_escape(api_key),  toml_escape(api_url)
-            ),
-        );
+        let _ = fs::write(PROVIDER_FILE, format!(
+            "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
+            toml_escape(provider), toml_escape(&pv_cfg.model),
+            toml_escape(api_key), toml_escape(api_url)
+        ));
         let _ = Command::new("chmod").args(["600", PROVIDER_FILE]).output();
-
-        let _ = fs::write(
-            format!("{}/wind-tunnel.env", "/etc/openclaw"),
-            format!("WIND_TUNNEL_HOSTNAME={}\n", wt_hostname),
-        );
         let _ = fs::write(format!("{}/holo-node.md", SKILLS_DIR), HOLO_NODE_SKILL);
-        let _ = fs::write(format!("{}/soul.md", SKILLS_DIR), SOUL_SKILL);
-
-        eprintln!("[onboard] Starting openclaw-daemon");
         let _ = Command::new("systemctl").args(["start", "openclaw-daemon.service"]).output();
 
-        let body_clone   = body.to_string();
-        let channel_str  = channel.to_string();
-        let hw_str       = hw_mode.to_string();
+        let body_clone  = body.to_string();
+        let channel_str = channel.to_string();
+        let hw_str      = hw_mode.to_string();
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(8));
             send_welcome_message(&channel_str, &body_clone, &hw_str);
         });
     }
 
+    // ── Persist state ────────────────────────────────────────────────────────
     let mut kv = HashMap::new();
-    kv.insert("onboarded".to_string(),     "true".to_string());
-    kv.insert("node_name".to_string(),     node_name.to_string());
-    kv.insert("hw_mode".to_string(),       if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string());
-    kv.insert("agent_enabled".to_string(), agent_on.to_string());
-    kv.insert("channel".to_string(),       channel.to_string());
-    kv.insert("provider".to_string(),      provider.to_string());
-    kv.insert("model".to_string(),         model.to_string());
+    kv.insert("onboarded".into(), "true".into());
+    kv.insert("node_name".into(), node_name.to_string());
+    kv.insert("hw_mode".into(), if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string());
+    kv.insert("agent_enabled".into(), agent_on.to_string());
+    kv.insert("channel".into(), channel.to_string());
+    kv.insert("provider".into(), provider.to_string());
+    kv.insert("model".into(), model.to_string());
     write_state_file(&kv);
 
-    *state.node_name.lock().unwrap()  = node_name.to_string();
-    *state.hw_mode.lock().unwrap()    = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string();
-    *state.channel.lock().unwrap()    = channel.to_string();
-    *state.provider.lock().unwrap()   = provider.to_string();
-    *state.model.lock().unwrap()      = model.to_string();
+    *state.node_name.lock().unwrap() = node_name.to_string();
+    *state.hw_mode.lock().unwrap()   = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string();
+    *state.channel.lock().unwrap()   = channel.to_string();
+    *state.provider.lock().unwrap()  = provider.to_string();
+    *state.model.lock().unwrap()     = model.to_string();
     state.agent_enabled.store(agent_on, Ordering::Relaxed);
     state.onboarded.store(true, Ordering::Relaxed);
 
@@ -2328,36 +2248,22 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let agent     = state.agent_enabled.load(Ordering::Relaxed);
     let uptime    = state.start_time.elapsed().unwrap_or_default().as_secs();
     let keys      = read_ssh_keys();
-
     let keys_json: String = keys.iter()
         .map(|k| format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let json = format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","agent_enabled":{},"channel":"{}","provider":"{}","model":"{}","openclaw_fork":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
+        .collect::<Vec<_>>().join(",");
+    send_json_ok(stream, &format!(
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","agent_enabled":{},"channel":"{}","provider":"{}","model":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
         VERSION, node_name, hw_mode, agent, channel, provider, model,
-        active_fork().id,
         keys.len(), keys_json, uptime
-    );
-    send_json_ok(stream, &json);
+    ));
 }
 
 fn handle_ssh_add(stream: &mut TcpStream, req: &Req) {
     let key = json_str(&req.body, "key");
-    if key.is_empty() {
-        send_json_err(stream, 400, "key is required");
-        return;
-    }
-    if !is_valid_ssh_pubkey(key) {
-        send_json_err(stream, 400, "Invalid SSH public key format");
-        return;
-    }
+    if key.is_empty() { send_json_err(stream, 400, "key is required"); return; }
+    if !is_valid_ssh_pubkey(key) { send_json_err(stream, 400, "Invalid SSH public key format"); return; }
     let mut keys = read_ssh_keys();
-    if keys.iter().any(|k| k == key) {
-        send_json_err(stream, 409, "Key already present");
-        return;
-    }
+    if keys.iter().any(|k| k == key) { send_json_err(stream, 409, "Key already present"); return; }
     keys.push(key.to_string());
     match write_ssh_keys(&keys) {
         Ok(()) => send_json_ok(stream, r#"{"status":"added"}"#),
@@ -2369,29 +2275,17 @@ fn handle_ssh_remove(stream: &mut TcpStream, req: &Req) {
     let idx_str = {
         let needle = "\"index\":";
         match req.body.find(needle) {
-            None => {
-                send_json_err(stream, 400, "index is required");
-                return;
-            }
+            None    => { send_json_err(stream, 400, "index is required"); return; }
             Some(p) => req.body[p + needle.len()..].trim_start()
-                .split(|c: char| !c.is_ascii_digit())
-                .next()
-                .unwrap_or("")
-                .to_string(),
+                .split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").to_string(),
         }
     };
     let idx: usize = match idx_str.parse() {
-        Ok(i) => i,
-        Err(_) => {
-            send_json_err(stream, 400, "invalid index");
-            return;
-        }
+        Ok(i)  => i,
+        Err(_) => { send_json_err(stream, 400, "invalid index"); return; }
     };
     let mut keys = read_ssh_keys();
-    if idx >= keys.len() {
-        send_json_err(stream, 404, "index out of range");
-        return;
-    }
+    if idx >= keys.len() { send_json_err(stream, 404, "index out of range"); return; }
     keys.remove(idx);
     match write_ssh_keys(&keys) {
         Ok(()) => send_json_ok(stream, r#"{"status":"removed"}"#),
@@ -2399,185 +2293,419 @@ fn handle_ssh_remove(stream: &mut TcpStream, req: &Req) {
     }
 }
 
-fn handle_agent_toggle(stream: &mut TcpStream, req: &Req, state: &AppState) {
-    let enable = json_bool(&req.body, "enabled");
+fn handle_agent_toggle(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
+    let enabled = json_bool(&req.body, "enabled");
 
-    if enable && !state.agent_enabled.load(Ordering::Relaxed) {
-        let pf = fs::read_to_string(PROVIDER_FILE).unwrap_or_default();
-        let pf_kv: HashMap<String, String> = pf.lines()
-            .filter_map(|l| l.find('=').map(|e| (l[..e].to_string(), l[e + 1..].to_string())))
-            .collect();
-        let provider = pf_kv.get("provider").map(|s| s.as_str()).unwrap_or("holo");
-        let model    = pf_kv.get("model").map(|s| s.as_str()).unwrap_or("");
-        let api_key  = pf_kv.get("api_key").map(|s| s.as_str()).unwrap_or("");
-        let api_url  = pf_kv.get("api_url").map(|s| s.as_str()).unwrap_or("");
+    if enabled {
+        // Bug fix v5.1.0: save existing channel config before openclaw onboard
+        // (which rewrites config.toml with a fresh skeleton), then reapply after.
+        let channel_config = match fs::read_to_string(OPENCLAW_CONFIG) {
+            Ok(c) => extract_channel_config(&c),
+            Err(_) => String::new(),
+        };
 
-        let pv_cfg = match make_provider_config(provider, model, api_key, api_url) {
+        // Read provider info
+        let provider = state.provider.lock().unwrap().clone();
+        let model = state.model.lock().unwrap().clone();
+        let (api_key, api_url) = read_provider_file();
+
+        let pv_cfg = match make_provider_config(&provider, &model, &api_key, &api_url) {
             Some(c) => c,
             None => {
-                send_json_err(stream, 400, "invalid stored provider config");
-                return;
+                // Fallback to holo if no provider configured
+                make_provider_config("holo", "", "", "").unwrap()
             }
         };
+
+        if !ensure_openclaw_binary(stream) { return; }
+
         if let Err(e) = run_openclaw_onboard(&pv_cfg) {
-            send_json_err(stream, 500, &e);
-            return;
+            send_json_err(stream, 500, &e); return;
         }
-        if let Ok(config) = fs::read_to_string("/etc/openclaw/config.toml") {
-            let autonomy    = read_state_file().get("autonomy").cloned().unwrap_or_else(|| "supervised".into());
-            let channel_cfg = extract_channel_config(&config);
-            let mut final_config = patch_openclaw_config(&config, &autonomy);
-            final_config.push('\n');
-            final_config.push_str(&channel_cfg);
-            let _ = fs::write("/etc/openclaw/config.toml", &final_config);
-            let _ = Command::new("chmod").args(["600", "/etc/openclaw/config.toml"]).output();
+        write_openclaw_env(&provider, &api_key);
+
+        // Reapply channel config
+        if !channel_config.trim().is_empty() {
+            if let Ok(config) = fs::read_to_string(OPENCLAW_CONFIG) {
+                let mut final_config = config;
+                final_config.push('\n');
+                final_config.push_str(&channel_config);
+                let _ = fs::write(OPENCLAW_CONFIG, &final_config);
+                let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+            }
         }
+
         let _ = Command::new("systemctl").args(["start", "openclaw-daemon.service"]).output();
-        eprintln!("[manage] Agent re-enabled ({})", active_fork().display_name);
-    } else if !enable && state.agent_enabled.load(Ordering::Relaxed) {
+    } else {
         let _ = Command::new("systemctl").args(["stop", "openclaw-daemon.service"]).output();
-        eprintln!("[manage] Agent disabled");
     }
 
-    state.agent_enabled.store(enable, Ordering::Relaxed);
-    update_state_key("agent_enabled", if enable { "true" } else { "false" });
-    send_json_ok(stream, r#"{"status":"ok"}"#);
+    state.agent_enabled.store(enabled, Ordering::Relaxed);
+    update_state_key("agent_enabled", &enabled.to_string());
+
+    send_json_ok(stream, &format!(r#"{{"status":"ok","agent_enabled":{}}}"#, enabled));
 }
 
-fn handle_provider_swap(stream: &mut TcpStream, req: &Req, state: &AppState) {
+fn handle_provider_swap(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
     let provider = json_str(&req.body, "provider");
     let model    = json_str(&req.body, "model");
     let api_key  = json_str(&req.body, "apiKey");
     let api_url  = json_str(&req.body, "apiUrl");
 
-    if provider.is_empty() {
-        send_json_err(stream, 400, "provider is required");
-        return;
-    }
+    if provider.is_empty() { send_json_err(stream, 400, "provider is required"); return; }
+
     let pv_cfg = match make_provider_config(provider, model, api_key, api_url) {
         Some(c) => c,
-        None => {
-            send_json_err(stream, 400, "unknown provider");
-            return;
-        }
+        None    => { send_json_err(stream, 400, "unknown provider"); return; }
     };
 
-    eprintln!("[manage] Provider swap → {}", provider);
-    if let Err(e) = run_openclaw_onboard(&pv_cfg) {
-        send_json_err(stream, 500, &e);
-        return;
-    }
+    // Bug fix v5.1.0: save existing channel config before openclaw onboard
+    // (which rewrites config.toml with a fresh skeleton), then reapply after.
+    let channel_config = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c) => extract_channel_config(&c),
+        Err(_) => String::new(),
+    };
 
+    if !ensure_openclaw_binary(stream) { return; }
+
+    if let Err(e) = run_openclaw_onboard(&pv_cfg) {
+        send_json_err(stream, 500, &e); return;
+    }
     write_openclaw_env(provider, api_key);
 
-    let config = match fs::read_to_string("/etc/openclaw/config.toml") {
-        Ok(c) => c,
-        Err(e) => {
-            send_json_err(stream, 500, &format!("config not found: {}", e));
-            return;
+    // Reapply channel config
+    if !channel_config.trim().is_empty() {
+        if let Ok(config) = fs::read_to_string(OPENCLAW_CONFIG) {
+            let mut final_config = config;
+            final_config.push('\n');
+            final_config.push_str(&channel_config);
+            let _ = fs::write(OPENCLAW_CONFIG, &final_config);
+            let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
         }
-    };
-    let autonomy    = read_state_file().get("autonomy").cloned().unwrap_or_else(|| "supervised".into());
-    let channel_cfg = extract_channel_config(&config);
-    let mut final_config = patch_openclaw_config(&config, &autonomy);
-    final_config.push('\n');
-    final_config.push_str(&channel_cfg);
-    let _ = fs::write("/etc/openclaw/config.toml", &final_config);
-    let _ = Command::new("chmod").args(["600", "/etc/openclaw/config.toml"]).output();
+    }
 
-    let _ = fs::write(
-        PROVIDER_FILE,
-        format!(
-            "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
-            toml_escape(provider), toml_escape(&pv_cfg.model),
-            toml_escape(api_key),  toml_escape(api_url)
-        ),
-    );
+    // Persist provider info
+    let _ = fs::write(PROVIDER_FILE, format!(
+        "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
+        toml_escape(provider), toml_escape(&pv_cfg.model),
+        toml_escape(api_key), toml_escape(api_url)
+    ));
     let _ = Command::new("chmod").args(["600", PROVIDER_FILE]).output();
-
-    let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
 
     *state.provider.lock().unwrap() = provider.to_string();
     *state.model.lock().unwrap()    = pv_cfg.model.clone();
     update_state_key("provider", provider);
     update_state_key("model", &pv_cfg.model);
 
+    let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
+
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
-fn handle_hardware_switch(stream: &mut TcpStream, req: &Req, state: &AppState) {
-    let mode = match json_str(&req.body, "mode") {
-        "WIND_TUNNEL" => "WIND_TUNNEL",
-        _ => "STANDARD",
+fn handle_channel_add(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
+    let channel_type = json_str(&req.body, "channel_type");
+    if channel_type.is_empty() { send_json_err(stream, 400, "channel_type is required"); return; }
+
+    let channel_toml = build_channel_section(channel_type, &req.body);
+
+    let config = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c)  => c,
+        Err(e) => { send_json_err(stream, 500, &format!("cannot read config: {}", e)); return; }
     };
+
+    let updated = add_channel_to_config(&config, channel_type, &channel_toml);
+    if let Err(e) = fs::write(OPENCLAW_CONFIG, &updated) {
+        send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
+    }
+    let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+
+    // Update state with the first/primary channel
+    *state.channel.lock().unwrap() = channel_type.to_string();
+    update_state_key("channel", channel_type);
+
+    // Restart agent to pick up new channel
+    if state.agent_enabled.load(Ordering::Relaxed) {
+        let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
+    }
+
+    send_json_ok(stream, r#"{"status":"added"}"#);
+}
+
+fn handle_channel_remove(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
+    let channel = json_str(&req.body, "channel");
+    if channel.is_empty() { send_json_err(stream, 400, "channel is required"); return; }
+
+    let config = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c)  => c,
+        Err(e) => { send_json_err(stream, 500, &format!("cannot read config: {}", e)); return; }
+    };
+
+    let updated = remove_channel_from_config(&config, channel);
+    if let Err(e) = fs::write(OPENCLAW_CONFIG, &updated) {
+        send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
+    }
+    let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+
+    // If we removed the primary channel, update state
+    {
+        let current = state.channel.lock().unwrap().clone();
+        if current == channel {
+            let remaining = list_configured_channels(&updated);
+            let new_primary = remaining.first().cloned().unwrap_or_default();
+            *state.channel.lock().unwrap() = new_primary.clone();
+            update_state_key("channel", &new_primary);
+        }
+    }
+
+    // Restart agent to pick up change
+    if state.agent_enabled.load(Ordering::Relaxed) {
+        let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
+    }
+
+    send_json_ok(stream, r#"{"status":"removed"}"#);
+}
+
+fn handle_hardware(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
+    let mode = json_str(&req.body, "mode");
+    let mode = if mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
     apply_hardware_mode(mode, state);
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
-fn handle_password_change(
+fn handle_password(
     stream: &mut TcpStream,
     req: &Req,
     auth_hash: &Arc<Mutex<String>>,
 ) {
-    let current  = json_str(&req.body, "current");
-    let new_pass = json_str(&req.body, "newPassword");
+    let current      = json_str(&req.body, "current");
+    let new_password = json_str(&req.body, "newPassword");
 
-    if current.is_empty() || new_pass.is_empty() {
-        send_json_err(stream, 400, "current and newPassword are required");
-        return;
+    if current.is_empty() || new_password.is_empty() {
+        send_json_err(stream, 400, "current and newPassword are required"); return;
     }
-    if new_pass.len() < 8 {
-        send_json_err(stream, 400, "new password must be at least 8 characters");
-        return;
+    if new_password.len() < 8 {
+        send_json_err(stream, 400, "Password must be at least 8 characters"); return;
     }
 
-    let stored = auth_hash.lock().unwrap().clone();
-    if !verify_password(current, &stored) {
-        send_json_err(stream, 403, "current password is incorrect");
-        return;
+    let hash = auth_hash.lock().unwrap().clone();
+    if !verify_password(current, &hash) {
+        send_json_err(stream, 401, "Incorrect current password"); return;
     }
 
-    let new_hash = hash_password(new_pass);
+    let new_hash = hash_password(new_password);
     let _ = fs::write(AUTH_FILE, &new_hash);
     let _ = Command::new("chmod").args(["600", AUTH_FILE]).output();
     *auth_hash.lock().unwrap() = new_hash;
 
-    eprintln!("[manage] Password changed");
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+fn handle_update(stream: &mut TcpStream) {
+    let repo = env::var(UPDATE_REPO_ENV).unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
+    thread::spawn(move || { check_and_apply_update(&repo); });
+    send_json_ok(stream, r#"{"status":"update_triggered"}"#);
+}
+
+/// Read provider info from the persisted provider file.
+fn read_provider_file() -> (String, String) {
+    let content = fs::read_to_string(PROVIDER_FILE).unwrap_or_default();
+    let mut api_key = String::new();
+    let mut api_url = String::new();
+    for line in content.lines() {
+        if let Some(eq) = line.find('=') {
+            let k = line[..eq].trim();
+            let v = line[eq + 1..].to_string();
+            match k {
+                "api_key" => api_key = v,
+                "api_url" => api_url = v,
+                _ => {}
+            }
+        }
+    }
+    (api_key, api_url)
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Rewrite the fork config block in openclaw-update.sh from compiled-in
-    // constants. Must run before the update checker spawns so that the hourly
-    // timer is always pointed at the correct fork repo.
+    eprintln!("[node-manager] Starting v{}", VERSION);
+
+    let ap_mode = env::args().any(|a| a == "--ap-mode");
+    let auth_hash = Arc::new(Mutex::new(load_or_create_auth()));
+    let state = Arc::new(AppState::new(ap_mode));
+
+    // Patch the openclaw update script with the active fork settings
     patch_openclaw_update_script();
 
-    let ap_mode = env::var("AP_MODE").unwrap_or_default() == "true";
-    let state   = Arc::new(AppState::new(ap_mode));
-
-    let auth_hash = Arc::new(Mutex::new(load_or_create_auth()));
-
+    // Spawn background update checker
     let repo = env::var(UPDATE_REPO_ENV).unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
     spawn_update_checker(repo);
 
-    let listener = TcpListener::bind("0.0.0.0:8080").expect("failed to bind :8080");
-    eprintln!("Holo node-manager v{} on :8080 (openclaw fork: {})", VERSION, active_fork().display_name);
-    eprintln!(
-        "State: onboarded={} agent={} hw={}",
-        state.onboarded.load(Ordering::Relaxed),
-        state.agent_enabled.load(Ordering::Relaxed),
-        state.hw_mode.lock().unwrap()
-    );
+    let listener = TcpListener::bind("0.0.0.0:8080").expect("Cannot bind to 0.0.0.0:8080");
+    eprintln!("[node-manager] Listening on http://0.0.0.0:8080");
 
     for stream in listener.incoming() {
-        let mut s = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let st = Arc::clone(&state);
-        let ah = Arc::clone(&auth_hash);
-        thread::spawn(move || handle(&mut s, st, ah));
+        let mut stream = match stream { Ok(s) => s, Err(_) => continue };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+        let state = Arc::clone(&state);
+        let auth_hash = Arc::clone(&auth_hash);
+
+        thread::spawn(move || {
+            let req = match read_request(&mut stream) { Some(r) => r, None => return };
+
+            match (req.method.as_str(), req.path.as_str()) {
+                // ── Public routes ──────────────────────────────────────────────
+                ("GET", "/") => {
+                    if state.onboarded.load(Ordering::Relaxed) {
+                        send_redirect(&mut stream, "/manage");
+                    } else {
+                        send_html(&mut stream, &build_onboarding_html(state.ap_mode));
+                    }
+                },
+
+                ("GET", "/login") => {
+                    if is_authenticated(&req, &state) {
+                        send_redirect(&mut stream, "/manage");
+                    } else {
+                        send_html(&mut stream, &build_login_html(false));
+                    }
+                },
+
+                ("POST", "/login") => {
+                    let form = parse_form(&req.body);
+                    let password = form.get("password").map(|s| s.as_str()).unwrap_or("");
+                    let hash = auth_hash.lock().unwrap().clone();
+                    if verify_password(password, &hash) {
+                        let token = create_session(&state);
+                        send_redirect_with_cookie(&mut stream, "/manage", &session_cookie(&token));
+                    } else {
+                        send_html(&mut stream, &build_login_html(true));
+                    }
+                },
+
+                ("POST", "/logout") => {
+                    send_redirect_with_cookie(&mut stream, "/login", &clear_cookie());
+                },
+
+                ("POST", "/submit") => {
+                    handle_submit(&mut stream, &req, &state, &auth_hash);
+                },
+
+                // ── Authenticated routes ───────────────────────────────────────
+                ("GET", "/manage") => {
+                    if !is_authenticated(&req, &state) {
+                        send_redirect(&mut stream, "/login");
+                    } else {
+                        send_html(&mut stream, &build_manage_html(&state));
+                    }
+                },
+
+                ("GET", "/manage/status") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_manage_status(&mut stream, &state);
+                    }
+                },
+
+                ("POST", "/manage/ssh/add") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_ssh_add(&mut stream, &req);
+                    }
+                },
+
+                ("POST", "/manage/ssh/remove") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_ssh_remove(&mut stream, &req);
+                    }
+                },
+
+                ("POST", "/manage/agent") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_agent_toggle(&mut stream, &req, &state);
+                    }
+                },
+
+                ("POST", "/manage/provider") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_provider_swap(&mut stream, &req, &state);
+                    }
+                },
+
+                ("POST", "/manage/hardware") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_hardware(&mut stream, &req, &state);
+                    }
+                },
+
+                ("POST", "/manage/password") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_password(&mut stream, &req, &auth_hash);
+                    }
+                },
+
+                ("POST", "/manage/update") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_update(&mut stream);
+                    }
+                },
+
+                ("POST", "/manage/channels/add") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_channel_add(&mut stream, &req, &state);
+                    }
+                },
+
+                ("POST", "/manage/channels/remove") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_channel_remove(&mut stream, &req, &state);
+                    }
+                },
+
+                _ => {
+                    send_response(&mut stream, 404, "Not Found", "text/plain", b"404 Not Found");
+                },
+            }
+        });
     }
 }

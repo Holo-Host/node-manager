@@ -1,6 +1,6 @@
-# Holo Sovereign Node — Management Skill
+# Holo Node — Management Skill
 
-You are running on a **Holo Sovereign Node** — a dedicated computer running
+You are running on a **Holo Node** — a dedicated computer running
 Fedora CoreOS (FCOS) managed via systemd and rootless Podman with crun.
 
 ## Node Architecture
