@@ -14,11 +14,12 @@ It is a single Rust binary with zero external dependencies — no Tokio, no Axum
 4. [Repository structure](#repository-structure)
 5. [Shipping a release](#shipping-a-release)
 6. [Self-update mechanism](#self-update-mechanism)
-7. [Routes reference](#routes-reference)
-8. [File paths on the node](#file-paths-on-the-node)
-9. [Security model](#security-model)
-10. [Adding a new chat channel](#adding-a-new-chat-channel)
-11. [Contributing](#contributing)
+7. [Switching OpenClaw forks](#switching-openclaw-forks)
+8. [Routes reference](#routes-reference)
+9. [File paths on the node](#file-paths-on-the-node)
+10. [Security model](#security-model)
+11. [Adding a new chat channel](#adding-a-new-chat-channel)
+12. [Contributing](#contributing)
 
 ---
 
@@ -39,7 +40,7 @@ holo-host/holo-node-iso          holo-host/node-manager
 │  node-setup.sh ─────┼──────────────────────────────►  downloaded at first boot
 │  (inlined script)   │
 │                     │
-│  node-manager    │   After first boot, the binary
+│  node-manager       │   After first boot, the binary
 │  .service (systemd) │   checks GitHub Releases hourly
 │                     │   and replaces itself in-place
 └─────────────────────┘   without needing a new ISO.
@@ -53,9 +54,9 @@ The binary is **not baked into the ISO**. Instead, the ISO contains `node-setup.
 
 ### First boot
 
-On first boot `node-setup.sh` (part of the ISO) downloads this binary from the latest GitHub Release and installs it to `/usr/local/bin/node-onboarding`. Once installed, `node-onboarding.service` starts.
+On first boot `node-setup.sh` (part of the ISO) downloads this binary from the latest GitHub Release and installs it to `/usr/local/bin/node-manager`. Once installed, `node-manager.service` starts.
 
-On startup the binary generates a random 12-character password, writes its SHA-256 hash to `/etc/node-onboarding/auth`, and displays the password and the node's local IP address on the HDMI-connected screen (`/dev/tty1`) in large coloured text. The node operator uses that information to open the setup UI in a browser.
+On startup the binary generates a random 12-character password, writes its SHA-256 hash to `/etc/node-manager/auth`, and displays the password and the node's local IP address on the HDMI-connected screen (`/dev/tty1`) in large coloured text. The node operator uses that information to open the setup UI in a browser.
 
 ### Onboarding wizard
 
@@ -73,7 +74,7 @@ After the operator submits, the server configures everything, starts the appropr
 After onboarding, `GET /` redirects to `/manage`. The panel (password-protected) lets the operator:
 
 - Add and remove SSH public keys for the `holo` user without physical access
-- Enable or disable the ZeroClaw AI agent at any time
+- Enable or disable the OpenClaw AI agent at any time
 - Hot-swap the AI provider, model, and API key without re-onboarding
 - Switch hardware mode between Standard EdgeNode and Wind Tunnel
 - Change the node password
@@ -81,7 +82,9 @@ After onboarding, `GET /` redirects to `/manage`. The panel (password-protected)
 
 ### Self-update
 
-A background thread wakes every hour, queries the GitHub Releases API for this repository, and compares the latest tag against the compiled-in `VERSION` constant. If a newer version exists it downloads the architecture-matched binary, atomically replaces the running binary on disk, and calls `systemctl restart node-onboarding.service`. The update check can also be triggered manually from the `/manage` panel.
+A background thread wakes every hour, queries the GitHub Releases API for this repository, and compares the latest tag against the compiled-in `VERSION` constant. If a newer version exists it downloads the architecture-matched binary, atomically replaces the running binary on disk, and calls `systemctl restart node-manager.service`. The update check can also be triggered manually from the `/manage` panel.
+
+On every startup, `node-manager` also rewrites the fork config block in `/usr/local/bin/openclaw-update.sh` from its compiled-in constants (see [Switching OpenClaw forks](#switching-openclaw-forks) below). This ensures the hourly OpenClaw update timer is always pointed at the correct fork repo, even after a node-manager update changes the active fork.
 
 ---
 
@@ -102,7 +105,7 @@ rustup target add aarch64-unknown-linux-musl
 
 ```bash
 cargo build
-./target/debug/node-onboarding
+./target/debug/node-manager
 # Open http://localhost:8080
 ```
 
@@ -132,9 +135,9 @@ cargo run
 To simulate an already-onboarded node (skip to /manage):
 
 ```bash
-mkdir -p /etc/node-onboarding
+mkdir -p /etc/node-manager
 echo "onboarded=true\nnode_name=test\nhw_mode=STANDARD\nagent_enabled=false" \
-  > /etc/node-onboarding/state
+  > /etc/node-manager/state
 cargo run
 # GET / will redirect to /manage
 ```
@@ -144,10 +147,10 @@ cargo run
 ## Repository structure
 
 ```
-node-onboarding/
+node-manager/
 ├── src/
 │   └── main.rs              ← entire server (single file, std-only)
-├── holo-node.md             ← ZeroClaw skill file, embedded via include_str!
+├── holo-node.md             ← OpenClaw skill file, embedded via include_str!
 ├── Cargo.toml
 ├── Cargo.lock
 ├── .github/
@@ -164,10 +167,10 @@ The server is intentionally a single file with no dependencies so it can be audi
 
 Every release publishes two binary assets:
 
-| Asset name                    | Architecture          |
-|-------------------------------|-----------------------|
-| `node-onboarding-x86_64`      | x86-64 (most hardware)|
-| `node-onboarding-aarch64`     | ARM64 (Raspberry Pi, Apple Silicon VMs) |
+| Asset name                | Architecture           |
+|---------------------------|------------------------|
+| `node-manager-x86_64`     | x86-64 (most hardware) |
+| `node-manager-aarch64`    | ARM64 (Raspberry Pi, Apple Silicon VMs) |
 
 **These asset names are load-bearing.** Both the self-update code in `find_asset_download_url()` and the first-boot `node-setup.sh` in `holo-node-iso` search for them by exact name. Do not rename them.
 
@@ -210,49 +213,72 @@ Once a release is published, updates reach nodes in two ways:
 The update logic lives in `check_and_apply_update()` and `spawn_update_checker()`.
 
 **Flow:**
-1. Background thread sleeps 90 seconds after startup (gives the server time to fully come up), then checks every `UPDATE_INTERVAL_SECS` (3600 = 1 hour).
-2. Hits `https://api.github.com/repos/{UPDATE_REPO}/releases/latest`.
-3. Parses `tag_name` from the response and compares `tag_name.trim_start_matches('v')` against the compiled-in `VERSION` const.
-4. If newer: downloads the arch-matched asset (`node-onboarding-x86_64` or `node-onboarding-aarch64`) to `/tmp/node-onboarding-update`.
-5. `chmod +x`, then `fs::rename()` to replace the running binary atomically.
-6. `systemctl restart node-onboarding.service` — systemd restarts the process, which picks up the new binary.
 
-**Environment variable:**
-```
-UPDATE_REPO=holo-host/node-onboarding   # default; override for forks/testing
+1. Thread sleeps 90 seconds after startup (lets the server stabilise)
+2. Queries `https://api.github.com/repos/{UPDATE_REPO}/releases/latest`
+3. Parses `tag_name`, strips the leading `v`, compares to `VERSION`
+4. If newer: finds the asset named `node-manager-{uname -m}` in the release JSON
+5. Downloads to `/usr/local/bin/node-manager-update`
+6. `chmod +x`, then `fs::rename` (atomic on Linux)
+7. `systemctl restart node-manager.service`
+8. Sleeps 1 hour, repeats
+
+The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-manager`). This is used in staging environments.
+
+---
+
+## Switching OpenClaw forks
+
+`node-manager` ships with an abstraction layer for the OpenClaw AI agent binary. The active fork is controlled by two constants in `src/main.rs`:
+
+```rust
+const OPENCLAW_FORKS: &[OpenClawFork] = &[
+    OpenClawFork {
+        id:           "zeroclaw",
+        display_name: "ZeroClaw",
+        repo:         "zeroclaw-labs/zeroclaw",
+        asset_prefix: "zeroclaw",
+        binary_name:  "zeroclaw",
+    },
+    // add future forks here
+];
+
+const ACTIVE_OPENCLAW_FORK: &str = "zeroclaw";
 ```
 
-**Rollback:** There is no automatic rollback. If a bad binary is released, publish a new release with a higher version number. The broken binary will attempt to restart, fail (if it panics on startup), and systemd's `Restart=always` will keep retrying — meaning the node will retry the update check as soon as a good release is available.
+On every startup, `patch_openclaw_update_script()` rewrites the fork config block at the top of `/usr/local/bin/openclaw-update.sh` from these constants. The hourly `openclaw-update.timer` then pulls from whichever repo is compiled in.
+
+**To switch the entire fleet to a different fork:**
+
+1. Add the new fork entry to `OPENCLAW_FORKS` (if not already present).
+2. Change `ACTIVE_OPENCLAW_FORK` to the new fork's `id`.
+3. Bump `VERSION` in `src/main.rs` and `Cargo.toml`.
+4. Tag and push a release.
+
+All nodes update within 60 minutes. On startup after the update, `patch_openclaw_update_script()` rewrites the update script, and the next `openclaw-update.timer` tick installs the new fork binary to `/usr/local/bin/openclaw`. No ISO rebuild or SSH access to nodes is required.
 
 ---
 
 ## Routes reference
 
-### Public (no authentication required)
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/` | — | Onboarding wizard (pre-onboard) or redirect to `/manage` |
+| `POST` | `/submit` | — | Run onboarding; returns JSON |
+| `GET` | `/login` | — | Login page |
+| `POST` | `/login` | — | Authenticate; sets session cookie |
+| `POST` | `/logout` | session | Clear session cookie |
+| `GET` | `/manage` | session | Management panel HTML |
+| `GET` | `/manage/status` | session | JSON node state snapshot |
+| `POST` | `/manage/ssh/add` | session | Add SSH public key |
+| `POST` | `/manage/ssh/remove` | session | Remove SSH key by index |
+| `POST` | `/manage/agent` | session | Enable/disable OpenClaw agent |
+| `POST` | `/manage/provider` | session | Hot-swap AI provider/model/key |
+| `POST` | `/manage/hardware` | session | Switch STANDARD ↔ WIND_TUNNEL |
+| `POST` | `/manage/password` | session | Change node password |
+| `POST` | `/manage/update` | session | Trigger immediate update check |
 
-| Method | Path       | Description |
-|--------|------------|-------------|
-| GET    | `/`        | Onboarding wizard (pre-onboard) or redirect to `/manage` (post-onboard) |
-| GET    | `/login`   | Login page |
-| POST   | `/login`   | Authenticate; sets `session` cookie; redirects to `/manage` |
-| POST   | `/logout`  | Clears session cookie; redirects to `/login` |
-| POST   | `/submit`  | Runs onboarding; expects JSON body |
-
-### Authenticated (require valid `session` cookie)
-
-| Method | Path                    | Description |
-|--------|-------------------------|-------------|
-| GET    | `/manage`               | Management panel HTML |
-| GET    | `/manage/status`        | Current node state as JSON |
-| POST   | `/manage/ssh/add`       | Add SSH public key `{"key":"ssh-ed25519 ..."}` |
-| POST   | `/manage/ssh/remove`    | Remove SSH key by index `{"index":0}` |
-| POST   | `/manage/agent`         | Enable/disable agent `{"enabled":true}` |
-| POST   | `/manage/provider`      | Hot-swap provider `{"provider":"anthropic","model":"...","apiKey":"..."}` |
-| POST   | `/manage/hardware`      | Switch mode `{"mode":"WIND_TUNNEL"}` |
-| POST   | `/manage/password`      | Change password `{"current":"...","newPassword":"..."}` |
-| POST   | `/manage/update`        | Trigger immediate update check |
-
-Sessions last 24 hours. Session tokens are stored in-memory and cleared on restart — operators will need to log in again after an update.
+Session tokens are stored in-memory and cleared on restart — operators will need to log in again after an update.
 
 ---
 
@@ -260,15 +286,17 @@ Sessions last 24 hours. Session tokens are stored in-memory and cleared on resta
 
 | Path | Contents | Permissions |
 |------|----------|-------------|
-| `/etc/node-onboarding/state` | Key-value store of node state (node_name, hw_mode, agent_enabled, channel, provider, model) | 600 |
-| `/etc/node-onboarding/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
-| `/etc/node-onboarding/provider` | Provider credentials for agent re-enable | 600 |
-| `/etc/zeroclaw/config.toml` | ZeroClaw agent configuration (if agent enabled) | 600 |
-| `/etc/zeroclaw/skills/holo-node.md` | Embedded ZeroClaw skill | 644 |
+| `/etc/node-manager/state` | Key-value store of node state (node_name, hw_mode, agent_enabled, channel, provider, model) | 600 |
+| `/etc/node-manager/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
+| `/etc/node-manager/provider` | Provider credentials for agent re-enable | 600 |
+| `/etc/openclaw/config.toml` | OpenClaw agent configuration (if agent enabled) | 600 |
+| `/etc/openclaw/skills/holo-node.md` | Embedded OpenClaw skill | 644 |
+| `/usr/local/bin/openclaw` | Active OpenClaw fork binary (fork-agnostic path) | 755 |
+| `/usr/local/bin/openclaw-update.sh` | Hourly update script (fork config block managed by node-manager) | 755 |
 | `/etc/containers/systemd/edgenode.container` | Podman Quadlet for the EdgeNode container | 644 |
 | `/etc/containers/systemd/wind-tunnel.container` | Podman Quadlet for Wind Tunnel | 644 |
 | `/home/holo/.ssh/authorized_keys` | SSH public keys for the holo user | 600 |
-| `/var/lib/zeroclaw/workspace/mode_switch.txt` | Current hardware mode (STANDARD or WIND_TUNNEL) | 644 |
+| `/var/lib/openclaw/workspace/mode_switch.txt` | Current hardware mode (STANDARD or WIND_TUNNEL) | 644 |
 | `/var/lib/edgenode/` | EdgeNode persistent data volume | — |
 
 ---
@@ -277,7 +305,7 @@ Sessions last 24 hours. Session tokens are stored in-memory and cleared on resta
 
 ### Authentication
 
-The server is protected by a single password (the "node password"). On first run a random 12-character password is generated (charset excludes ambiguous characters: `0`, `O`, `1`, `l`, `I`), hashed as `sha256:<8-hex-salt>:<sha256(salt:password)>`, and the hash is stored at `/etc/node-onboarding/auth` (chmod 600). The cleartext password is never stored — it is only displayed once on the HDMI screen and logged to the systemd journal.
+The server is protected by a single password (the "node password"). On first run a random 12-character password is generated (charset excludes ambiguous characters: `0`, `O`, `1`, `l`, `I`), hashed as `sha256:<8-hex-salt>:<sha256(salt:password)>`, and the hash is stored at `/etc/node-manager/auth` (chmod 600). The cleartext password is never stored — it is only displayed once on the HDMI screen and logged to the systemd journal.
 
 Sessions are 24-hour cookie-based tokens stored in-memory. They are cleared on server restart. All `/manage/*` routes require an active session; unauthenticated requests are redirected to `/login`.
 
@@ -287,7 +315,7 @@ SSH access is provided only for the `holo` system user. Root login is disabled v
 
 ### AI agent command allowlist
 
-The ZeroClaw AI agent operates against a strict allowlist. `curl` and `wget` are intentionally excluded to prevent the agent from making arbitrary outbound HTTP requests. The full list:
+The OpenClaw AI agent operates against a strict allowlist. `curl` and `wget` are intentionally excluded to prevent the agent from making arbitrary outbound HTTP requests. The full list:
 
 ```
 ls, cat, grep, find, head, tail, wc, echo, pwd, date, git,
@@ -296,7 +324,7 @@ chmod, chown, mkdir, rm, cp, mv, touch,
 df, du, ps, free, uname, env, which
 ```
 
-The agent also cannot write outside `/var/lib/zeroclaw/workspace` (enforced by `allowed_roots` in the ZeroClaw config) and cannot modify system files (enforced by `forbidden_paths`).
+The agent also cannot write outside `/var/lib/openclaw/workspace` (enforced by `allowed_roots` in the OpenClaw config) and cannot modify system files (enforced by `forbidden_paths`).
 
 ### Network exposure
 
@@ -309,7 +337,7 @@ The server binds to `0.0.0.0:8080`. It is intended to be reachable only on the l
 1. Add a credentials block to the HTML in `build_onboarding_html()` (copy the pattern from the `cr-telegram` div).
 2. Add a case to `build_channel_toml()` that serialises the credentials to TOML.
 3. Add a case to `send_welcome_message()` that posts the welcome message via the channel's API.
-4. Add the channel to the `extract_channel_config()` parser if the section header differs from the `[channels_config.<name>]` pattern.
+4. Add the channel to the `extract_channel_config()` parser if the section header differs from the `[channels_config.<n>]` pattern.
 5. Test locally; submit a PR.
 
 ---

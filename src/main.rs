@@ -1,4 +1,4 @@
-// Holo Node Onboarding Server — v5
+// Holo Node Manager Server — v5
 //
 // Changes from v4:
 //   - Server stays running permanently. GET / redirects to /manage after onboarding.
@@ -7,17 +7,22 @@
 //   - SSH key management for the `holo` user (/home/holo/.ssh/authorized_keys).
 //     Step 1 of onboarding collects node name + first SSH public key.
 //     /manage lets operators add/remove keys without USB access.
-//   - AI agent is 100% opt-in. Step 2 has a toggle (default OFF). If off, zeroclaw
-//     is never installed; the node is SSH + container management only.
+//   - AI agent is 100% opt-in. Step 2 has a toggle (default OFF). If off, the
+//     OpenClaw fork is never installed; the node is SSH + container management only.
 //   - /manage page: SSH keys, agent toggle, provider hot-swap, hardware mode switch,
 //     password change, manual software update trigger. All operations functional.
 //   - Self-update: background thread polls GitHub Releases API hourly. On a new
 //     tag it downloads the arch-matched binary, atomically replaces the running
-//     binary and calls `systemctl restart node-onboarding.service`.
+//     binary and calls `systemctl restart node-manager.service`.
 //   - node_name replaces tgUid as the hostname slug.
 //     Wind-tunnel hostname: nomad-client-{node_name}
 //   - Wind-tunnel image also uses resolve_image() for ARM (prefix "latest-").
 //   - curl and wget removed from agent allowed_commands.
+//   - OpenClaw fork abstraction: OPENCLAW_FORKS / ACTIVE_OPENCLAW_FORK constants
+//     control which fork is active. patch_openclaw_update_script() rewrites
+//     /usr/local/bin/openclaw-update.sh on every startup so the hourly timer
+//     always pulls from the correct repo. Switching forks fleet-wide is a single
+//     constant change + release tag.
 //
 // Routes:
 //   GET  /              → onboarding wizard (pre-onboard) or redirect /manage
@@ -36,9 +41,9 @@
 //   POST /manage/update     → trigger immediate update check
 //
 // Boot sequence:
-//   install-zeroclaw.service  (first boot, only if agent was enabled at onboarding)
+//   install-openclaw.service  (first boot, only if agent was enabled at onboarding)
 //        ↓ After=
-//   node-onboarding.service   (permanent — runs indefinitely)
+//   node-manager.service      (permanent — runs indefinitely)
 
 use std::{
     collections::HashMap,
@@ -56,21 +61,107 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.0.13";
-const STATE_FILE: &str = "/etc/node-onboarding/state";
-const AUTH_FILE: &str = "/etc/node-onboarding/auth";
-const PROVIDER_FILE: &str = "/etc/node-onboarding/provider";   // chmod 600
-const SKILLS_DIR: &str = "/etc/zeroclaw/skills";
+const VERSION: &str = "5.0.14";
+const STATE_FILE: &str = "/etc/node-manager/state";
+const AUTH_FILE: &str = "/etc/node-manager/auth";
+const PROVIDER_FILE: &str = "/etc/node-manager/provider";   // chmod 600
+const SKILLS_DIR: &str = "/etc/openclaw/skills";
 const QUADLET_DIR: &str = "/etc/containers/systemd";
-const WORKSPACE_DIR: &str = "/var/lib/zeroclaw/workspace";
+const WORKSPACE_DIR: &str = "/var/lib/openclaw/workspace";
 const AUTHORIZED_KEYS: &str = "/home/holo/.ssh/authorized_keys";
 const UPDATE_REPO_ENV: &str = "UPDATE_REPO";
-const UPDATE_REPO_DEFAULT: &str = "holo-host/node-onboarding";
+const UPDATE_REPO_DEFAULT: &str = "holo-host/node-manager";
 const SESSION_TTL_SECS: u64 = 86400;     // 24 h
 const UPDATE_INTERVAL_SECS: u64 = 3600;  // 1 h
 
-// ── Embedded zeroclaw skill ────────────────────────────────────────────────────
+// ── OpenClaw fork abstraction ──────────────────────────────────────────────────
+//
+// To switch all nodes to a different OpenClaw fork:
+//   1. Add the fork to OPENCLAW_FORKS (or confirm it's already there).
+//   2. Change ACTIVE_OPENCLAW_FORK to its `id`.
+//   3. Bump VERSION, tag and push a release.
+//
+// patch_openclaw_update_script() runs on every startup and rewrites the fork
+// config block in /usr/local/bin/openclaw-update.sh from these constants.
+// The next openclaw-update.timer tick will then pull from the new fork.
+// No ISO rebuild or SSH access to nodes is required.
+
+struct OpenClawFork {
+    id:           &'static str, // stable key persisted to state file
+    display_name: &'static str, // shown in logs
+    repo:         &'static str, // GitHub "owner/repo"
+    asset_prefix: &'static str, // asset = {prefix}-{triple}.tar.gz
+    binary_name:  &'static str, // name of binary inside the tar
+}
+
+const OPENCLAW_FORKS: &[OpenClawFork] = &[
+    OpenClawFork {
+        id:           "zeroclaw",
+        display_name: "ZeroClaw",
+        repo:         "zeroclaw-labs/zeroclaw",
+        asset_prefix: "zeroclaw",
+        binary_name:  "zeroclaw",
+    },
+    // future forks added here, e.g.:
+    // OpenClawFork {
+    //     id:           "somefork",
+    //     display_name: "SomeFork",
+    //     repo:         "some-org/somefork",
+    //     asset_prefix: "somefork",
+    //     binary_name:  "somefork",
+    // },
+];
+
+const ACTIVE_OPENCLAW_FORK: &str = "zeroclaw";
+
+const OPENCLAW_UPDATE_SCRIPT: &str = "/usr/local/bin/openclaw-update.sh";
+
+fn active_fork() -> &'static OpenClawFork {
+    OPENCLAW_FORKS
+        .iter()
+        .find(|f| f.id == ACTIVE_OPENCLAW_FORK)
+        .expect("ACTIVE_OPENCLAW_FORK must match an entry in OPENCLAW_FORKS")
+}
+
+/// Rewrites the fork config block at the top of openclaw-update.sh from the
+/// compiled-in OPENCLAW_FORKS / ACTIVE_OPENCLAW_FORK constants. Called once on
+/// startup before the update checker spawns, so the hourly timer always pulls
+/// from whichever fork is active in this binary.
+fn patch_openclaw_update_script() {
+    let fork = active_fork();
+    let current = match fs::read_to_string(OPENCLAW_UPDATE_SCRIPT) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[openclaw] Could not read {}: {}", OPENCLAW_UPDATE_SCRIPT, e);
+            return;
+        }
+    };
+
+    let patched: String = current
+        .lines()
+        .map(|line| {
+            let t = line.trim_start();
+            if      t.starts_with("OPENCLAW_FORK_ID=")     { format!("OPENCLAW_FORK_ID=\"{}\"",     fork.id) }
+            else if t.starts_with("OPENCLAW_REPO=")         { format!("OPENCLAW_REPO=\"{}\"",         fork.repo) }
+            else if t.starts_with("OPENCLAW_ASSET_PREFIX=") { format!("OPENCLAW_ASSET_PREFIX=\"{}\"", fork.asset_prefix) }
+            else if t.starts_with("OPENCLAW_BINARY_NAME=")  { format!("OPENCLAW_BINARY_NAME=\"{}\"",  fork.binary_name) }
+            else { line.to_string() }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if patched != current {
+        eprintln!("[openclaw] Patching {} → fork={}", OPENCLAW_UPDATE_SCRIPT, fork.display_name);
+        let _ = fs::write(OPENCLAW_UPDATE_SCRIPT, &patched);
+        let _ = Command::new("chmod").args(["+x", OPENCLAW_UPDATE_SCRIPT]).output();
+    } else {
+        eprintln!("[openclaw] Fork config already correct ({})", fork.display_name);
+    }
+}
+
+// ── Embedded openclaw skill ────────────────────────────────────────────────────
 const HOLO_NODE_SKILL: &str = include_str!("../holo-node.md");
+const SOUL_SKILL: &str = include_str!("../soul.md");
 
 // ── Agent allowed commands — curl and wget removed ────────────────────────────
 const ALLOWED_COMMANDS: &str = concat!(
@@ -127,7 +218,7 @@ fn read_state_file() -> HashMap<String, String> {
 }
 
 fn write_state_file(kv: &HashMap<String, String>) {
-    let _ = fs::create_dir_all("/etc/node-onboarding");
+    let _ = fs::create_dir_all("/etc/node-manager");
     let content: String = kv.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
     let _ = fs::write(STATE_FILE, content);
     let _ = Command::new("chmod").args(["600", STATE_FILE]).output();
@@ -207,7 +298,7 @@ fn load_or_create_auth() -> String {
     }
     let password = generate_password();
     let hash = hash_password(&password);
-    let _ = fs::create_dir_all("/etc/node-onboarding");
+    let _ = fs::create_dir_all("/etc/node-manager");
     let _ = fs::write(AUTH_FILE, &hash);
     let _ = Command::new("chmod").args(["600", AUTH_FILE]).output();
     display_password_on_tty(&password);
@@ -235,7 +326,7 @@ fn display_password_on_tty(password: &str) {
         "\x1b[2J\x1b[H\
          \n\
          \x1b[1;36m  ╔══════════════════════════════════════════╗\n\
-         \x1b[1;36m  ║      🜲  HOLO SOVEREIGN NODE SETUP        ║\n\
+         \x1b[1;36m  ║      🜲  HOLO NODE SETUP        ║\n\
          \x1b[1;36m  ╚══════════════════════════════════════════╝\x1b[0m\n\
          \n\
          \x1b[1m  Open a browser on your local network and visit:\x1b[0m\n\
@@ -245,7 +336,7 @@ fn display_password_on_tty(password: &str) {
          \x1b[1;32m  {}\x1b[0m\n\
          \n\
          \x1b[31m  ⚠  Write this password down and store it securely.\x1b[0m\n\
-         \x1b[31m     It CANNOT be recovered if lost — there is no reset.\x1b[0m\n\
+         \x1b[31m     It will NOT show again after setup and CANNOT be recovered if lost.\x1b[0m\n\
          \x1b[31m     You can change it later in the /manage panel.\x1b[0m\n\
          \n",
         ip, password
@@ -253,14 +344,12 @@ fn display_password_on_tty(password: &str) {
     if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty1") {
         let _ = tty.write_all(msg.as_bytes());
     }
-    // Write to issue file so password appears above login: prompt on all consoles
     let issue = format!(
         "\n\x1b[1;36m╔══════════════════════════════════════════╗\x1b[0m\n         \x1b[1;36m║      HOLO NODE SETUP                     ║\x1b[0m\n         \x1b[1;36m╚══════════════════════════════════════════╝\x1b[0m\n         \x1b[1mURL:\x1b[0m      http://{}:8080\n         \x1b[1mPassword:\x1b[0m \x1b[1;32m{}\x1b[0m\n         \x1b[31m⚠  Write this down — it cannot be recovered.\x1b[0m\n\n",
         ip, password
     );
     let _ = fs::create_dir_all("/run/issue.d");
-    let _ = fs::write("/run/issue.d/51-node-onboarding.issue", issue.as_bytes());
-    // Always log so it appears in journal
+    let _ = fs::write("/run/issue.d/51-node-manager.issue", issue.as_bytes());
     eprintln!(
         "[onboard] *** SETUP PASSWORD: {} | URL: http://{}:8080 ***",
         password, ip
@@ -341,8 +430,6 @@ fn detect_arch() -> String {
         .unwrap_or_else(|_| "x86_64".to_string())
 }
 
-/// Generic resolver: checks if `:latest` carries an arm64 manifest via skopeo;
-/// if not, queries the GHCR tags list and picks the newest tag with `arm64_prefix`.
 fn resolve_image(image_ref: &str, arm64_prefix: &str) -> String {
     let arch = detect_arch();
     eprintln!("[onboard] arch={} image={}", arch, image_ref);
@@ -407,7 +494,6 @@ fn resolve_edgenode_image() -> String {
 }
 
 fn resolve_wind_tunnel_image() -> String {
-    // Wind-tunnel ARM builds use a plain "latest-" prefix (e.g. "latest-0.6.1")
     resolve_image("ghcr.io/holochain/wind-tunnel-runner", "latest-")
 }
 
@@ -501,9 +587,9 @@ WantedBy=multi-user.target
     )
 }
 
-// ── zeroclaw config patching ───────────────────────────────────────────────────
+// ── OpenClaw config patching ───────────────────────────────────────────────────
 
-fn patch_config(config: &str, level: &str) -> String {
+fn patch_openclaw_config(config: &str, level: &str) -> String {
     let mut out = String::with_capacity(config.len() + 512);
     let mut lines = config.lines().peekable();
     let mut in_skills = false;
@@ -529,7 +615,7 @@ fn patch_config(config: &str, level: &str) -> String {
             continue;
         }
         if trimmed.starts_with("allowed_roots") {
-            out.push_str("allowed_roots = [\"/var/lib/zeroclaw/workspace\"]\n");
+            out.push_str(&format!("allowed_roots = [\"{WORKSPACE_DIR}\"]\n"));
             if !trimmed.contains(']') {
                 for cont in lines.by_ref() {
                     if cont.contains(']') { break; }
@@ -551,7 +637,7 @@ fn patch_config(config: &str, level: &str) -> String {
         if in_skills {
             if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
                 if !skills_dir_written {
-                    out.push_str("open_skills_dir = \"/etc/zeroclaw/skills\"\n");
+                    out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n"));
                 }
                 in_skills = false;
             } else {
@@ -560,7 +646,7 @@ fn patch_config(config: &str, level: &str) -> String {
                     continue;
                 }
                 if trimmed.starts_with("open_skills_dir") {
-                    out.push_str("open_skills_dir = \"/etc/zeroclaw/skills\"\n");
+                    out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n"));
                     skills_dir_written = true;
                     continue;
                 }
@@ -573,10 +659,12 @@ fn patch_config(config: &str, level: &str) -> String {
         out.push('\n');
     }
     if in_skills && !skills_dir_written {
-        out.push_str("open_skills_dir = \"/etc/zeroclaw/skills\"\n");
+        out.push_str(&format!("open_skills_dir = \"{SKILLS_DIR}\"\n"));
     }
     if !skills_section_seen {
-        out.push_str("\n[skills]\nopen_skills_enabled = true\nopen_skills_dir = \"/etc/zeroclaw/skills\"\n");
+        out.push_str(&format!(
+            "\n[skills]\nopen_skills_enabled = true\nopen_skills_dir = \"{SKILLS_DIR}\"\n"
+        ));
     }
     out
 }
@@ -628,8 +716,6 @@ fn build_channel_toml(body: &str, channel: &str) -> String {
     }
 }
 
-/// Extract the [channels_config.*] section from an existing config for reuse
-/// during provider hot-swap (avoids needing to re-enter channel credentials).
 fn extract_channel_config(config: &str) -> String {
     let mut result = String::new();
     let mut in_channel = false;
@@ -657,7 +743,7 @@ fn send_welcome_message(channel: &str, body: &str, hw_mode: &str) {
         "Holo EdgeNode — always-on Holochain peer"
     };
     let welcome = format!(
-        "🜲 Your Holo Sovereign Node is online!\n\nI'm your on-device AI agent, powered by ZeroClaw.\n\nCurrent mode: {}\n\nTry asking me:\n• what containers are running?\n• show me the node health\n• switch to wind tunnel mode\n\nI'll always ask for your approval before taking action. Type anything to get started.",
+        "Your Holo Node is online!\n\nI'm your on-device AI agent.\n\nCurrent mode: {}\n\nTry asking me:\n• what containers are running?\n• show me the node health\n• switch to wind tunnel mode\n\nI'll always ask for your approval before taking action. Type anything to get started.",
         mode_desc
     );
     fn json_escape(s: &str) -> String {
@@ -730,7 +816,7 @@ fn check_and_apply_update(repo: &str) {
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let json = match Command::new("curl")
         .args(["-sf", "-H", "Accept: application/vnd.github+json",
-            "-H", "User-Agent: holo-node-onboarding", &api_url])
+            "-H", "User-Agent: holo-node-manager", &api_url])
         .output()
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -753,14 +839,14 @@ fn check_and_apply_update(repo: &str) {
     eprintln!("[update] New version: {} (have: {})", tag_ver, VERSION);
 
     let arch = detect_arch();
-    let asset_name = format!("node-onboarding-{}", arch);
+    let asset_name = format!("node-manager-{}", arch);
     let download_url = find_asset_download_url(&json, &asset_name);
     if download_url.is_empty() {
         eprintln!("[update] No asset '{}' in release {}", asset_name, tag);
         return;
     }
 
-    let tmp = "/usr/local/bin/node-onboarding-update";
+    let tmp = "/usr/local/bin/node-manager-update";
     eprintln!("[update] Downloading {}", download_url);
     let ok = Command::new("curl")
         .args(["-sfL", "-o", tmp, &download_url])
@@ -774,7 +860,7 @@ fn check_and_apply_update(repo: &str) {
 
     let _ = Command::new("chmod").args(["+x", tmp]).output();
     let self_path = env::current_exe()
-        .unwrap_or_else(|_| "/usr/local/bin/node-onboarding".into());
+        .unwrap_or_else(|_| "/usr/local/bin/node-manager".into());
 
     if let Err(e) = fs::rename(tmp, &self_path) {
         eprintln!("[update] Replace failed: {}", e);
@@ -782,7 +868,7 @@ fn check_and_apply_update(repo: &str) {
     }
     eprintln!("[update] Binary replaced. Triggering systemd restart...");
     let _ = Command::new("systemctl")
-        .args(["restart", "node-onboarding.service"])
+        .args(["restart", "node-manager.service"])
         .output();
 }
 
@@ -792,22 +878,21 @@ fn find_asset_download_url(release_json: &str, asset_name: &str) -> String {
         Some(p) => p,
         None => return String::new(),
     };
-    
-    let window = &release_json[pos..]; 
+
+    let window = &release_json[pos..];
     let url_key = "\"browser_download_url\":\"";
-    
+
     let url_pos = match window.find(url_key) {
         Some(p) => p,
         None => return String::new(),
     };
-    
+
     let after = &window[url_pos + url_key.len()..];
     after[..after.find('"').unwrap_or(0)].to_string()
 }
 
 fn spawn_update_checker(repo: String) {
     thread::spawn(move || {
-        // Give the server time to start before first check.
         thread::sleep(Duration::from_secs(90));
         loop {
             check_and_apply_update(&repo);
@@ -819,9 +904,9 @@ fn spawn_update_checker(repo: String) {
 // ── Node operations ────────────────────────────────────────────────────────────
 
 struct ProviderConfig {
-    id: String,
+    id:    String,
     model: String,
-    key: String,
+    key:   String,
 }
 
 fn make_provider_config(provider: &str, model: &str, api_key: &str, api_url: &str) -> Option<ProviderConfig> {
@@ -864,10 +949,10 @@ fn make_provider_config(provider: &str, model: &str, api_key: &str, api_url: &st
     Some(ProviderConfig { id, model: mdl, key })
 }
 
-fn run_zeroclaw_onboard(pv: &ProviderConfig) -> Result<(), String> {
-    let result = Command::new("/usr/local/bin/zeroclaw")
+fn run_openclaw_onboard(pv: &ProviderConfig) -> Result<(), String> {
+    let result = Command::new("/usr/local/bin/openclaw")
         .args([
-            "--config-dir", "/etc/zeroclaw",
+            "--config-dir", "/etc/openclaw",
             "onboard", "--force", "--memory", "sqlite",
             "--provider", &pv.id,
             "--model", &pv.model,
@@ -876,10 +961,10 @@ fn run_zeroclaw_onboard(pv: &ProviderConfig) -> Result<(), String> {
         .env("HOME", "/root")
         .output();
     match result {
-        Err(e) => Err(format!("zeroclaw binary not found: {}", e)),
+        Err(e) => Err(format!("openclaw binary not found: {}", e)),
         Ok(o) if !o.status.success() => {
             let err = String::from_utf8_lossy(&o.stderr);
-            Err(format!("zeroclaw onboard failed: {}",
+            Err(format!("openclaw onboard failed: {}",
                 err.replace('"', "'").replace('\n', " ").chars().take(200).collect::<String>()))
         }
         Ok(_) => Ok(()),
@@ -888,43 +973,39 @@ fn run_zeroclaw_onboard(pv: &ProviderConfig) -> Result<(), String> {
 
 fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     let current = state.hw_mode.lock().unwrap().clone();
-    let stop_svc = if current == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
+    let stop_svc  = if current == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
     let start_svc = if new_mode == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
 
     let _ = fs::write(format!("{}/mode_switch.txt", WORKSPACE_DIR), new_mode);
     if current != new_mode {
         eprintln!("[manage] Stopping {} → starting {}", stop_svc, start_svc);
-        let _ = Command::new("systemctl").args(["stop", stop_svc]).output();
+        let _ = Command::new("systemctl").args(["stop",  stop_svc]).output();
         let _ = Command::new("systemctl").args(["start", start_svc]).output();
     }
     *state.hw_mode.lock().unwrap() = new_mode.to_string();
     update_state_key("hw_mode", new_mode);
 }
 
-fn write_zeroclaw_env(provider: &str, api_key: &str) {
-    let dropin_dir = "/etc/systemd/system/zeroclaw-daemon.service.d";
-    let conf_path = format!("{}/api-key.conf", dropin_dir);
+fn write_openclaw_env(provider: &str, api_key: &str) {
+    let dropin_dir = "/etc/systemd/system/openclaw-daemon.service.d";
+    let conf_path  = format!("{}/api-key.conf", dropin_dir);
 
-    // Match the correct env var for the chosen provider
     let env_var = match provider {
         "openrouter" => "OPENROUTER_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "google" => "GEMINI_API_KEY",
+        "openai"     => "OPENAI_API_KEY",
+        "anthropic"  => "ANTHROPIC_API_KEY",
+        "google"     => "GEMINI_API_KEY",
         _ => {
-            // If Ollama or Holo (no API key needed), delete the override
+            // Ollama or Holo — no API key needed; remove any existing override
             let _ = fs::remove_file(&conf_path);
             let _ = Command::new("systemctl").args(["daemon-reload"]).output();
             return;
         }
     };
 
-    // Write the systemd override
     let _ = fs::create_dir_all(dropin_dir);
     let dropin_content = format!("[Service]\nEnvironment=\"{}={}\"\n", env_var, api_key);
     let _ = fs::write(&conf_path, dropin_content);
-    
-    // Reload systemd to apply the new environment variable
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 }
 
@@ -985,7 +1066,6 @@ fn json_bool(json: &str, key: &str) -> bool {
     after.starts_with("true")
 }
 
-// Parse application/x-www-form-urlencoded
 fn parse_form(body: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for pair in body.split('&') {
@@ -1061,10 +1141,10 @@ fn send_redirect_with_cookie(stream: &mut TcpStream, location: &str, cookie: &st
 }
 
 struct Req {
-    method: String,
-    path: String,
+    method:  String,
+    path:    String,
     headers: String,
-    body: String,
+    body:    String,
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Req> {
@@ -1072,10 +1152,9 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut line0 = String::new();
     r.read_line(&mut line0).ok()?;
     let mut parts = line0.trim().splitn(3, ' ');
-    let method = parts.next()?.to_string();
+    let method   = parts.next()?.to_string();
     let path_raw = parts.next()?.to_string();
-    // Strip query string
-    let path = path_raw.split('?').next().unwrap_or(&path_raw).to_string();
+    let path     = path_raw.split('?').next().unwrap_or(&path_raw).to_string();
 
     let mut cl: usize = 0;
     let mut headers = String::new();
@@ -1090,7 +1169,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
         headers.push_str(&line);
     }
 
-    let mut body = vec![0u8; cl.min(1 << 20)]; // cap 1 MB
+    let mut body = vec![0u8; cl.min(1 << 20)];
     if cl > 0 { r.read_exact(&mut body).ok()?; }
     Some(Req {
         method,
@@ -1118,7 +1197,6 @@ fn get_cookie(headers: &str, name: &str) -> Option<String> {
 
 // ── HTML pages ─────────────────────────────────────────────────────────────────
 
-// Shared CSS for all pages
 const COMMON_CSS: &str = r#"
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:32px 16px}
@@ -1167,7 +1245,7 @@ body{{align-items:center}}
 form .btn{{width:100%;margin-top:18px}}
 </style></head><body>
 <div class="card">
-  <div class="hdr"><div class="icon">🜲</div><h1>Holo Sovereign Node</h1><p>Enter your node password to continue.</p></div>
+  <div class="hdr"><div class="icon">🜲</div><h1>Holo Node</h1><p>Enter your node password to continue.</p></div>
   <div class="body">
     {err}
     <form method="POST" action="/login">
@@ -1253,7 +1331,7 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
 .suc p{{color:#64748b;font-size:14px;line-height:1.7}}
 </style></head><body>
 <div class="card">
-  <div class="hdr"><h1>🜲 Holo Sovereign Node</h1><p>One-time setup — about 3 minutes.</p></div>
+  <div class="hdr"><h1>Holo Node</h1><p>One-time setup — about 3 minutes.</p></div>
   <div class="prog"><div class="prog-fill" id="prog" style="width:0%"></div></div>
   <div class="body">
     {wifi_block}
@@ -1278,7 +1356,7 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
       <div class="stit">AI agent</div>
       <div class="sdsc">The AI agent lets you control this node via a chat app. It is completely optional — the node runs fine without it.</div>
       <div class="toggle-row">
-        <div><div class="toggle-label">Enable AI agent</div><div class="toggle-sub">Installs ZeroClaw and connects to your chat app</div></div>
+        <div><div class="toggle-label">Enable AI agent</div><div class="toggle-sub">Installs an OpenClaw agent and connects to your chat app</div></div>
         <label class="toggle"><input type="checkbox" id="agentToggle" onchange="onAgentToggle()"><span class="slider"></span></label>
       </div>
       <div class="agent-config" id="agentConfig">
@@ -1435,7 +1513,7 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
       <div class="info-box" style="margin-top:16px">After you click Initialize:<br>
       1. SSH access is configured for the <code>holo</code> user<br>
       2. Podman Quadlet services are registered with systemd<br>
-      3. If the AI agent is enabled, ZeroClaw connects within ~60 seconds<br>
+      3. If the AI agent is enabled, the OpenClaw agent connects within ~60 seconds<br>
       4. This setup page redirects to the management panel</div>
       <div class="brow">
         <button class="btn btn-secondary" onclick="gTo(3)">← Back</button>
@@ -1539,7 +1617,6 @@ function bRev(){{
   set('rv-hw',v('hw')==='WIND_TUNNEL'?'Wind Tunnel':'Standard EdgeNode');
 }}
 
-// Disable b3 initially; it will be re-checked when agent is toggled
 document.getElementById('b3').disabled=false;
 
 async function doSubmit(){{
@@ -1589,7 +1666,7 @@ async function doSubmit(){{
 }}
 </script>
 </body></html>"#,
-        css = COMMON_CSS,
+        css        = COMMON_CSS,
         wifi_block = wifi_block)
 }
 
@@ -1604,16 +1681,11 @@ fn build_manage_html(state: &AppState) -> String {
     let uptime_s   = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip         = get_local_ip();
 
-    // SSH keys list
     let keys_html: String = if ssh_keys.is_empty() {
         r#"<div class="no-keys">No SSH keys configured. Add one below to enable SSH access.</div>"#.to_string()
     } else {
         ssh_keys.iter().enumerate().map(|(i, k)| {
-            let short = if k.len() > 72 {
-                format!("{}…", &k[..72])
-            } else {
-                k.clone()
-            };
+            let short = if k.len() > 72 { format!("{}…", &k[..72]) } else { k.clone() };
             format!(
                 r#"<div class="key-row"><span class="key-type">{}</span><span class="key-val">{}</span><button class="btn btn-danger btn-sm" onclick="removeKey({})">Remove</button></div>"#,
                 html_escape(k.split_whitespace().next().unwrap_or("key")),
@@ -1624,9 +1696,10 @@ fn build_manage_html(state: &AppState) -> String {
     };
 
     let hw_std_sel  = if hw_mode != "WIND_TUNNEL" { " selected" } else { "" };
-    let hw_wt_sel   = if hw_mode == "WIND_TUNNEL" { " selected" } else { "" };
+    let hw_wt_sel   = if hw_mode == "WIND_TUNNEL"  { " selected" } else { "" };
     let agent_chk   = if agent_on { " checked" } else { "" };
     let agent_vis   = if agent_on { "" } else { "display:none" };
+    let fork_name   = active_fork().display_name;
 
     format!(r##"<!DOCTYPE html>
 <html lang="en"><head>
@@ -1723,7 +1796,7 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
       </div>
       <div class="section-body" id="sec-agent">
         <div class="toggle-row">
-          <div><div class="toggle-label">Enable ZeroClaw AI agent</div></div>
+          <div><div class="toggle-label">Enable AI agent ({fork_name})</div></div>
           <label class="toggle"><input type="checkbox" id="agentToggle"{agent_chk} onchange="toggleAgent(this.checked)"><span class="slider"></span></label>
         </div>
         <div id="agentDetails" style="{agent_vis}">
@@ -1816,12 +1889,9 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
 </div>
 
 <script>
-// ── State ──────────────────────────────────────────────────────────────────────
 let curPv = '{provider_js}';
 let curHw = '{hw_mode}';
-let openSections = {{}};
 
-// ── Section toggle ─────────────────────────────────────────────────────────────
 function toggleSection(id){{
   const body = document.getElementById('sec-'+id);
   const arr  = document.getElementById('arr-'+id);
@@ -1829,10 +1899,8 @@ function toggleSection(id){{
   body.style.display = open ? 'none' : 'block';
   arr.textContent = open ? '▶' : '▼';
 }}
-// Collapse all sections on load except SSH
 ['agent','hw','pw','upd'].forEach(id=>toggleSection(id));
 
-// ── Toast ──────────────────────────────────────────────────────────────────────
 function toast(msg, ok){{
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -1841,7 +1909,6 @@ function toast(msg, ok){{
   t._timer = setTimeout(()=>t.classList.remove('vis'), 3000);
 }}
 
-// ── Generic POST ───────────────────────────────────────────────────────────────
 async function api(path, payload){{
   const r = await fetch(path, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload)}});
   const text = await r.text();
@@ -1849,7 +1916,6 @@ async function api(path, payload){{
   return text;
 }}
 
-// ── SSH Keys ───────────────────────────────────────────────────────────────────
 async function addKey(){{
   const key = document.getElementById('newKey').value.trim();
   if(!key) return toast('Paste a public key first', false);
@@ -1870,7 +1936,6 @@ async function removeKey(i){{
   }}catch(e){{toast('Error: '+e.message, false);}}
 }}
 
-// ── Agent toggle ───────────────────────────────────────────────────────────────
 function toggleAgent(on){{
   document.getElementById('agentDetails').style.display = on ? 'block' : 'none';
   api('/manage/agent', {{enabled:on}})
@@ -1878,7 +1943,6 @@ function toggleAgent(on){{
     .catch(e=>toast('Error: '+e.message, false));
 }}
 
-// ── Provider ───────────────────────────────────────────────────────────────────
 function selPv(pv, el){{
   curPv = pv;
   document.querySelectorAll('.pcard').forEach(c=>c.classList.remove('sel'));
@@ -1891,11 +1955,11 @@ function v(id){{ const e=document.getElementById(id); return e?e.value.trim():''
 
 async function saveProvider(){{
   let key='', model='', apiUrl='';
-  if(curPv==='google')  {{key=v('m-gkey'); model=v('m-gmdl');}}
+  if(curPv==='google')     {{key=v('m-gkey'); model=v('m-gmdl');}}
   else if(curPv==='anthropic') {{key=v('m-akey'); model=v('m-amdl');}}
-  else if(curPv==='openai')   {{key=v('m-okey'); model=v('m-omdl');}}
+  else if(curPv==='openai')    {{key=v('m-okey'); model=v('m-omdl');}}
   else if(curPv==='openrouter'){{key=v('m-rkey'); model=v('m-rmdl');}}
-  else if(curPv==='ollama')   {{apiUrl=v('m-lurl'); model=v('m-lmdl');}}
+  else if(curPv==='ollama')    {{apiUrl=v('m-lurl'); model=v('m-lmdl');}}
   try{{
     await api('/manage/provider', {{provider:curPv, model, apiKey:key, apiUrl}});
     toast('Provider updated — agent restarting…', true);
@@ -1903,7 +1967,6 @@ async function saveProvider(){{
   }}catch(e){{toast('Error: '+e.message, false);}}
 }}
 
-// ── Hardware mode ──────────────────────────────────────────────────────────────
 function selHw(mode, el){{
   curHw = mode;
   document.querySelectorAll('.hw-opt').forEach(o=>o.classList.remove('sel'));
@@ -1919,7 +1982,6 @@ async function saveHardware(){{
   }}catch(e){{toast('Error: '+e.message, false);}}
 }}
 
-// ── Password ───────────────────────────────────────────────────────────────────
 async function changePassword(){{
   const cur = v('pw-cur'), nw = v('pw-new'), cfm = v('pw-cfm');
   if(!cur||!nw) return toast('Fill in all password fields', false);
@@ -1934,7 +1996,6 @@ async function changePassword(){{
   }}catch(e){{toast('Error: '+e.message, false);}}
 }}
 
-// ── Software update ────────────────────────────────────────────────────────────
 async function triggerUpdate(){{
   const btn = document.getElementById('upd-btn');
   const msg = document.getElementById('upd-msg');
@@ -1956,37 +2017,38 @@ async function triggerUpdate(){{
 }}
 </script>
 </body></html>"##,
-        css            = COMMON_CSS,
-        node_name      = html_escape(&node_name),
-        version        = VERSION,
-        ip             = ip,
-        uptime         = fmt_uptime(uptime_s),
-        agent_badge    = if agent_on { "Enabled" } else { "Disabled" },
+        css              = COMMON_CSS,
+        node_name        = html_escape(&node_name),
+        version          = VERSION,
+        ip               = ip,
+        uptime           = fmt_uptime(uptime_s),
+        agent_badge      = if agent_on { "Enabled" } else { "Disabled" },
         agent_badge_class = if agent_on { "badge-green" } else { "badge-gray" },
-        agent_chk      = agent_chk,
-        agent_vis      = agent_vis,
-        hw_mode_display = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" },
-        hw_mode        = hw_mode,
-        channel_display = if channel.is_empty() { "—".to_string() } else { channel.clone() },
+        agent_chk        = agent_chk,
+        agent_vis        = agent_vis,
+        fork_name        = fork_name,
+        hw_mode_display  = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" },
+        hw_mode          = hw_mode,
+        channel_display  = if channel.is_empty()  { "—".to_string() } else { channel.clone() },
         provider_display = if provider.is_empty() { "—".to_string() } else { provider.clone() },
-        provider_js    = html_escape(&provider),
-        keys_html      = keys_html,
-        ssh_count      = ssh_keys.len(),
-        ssh_plural     = if ssh_keys.len() == 1 { "" } else { "s" },
-        sel_std        = if hw_mode != "WIND_TUNNEL" { " sel" } else { "" },
-        sel_wt         = if hw_mode == "WIND_TUNNEL" { " sel" } else { "" },
-        sel_holo       = if provider == "holo"       { " sel" } else { "" },
-        sel_google     = if provider == "google"     { " sel" } else { "" },
-        sel_anthropic  = if provider == "anthropic"  { " sel" } else { "" },
-        sel_openai     = if provider == "openai"     { " sel" } else { "" },
-        sel_openrouter = if provider == "openrouter" { " sel" } else { "" },
-        sel_ollama     = if provider == "ollama"     { " sel" } else { "" },
-        vis_holo       = if provider == "holo"       { " vis" } else { "" },
-        vis_google     = if provider == "google"     { " vis" } else { "" },
-        vis_anthropic  = if provider == "anthropic"  { " vis" } else { "" },
-        vis_openai     = if provider == "openai"     { " vis" } else { "" },
-        vis_openrouter = if provider == "openrouter" { " vis" } else { "" },
-        vis_ollama     = if provider == "ollama"     { " vis" } else { "" },
+        provider_js      = html_escape(&provider),
+        keys_html        = keys_html,
+        ssh_count        = ssh_keys.len(),
+        ssh_plural       = if ssh_keys.len() == 1 { "" } else { "s" },
+        sel_std          = if hw_mode != "WIND_TUNNEL" { " sel" } else { "" },
+        sel_wt           = if hw_mode == "WIND_TUNNEL"  { " sel" } else { "" },
+        sel_holo         = if provider == "holo"        { " sel" } else { "" },
+        sel_google       = if provider == "google"      { " sel" } else { "" },
+        sel_anthropic    = if provider == "anthropic"   { " sel" } else { "" },
+        sel_openai       = if provider == "openai"      { " sel" } else { "" },
+        sel_openrouter   = if provider == "openrouter"  { " sel" } else { "" },
+        sel_ollama       = if provider == "ollama"      { " sel" } else { "" },
+        vis_holo         = if provider == "holo"        { " vis" } else { "" },
+        vis_google       = if provider == "google"      { " vis" } else { "" },
+        vis_anthropic    = if provider == "anthropic"   { " vis" } else { "" },
+        vis_openai       = if provider == "openai"      { " vis" } else { "" },
+        vis_openrouter   = if provider == "openrouter"  { " vis" } else { "" },
+        vis_ollama       = if provider == "ollama"      { " vis" } else { "" },
     )
 }
 
@@ -2010,19 +2072,18 @@ fn handle(stream: &mut TcpStream, state: Arc<AppState>, auth_hash: Arc<Mutex<Str
         None => return,
     };
 
-    let path = req.path.as_str();
+    let path   = req.path.as_str();
     let method = req.method.as_str();
 
-    // ── Public routes ────────────────────────────────────────────────────────
     match (method, path) {
         ("GET", "/login") => {
             send_html(stream, &build_login_html(false));
             return;
         }
         ("POST", "/login") => {
-            let form = parse_form(&req.body);
+            let form     = parse_form(&req.body);
             let password = form.get("password").map(|s| s.as_str()).unwrap_or("");
-            let hash = auth_hash.lock().unwrap().clone();
+            let hash     = auth_hash.lock().unwrap().clone();
             if verify_password(password, &hash) {
                 let token = create_session(&state);
                 send_redirect_with_cookie(stream, "/manage", &session_cookie(&token));
@@ -2058,46 +2119,27 @@ fn handle(stream: &mut TcpStream, state: Arc<AppState>, auth_hash: Arc<Mutex<Str
         _ => {}
     }
 
-    // ── Auth-gated routes ────────────────────────────────────────────────────
     if !is_authenticated(&req, &state) {
         send_redirect(stream, "/login");
         return;
     }
 
     match (method, path) {
-        ("GET", "/manage") => {
-            send_html(stream, &build_manage_html(&state));
-        }
-        ("GET", "/manage/status") => {
-            handle_manage_status(stream, &state);
-        }
-        ("POST", "/manage/ssh/add") => {
-            handle_ssh_add(stream, &req);
-        }
-        ("POST", "/manage/ssh/remove") => {
-            handle_ssh_remove(stream, &req);
-        }
-        ("POST", "/manage/agent") => {
-            handle_agent_toggle(stream, &req, &state);
-        }
-        ("POST", "/manage/provider") => {
-            handle_provider_swap(stream, &req, &state);
-        }
-        ("POST", "/manage/hardware") => {
-            handle_hardware_switch(stream, &req, &state);
-        }
-        ("POST", "/manage/password") => {
-            handle_password_change(stream, &req, &auth_hash);
-        }
-        ("POST", "/manage/update") => {
+        ("GET",  "/manage")          => { send_html(stream, &build_manage_html(&state)); }
+        ("GET",  "/manage/status")   => { handle_manage_status(stream, &state); }
+        ("POST", "/manage/ssh/add")  => { handle_ssh_add(stream, &req); }
+        ("POST", "/manage/ssh/remove") => { handle_ssh_remove(stream, &req); }
+        ("POST", "/manage/agent")    => { handle_agent_toggle(stream, &req, &state); }
+        ("POST", "/manage/provider") => { handle_provider_swap(stream, &req, &state); }
+        ("POST", "/manage/hardware") => { handle_hardware_switch(stream, &req, &state); }
+        ("POST", "/manage/password") => { handle_password_change(stream, &req, &auth_hash); }
+        ("POST", "/manage/update")   => {
             let repo = env::var(UPDATE_REPO_ENV)
                 .unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
             thread::spawn(move || check_and_apply_update(&repo));
             send_json_ok(stream, r#"{"status":"update check triggered"}"#);
         }
-        _ => {
-            send_response(stream, 404, "Not Found", "text/plain", b"Not Found");
-        }
+        _ => { send_response(stream, 404, "Not Found", "text/plain", b"Not Found"); }
     }
 }
 
@@ -2107,9 +2149,9 @@ fn handle_submit(
     stream: &mut TcpStream,
     req: &Req,
     state: &AppState,
-    auth_hash: &Arc<Mutex<String>>,
+    _auth_hash: &Arc<Mutex<String>>,
 ) {
-    let body = &req.body;
+    let body        = &req.body;
     let node_name   = json_str(body, "nodeName");
     let ssh_key     = json_str(body, "sshKey");
     let agent_on    = json_bool(body, "agentEnabled");
@@ -2129,7 +2171,6 @@ fn handle_submit(
         return;
     }
 
-    // ── WiFi (AP mode) ───────────────────────────────────────────────────────
     let wifi_ssid = json_str(body, "wifiSsid");
     let wifi_pass = json_str(body, "wifiPass");
     if !wifi_ssid.is_empty() && !wifi_pass.is_empty() {
@@ -2140,9 +2181,8 @@ fn handle_submit(
         thread::sleep(Duration::from_secs(4));
     }
 
-    // ── Ensure directories ───────────────────────────────────────────────────
     for dir in &[
-        "/etc/node-onboarding",
+        "/etc/node-manager",
         SKILLS_DIR,
         QUADLET_DIR,
         WORKSPACE_DIR,
@@ -2152,21 +2192,18 @@ fn handle_submit(
         let _ = fs::create_dir_all(dir);
     }
 
-    // ── SSH keys ─────────────────────────────────────────────────────────────
     if !ssh_key.trim().is_empty() {
         if !is_valid_ssh_pubkey(ssh_key) {
             send_json_err(stream, 400, "Invalid SSH public key format");
             return;
         }
         if let Err(e) = write_ssh_keys(&[ssh_key.to_string()]) {
-            let msg = format!("Failed to write SSH key: {}", e);
-            send_json_err(stream, 500, &msg);
+            send_json_err(stream, 500, &format!("Failed to write SSH key: {}", e));
             return;
         }
         eprintln!("[onboard] SSH key written for holo user");
     }
 
-    // ── Quadlets ─────────────────────────────────────────────────────────────
     let wt_hostname    = format!("nomad-client-{}", node_name);
     let edgenode_image = resolve_edgenode_image();
     let wt_image       = resolve_wind_tunnel_image();
@@ -2181,25 +2218,17 @@ fn handle_submit(
         format!("{}/wind-tunnel.container", QUADLET_DIR),
         build_wind_tunnel_quadlet(&wt_hostname, &wt_image),
     );
-    eprintln!("[onboard] daemon-reload");
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 
-    // ── Mode file ────────────────────────────────────────────────────────────
     let _ = fs::write(
         format!("{}/mode_switch.txt", WORKSPACE_DIR),
         if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" },
     );
 
-    // ── Start container ──────────────────────────────────────────────────────
-    let initial_svc = if hw_mode == "WIND_TUNNEL" {
-        "wind-tunnel.service"
-    } else {
-        "edgenode.service"
-    };
+    let initial_svc = if hw_mode == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
     eprintln!("[onboard] Starting {}", initial_svc);
     let _ = Command::new("systemctl").args(["start", initial_svc]).output();
 
-    // ── Agent (optional) ─────────────────────────────────────────────────────
     if agent_on {
         if channel.is_empty() || provider.is_empty() {
             send_json_err(stream, 400, "channel and provider required when agent is enabled");
@@ -2213,15 +2242,15 @@ fn handle_submit(
             }
         };
 
-        eprintln!("[onboard] Running zeroclaw onboard");
-        if let Err(e) = run_zeroclaw_onboard(&pv_cfg) {
+        eprintln!("[onboard] Running openclaw onboard (fork: {})", active_fork().display_name);
+        if let Err(e) = run_openclaw_onboard(&pv_cfg) {
             send_json_err(stream, 500, &e);
             return;
         }
 
-        write_zeroclaw_env(provider, api_key);
+        write_openclaw_env(provider, api_key);
 
-        let config = match fs::read_to_string("/etc/zeroclaw/config.toml") {
+        let config = match fs::read_to_string("/etc/openclaw/config.toml") {
             Ok(c) => c,
             Err(e) => {
                 send_json_err(stream, 500, &format!("config not found: {}", e));
@@ -2229,61 +2258,60 @@ fn handle_submit(
             }
         };
 
-        let mut final_config = patch_config(&config, level);
+        let mut final_config = patch_openclaw_config(&config, level);
         final_config.push('\n');
         final_config.push_str(&build_channel_toml(body, channel));
 
-        if let Err(e) = fs::write("/etc/zeroclaw/config.toml", &final_config) {
+        if let Err(e) = fs::write("/etc/openclaw/config.toml", &final_config) {
             send_json_err(stream, 500, &format!("failed to write config: {}", e));
             return;
         }
-        let _ = Command::new("chmod").args(["600", "/etc/zeroclaw/config.toml"]).output();
+        let _ = Command::new("chmod").args(["600", "/etc/openclaw/config.toml"]).output();
 
-        // Persist provider credentials for hot-swap / re-enable
         let _ = fs::write(
             PROVIDER_FILE,
             format!(
                 "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
                 toml_escape(provider), toml_escape(&pv_cfg.model),
-                toml_escape(api_key), toml_escape(api_url)
+                toml_escape(api_key),  toml_escape(api_url)
             ),
         );
         let _ = Command::new("chmod").args(["600", PROVIDER_FILE]).output();
 
-        let _ = fs::write(format!("{}/wind-tunnel.env", "/etc/zeroclaw"),
-            format!("WIND_TUNNEL_HOSTNAME={}\n", wt_hostname));
+        let _ = fs::write(
+            format!("{}/wind-tunnel.env", "/etc/openclaw"),
+            format!("WIND_TUNNEL_HOSTNAME={}\n", wt_hostname),
+        );
         let _ = fs::write(format!("{}/holo-node.md", SKILLS_DIR), HOLO_NODE_SKILL);
+        let _ = fs::write(format!("{}/soul.md", SKILLS_DIR), SOUL_SKILL);
 
-        eprintln!("[onboard] Starting zeroclaw-daemon");
-        let _ = Command::new("systemctl").args(["start", "zeroclaw-daemon.service"]).output();
+        eprintln!("[onboard] Starting openclaw-daemon");
+        let _ = Command::new("systemctl").args(["start", "openclaw-daemon.service"]).output();
 
-        // Welcome message after brief startup pause
-        let body_clone = body.to_string();
-        let channel_str = channel.to_string();
-        let hw_str = hw_mode.to_string();
+        let body_clone   = body.to_string();
+        let channel_str  = channel.to_string();
+        let hw_str       = hw_mode.to_string();
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(8));
             send_welcome_message(&channel_str, &body_clone, &hw_str);
         });
     }
 
-    // ── Persist state ────────────────────────────────────────────────────────
     let mut kv = HashMap::new();
-    kv.insert("onboarded".to_string(), "true".to_string());
-    kv.insert("node_name".to_string(), node_name.to_string());
-    kv.insert("hw_mode".to_string(), if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string());
+    kv.insert("onboarded".to_string(),     "true".to_string());
+    kv.insert("node_name".to_string(),     node_name.to_string());
+    kv.insert("hw_mode".to_string(),       if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string());
     kv.insert("agent_enabled".to_string(), agent_on.to_string());
-    kv.insert("channel".to_string(), channel.to_string());
-    kv.insert("provider".to_string(), provider.to_string());
-    kv.insert("model".to_string(), model.to_string());
+    kv.insert("channel".to_string(),       channel.to_string());
+    kv.insert("provider".to_string(),      provider.to_string());
+    kv.insert("model".to_string(),         model.to_string());
     write_state_file(&kv);
 
-    // ── Update in-memory state ───────────────────────────────────────────────
-    *state.node_name.lock().unwrap() = node_name.to_string();
-    *state.hw_mode.lock().unwrap() = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string();
-    *state.channel.lock().unwrap() = channel.to_string();
-    *state.provider.lock().unwrap() = provider.to_string();
-    *state.model.lock().unwrap() = model.to_string();
+    *state.node_name.lock().unwrap()  = node_name.to_string();
+    *state.hw_mode.lock().unwrap()    = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string();
+    *state.channel.lock().unwrap()    = channel.to_string();
+    *state.provider.lock().unwrap()   = provider.to_string();
+    *state.model.lock().unwrap()      = model.to_string();
     state.agent_enabled.store(agent_on, Ordering::Relaxed);
     state.onboarded.store(true, Ordering::Relaxed);
 
@@ -2307,8 +2335,9 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
         .join(",");
 
     let json = format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","agent_enabled":{},"channel":"{}","provider":"{}","model":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","agent_enabled":{},"channel":"{}","provider":"{}","model":"{}","openclaw_fork":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
         VERSION, node_name, hw_mode, agent, channel, provider, model,
+        active_fork().id,
         keys.len(), keys_json, uptime
     );
     send_json_ok(stream, &json);
@@ -2325,7 +2354,6 @@ fn handle_ssh_add(stream: &mut TcpStream, req: &Req) {
         return;
     }
     let mut keys = read_ssh_keys();
-    // Deduplicate
     if keys.iter().any(|k| k == key) {
         send_json_err(stream, 409, "Key already present");
         return;
@@ -2338,7 +2366,6 @@ fn handle_ssh_add(stream: &mut TcpStream, req: &Req) {
 }
 
 fn handle_ssh_remove(stream: &mut TcpStream, req: &Req) {
-    // Parse index from JSON: {"index": 2}
     let idx_str = {
         let needle = "\"index\":";
         match req.body.find(needle) {
@@ -2376,10 +2403,9 @@ fn handle_agent_toggle(stream: &mut TcpStream, req: &Req, state: &AppState) {
     let enable = json_bool(&req.body, "enabled");
 
     if enable && !state.agent_enabled.load(Ordering::Relaxed) {
-        // Re-enable: need stored provider config
         let pf = fs::read_to_string(PROVIDER_FILE).unwrap_or_default();
         let pf_kv: HashMap<String, String> = pf.lines()
-            .filter_map(|l| l.find('=').map(|e| (l[..e].to_string(), l[e+1..].to_string())))
+            .filter_map(|l| l.find('=').map(|e| (l[..e].to_string(), l[e + 1..].to_string())))
             .collect();
         let provider = pf_kv.get("provider").map(|s| s.as_str()).unwrap_or("holo");
         let model    = pf_kv.get("model").map(|s| s.as_str()).unwrap_or("");
@@ -2393,24 +2419,23 @@ fn handle_agent_toggle(stream: &mut TcpStream, req: &Req, state: &AppState) {
                 return;
             }
         };
-        if let Err(e) = run_zeroclaw_onboard(&pv_cfg) {
+        if let Err(e) = run_openclaw_onboard(&pv_cfg) {
             send_json_err(stream, 500, &e);
             return;
         }
-        // Restore patched config
-        if let Ok(config) = fs::read_to_string("/etc/zeroclaw/config.toml") {
-            let autonomy = read_state_file().get("autonomy").cloned().unwrap_or_else(|| "supervised".into());
+        if let Ok(config) = fs::read_to_string("/etc/openclaw/config.toml") {
+            let autonomy    = read_state_file().get("autonomy").cloned().unwrap_or_else(|| "supervised".into());
             let channel_cfg = extract_channel_config(&config);
-            let mut final_config = patch_config(&config, &autonomy);
+            let mut final_config = patch_openclaw_config(&config, &autonomy);
             final_config.push('\n');
             final_config.push_str(&channel_cfg);
-            let _ = fs::write("/etc/zeroclaw/config.toml", &final_config);
-            let _ = Command::new("chmod").args(["600", "/etc/zeroclaw/config.toml"]).output();
+            let _ = fs::write("/etc/openclaw/config.toml", &final_config);
+            let _ = Command::new("chmod").args(["600", "/etc/openclaw/config.toml"]).output();
         }
-        let _ = Command::new("systemctl").args(["start", "zeroclaw-daemon.service"]).output();
-        eprintln!("[manage] Agent re-enabled");
+        let _ = Command::new("systemctl").args(["start", "openclaw-daemon.service"]).output();
+        eprintln!("[manage] Agent re-enabled ({})", active_fork().display_name);
     } else if !enable && state.agent_enabled.load(Ordering::Relaxed) {
-        let _ = Command::new("systemctl").args(["stop", "zeroclaw-daemon.service"]).output();
+        let _ = Command::new("systemctl").args(["stop", "openclaw-daemon.service"]).output();
         eprintln!("[manage] Agent disabled");
     }
 
@@ -2438,45 +2463,42 @@ fn handle_provider_swap(stream: &mut TcpStream, req: &Req, state: &AppState) {
     };
 
     eprintln!("[manage] Provider swap → {}", provider);
-    if let Err(e) = run_zeroclaw_onboard(&pv_cfg) {
+    if let Err(e) = run_openclaw_onboard(&pv_cfg) {
         send_json_err(stream, 500, &e);
         return;
     }
 
-    write_zeroclaw_env(provider, api_key);
+    write_openclaw_env(provider, api_key);
 
-    // Re-apply patches, preserving existing channel config
-    let config = match fs::read_to_string("/etc/zeroclaw/config.toml") {
+    let config = match fs::read_to_string("/etc/openclaw/config.toml") {
         Ok(c) => c,
         Err(e) => {
             send_json_err(stream, 500, &format!("config not found: {}", e));
             return;
         }
     };
-    let autonomy = read_state_file().get("autonomy").cloned().unwrap_or_else(|| "supervised".into());
+    let autonomy    = read_state_file().get("autonomy").cloned().unwrap_or_else(|| "supervised".into());
     let channel_cfg = extract_channel_config(&config);
-    let mut final_config = patch_config(&config, &autonomy);
+    let mut final_config = patch_openclaw_config(&config, &autonomy);
     final_config.push('\n');
     final_config.push_str(&channel_cfg);
-    let _ = fs::write("/etc/zeroclaw/config.toml", &final_config);
-    let _ = Command::new("chmod").args(["600", "/etc/zeroclaw/config.toml"]).output();
+    let _ = fs::write("/etc/openclaw/config.toml", &final_config);
+    let _ = Command::new("chmod").args(["600", "/etc/openclaw/config.toml"]).output();
 
-    // Update stored provider file
     let _ = fs::write(
         PROVIDER_FILE,
         format!(
             "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
             toml_escape(provider), toml_escape(&pv_cfg.model),
-            toml_escape(api_key), toml_escape(api_url)
+            toml_escape(api_key),  toml_escape(api_url)
         ),
     );
     let _ = Command::new("chmod").args(["600", PROVIDER_FILE]).output();
 
-    // Restart daemon
-    let _ = Command::new("systemctl").args(["restart", "zeroclaw-daemon.service"]).output();
+    let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
 
     *state.provider.lock().unwrap() = provider.to_string();
-    *state.model.lock().unwrap() = pv_cfg.model.clone();
+    *state.model.lock().unwrap()    = pv_cfg.model.clone();
     update_state_key("provider", provider);
     update_state_key("model", &pv_cfg.model);
 
@@ -2484,8 +2506,7 @@ fn handle_provider_swap(stream: &mut TcpStream, req: &Req, state: &AppState) {
 }
 
 fn handle_hardware_switch(stream: &mut TcpStream, req: &Req, state: &AppState) {
-    let mode = json_str(&req.body, "mode");
-    let mode = match mode {
+    let mode = match json_str(&req.body, "mode") {
         "WIND_TUNNEL" => "WIND_TUNNEL",
         _ => "STANDARD",
     };
@@ -2528,18 +2549,21 @@ fn handle_password_change(
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // Rewrite the fork config block in openclaw-update.sh from compiled-in
+    // constants. Must run before the update checker spawns so that the hourly
+    // timer is always pointed at the correct fork repo.
+    patch_openclaw_update_script();
+
     let ap_mode = env::var("AP_MODE").unwrap_or_default() == "true";
     let state   = Arc::new(AppState::new(ap_mode));
 
-    // Generate or load auth credential; display on HDMI if this is first run.
     let auth_hash = Arc::new(Mutex::new(load_or_create_auth()));
 
-    // Spawn background self-update checker.
     let repo = env::var(UPDATE_REPO_ENV).unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
     spawn_update_checker(repo);
 
     let listener = TcpListener::bind("0.0.0.0:8080").expect("failed to bind :8080");
-    eprintln!("Holo node-onboarding v{} on :8080", VERSION);
+    eprintln!("Holo node-manager v{} on :8080 (openclaw fork: {})", VERSION, active_fork().display_name);
     eprintln!(
         "State: onboarded={} agent={} hw={}",
         state.onboarded.load(Ordering::Relaxed),

@@ -13,9 +13,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            asset: node-onboarding-x86_64
+            asset: node-manager-x86_64
           - target: aarch64-unknown-linux-musl
-            asset: node-onboarding-aarch64
+            asset: node-manager-aarch64
 
     steps:
       - name: Checkout
@@ -39,7 +39,7 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
           cargo build --release --target ${{ matrix.target }}
-          cp target/${{ matrix.target }}/release/node-onboarding ${{ matrix.asset }}
+          cp target/${{ matrix.target }}/release/node-manager ${{ matrix.asset }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -69,4 +69,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            dist/node-onboarding-x86_64 dist/node-onboarding-aarch64
+            dist/node-manager-x86_64 dist/node-manager-aarch64
