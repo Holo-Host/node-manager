@@ -659,7 +659,7 @@ fn add_channel_to_config(config: &str, channel_type: &str, channel_toml: &str) -
     result
 }
 
-fn channel_display_name(name: &str) -> &'static str {
+fn channel_display_name(name: &str) -> &str {
     match name {
         "cli"            => "CLI",
         "telegram"       => "Telegram",
