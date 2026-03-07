@@ -1267,11 +1267,10 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
         <div class="divider"></div>
         <label>Agent autonomy</label>
         <div class="ao">
-          <div class="ab" onclick="sAu('readonly',this)"><div class="ar"></div><div><div class="an">👁 Read-Only</div><div class="ad">Observe and answer. Cannot execute commands.</div></div></div>
-          <div class="ab" onclick="sAu('supervised',this)"><div class="ar"></div><div><div class="an">✋ Supervised <span style="font-size:11px;color:#6366f1;margin-left:6px">Recommended</span></div><div class="ad">Plans actions, waits for your approval.</div></div></div>
-          <div class="ab" onclick="sAu('full',this)"><div class="ar"></div><div><div class="an">⚡ Full Autonomy</div><div class="ad">Acts immediately, notifies after.</div></div></div>
+          <div class="ab sel" onclick="sAu('operator',this)"><div class="ar"></div><div><div class="an">⚡ Operator Autonomy <span style="font-size:11px;color:#6366f1;margin-left:6px">Default</span></div><div class="ad">The human directs their agent who has permission to run the commands required to operate the node.</div></div></div>
+          <div class="ab" onclick="sAu('advisor',this)"><div class="ar"></div><div><div class="an">🔒 Advisor Autonomy</div><div class="ad">The agent has read-only access, and the human chooses which commands to manually execute via SSH.</div></div></div>
         </div>
-        <div class="fw" id="fw"><strong>⚠ Full Autonomy</strong> — the agent acts without asking first.<label><input type="checkbox" id="fc" onchange="chkS3()"> I understand and accept full autonomy</label></div>
+        <div class="fw vis" id="fw" style="background:#0f1f2e;border-color:#1e3a5f;color:#93c5fd"><strong>🛡 Risk surface is well contained.</strong> A strict command allowlist is already enforced — <code>curl</code> and <code>wget</code> are blocked. The agent can only write inside <code>/var/lib/zeroclaw/workspace</code> (enforced by <code>allowed_roots</code>) and cannot touch system files (enforced by <code>forbidden_paths</code>).</div>
         <div class="divider"></div>
       </div>
       <label>Hardware mode</label>
@@ -1418,7 +1417,7 @@ const CH = {{
 }};
 
 // ── JS state ───────────────────────────────────────────────────────────────────
-const S={{agent:false,ch:'',pv:'ollama',au:'supervised'}};
+const S={{agent:false,ch:'',pv:'ollama',au:'operator'}};
 const PVN={{holo:'Holo (built-in)',google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
 
 // ── Dynamic channel form renderer ─────────────────────────────────────────────
@@ -1488,8 +1487,7 @@ function sAu(lvl,el){{
   S.au=lvl;
   document.querySelectorAll('.ab').forEach(b=>b.classList.remove('sel'));
   el.classList.add('sel');
-  document.getElementById('fw').classList.toggle('vis',lvl==='full');
-  if(lvl!=='full')document.getElementById('fc').checked=false;
+  document.getElementById('fw').classList.toggle('vis',lvl==='operator');
   chkS3();
 }}
 
@@ -1498,7 +1496,6 @@ function chkS3(){{
   if(S.agent){{
     if(!S.pv)ok=false;
     if(!S.au)ok=false;
-    if(S.au==='full'&&!document.getElementById('fc').checked)ok=false;
   }}
   document.getElementById('b3').disabled=!ok;
 }}
@@ -1521,7 +1518,7 @@ function bRev(){{
   set('rv-ch',S.agent?(CH[S.ch]?CH[S.ch].name:'—'):'—');
   set('rv-pv',S.agent?(PVN[S.pv]||S.pv||'—'):'—');
   set('rv-md',S.agent?(mdl||'(default)'):'—');
-  set('rv-au',S.agent?({{readonly:'Read-Only',supervised:'Supervised',full:'Full Autonomy'}}[S.au]||'—'):'—');
+  set('rv-au',S.agent?({{operator:'Operator Autonomy',advisor:'Advisor Autonomy'}}[S.au]||'—'):'—');
   set('rv-hw',v('hw')==='WIND_TUNNEL'?'Wind Tunnel':'Standard EdgeNode');
 }}
 
@@ -2225,6 +2222,7 @@ fn handle_submit(
     kv.insert("channel".into(), channel.to_string());
     kv.insert("provider".into(), provider.to_string());
     kv.insert("model".into(), model.to_string());
+    kv.insert("autonomy".into(), level.to_string());
     write_state_file(&kv);
 
     *state.node_name.lock().unwrap() = node_name.to_string();
