@@ -15,7 +15,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.2.3";
+const VERSION: &str = "5.2.5";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
@@ -1081,6 +1081,52 @@ fn validate_toml_structure(config: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Insert content immediately after the [channels_config] section and its
+/// direct keys, before the next unrelated section header. This keeps channel
+/// sub-sections (e.g. [channels_config.telegram]) contiguous with their
+/// parent table, which ZeroClaw's config parser requires.
+fn insert_after_channels_section(config: &str, content: &str) -> String {
+    let trimmed_content = content.trim();
+    if trimmed_content.is_empty() { return config.to_string(); }
+
+    let mut out = String::with_capacity(config.len() + trimmed_content.len() + 4);
+    let mut found_channels = false;
+    let mut inserted = false;
+
+    for line in config.lines() {
+        let t = line.trim();
+
+        if t == "[channels_config]" {
+            found_channels = true;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // We passed [channels_config] and its keys; now we hit a new unrelated section.
+        // Insert the channel sub-sections here, right before this next header.
+        if found_channels && !inserted
+            && t.starts_with('[') && !t.starts_with("[[")
+            && !t.starts_with("[channels_config")
+        {
+            out.push_str(trimmed_content);
+            out.push_str("\n\n");
+            inserted = true;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // Edge case: [channels_config] was the last section in the file
+    if found_channels && !inserted {
+        out.push_str(trimmed_content);
+        out.push('\n');
+    }
+
+    out
+}
+
 /// Write config with validation and rollback. Returns Ok(()) on success,
 /// or Err(message) if validation fails (config is rolled back automatically).
 fn write_validated_config(config: &str) -> Result<(), String> {
@@ -1142,37 +1188,45 @@ fn restart_openclaw_with_channel_config(channel_config: &str, autonomy: &str) {
         let mut final_config = patch_openclaw_config(&stripped, autonomy);
         let trimmed_channels = channel_config.trim();
         if !trimmed_channels.is_empty() {
-            // The stripped config still has [channels_config] with non-channel keys.
-            // The extracted channel_config starts with [channels_config]\ncli = true.
-            // We need to merge: inject cli = true into the existing section,
-            // then append the sub-sections.
+            // Split the extracted channel config into:
+            //   1. Root keys (cli = true) → inject into existing [channels_config]
+            //   2. Sub-sections ([channels_config.*]) → insert contiguously after it
+            let mut root_keys = Vec::new();
+            let mut sub_sections = String::new();
+
             for ch_line in trimmed_channels.lines() {
                 let ct = ch_line.trim();
-                // Skip the [channels_config] header — it already exists in final_config
-                if ct == "[channels_config]" { continue; }
-                // cli = true goes under the existing [channels_config] header
-                if ct == "cli = true" || ct == "cli=true" {
-                    // Find the [channels_config] header and insert after it
-                    if let Some(pos) = final_config.find("\n[channels_config]\n") {
-                        let insert_at = pos + "\n[channels_config]\n".len();
-                        final_config.insert_str(insert_at, "cli = true\n");
-                    } else if final_config.contains("[channels_config]") {
-                        // Header might be at start of file (no leading newline)
-                        if let Some(pos) = final_config.find("[channels_config]\n") {
-                            let insert_at = pos + "[channels_config]\n".len();
-                            final_config.insert_str(insert_at, "cli = true\n");
-                        }
-                    } else {
-                        // No [channels_config] at all — append fresh
-                        final_config.push_str("\n[channels_config]\ncli = true\n");
-                    }
-                    continue;
+                if ct == "[channels_config]" { continue; } // header already exists
+                if ct.starts_with("[channels_config.") {
+                    // Start of a sub-section — collect it and everything after
+                    sub_sections.push_str(ch_line);
+                    sub_sections.push('\n');
+                } else if !sub_sections.is_empty() {
+                    // Key inside a sub-section
+                    sub_sections.push_str(ch_line);
+                    sub_sections.push('\n');
+                } else if !ct.is_empty() {
+                    // Root key like "cli = true"
+                    root_keys.push(ch_line.to_string());
                 }
-                // Sub-section headers and their keys — append at end
-                if ct.starts_with("[channels_config.") || !ct.starts_with('[') {
-                    final_config.push_str(ch_line);
-                    final_config.push('\n');
+            }
+
+            // Inject root keys (e.g. cli = true) into existing [channels_config]
+            for key_line in &root_keys {
+                if let Some(pos) = final_config.find("\n[channels_config]\n") {
+                    let insert_at = pos + "\n[channels_config]\n".len();
+                    final_config.insert_str(insert_at, &format!("{}\n", key_line.trim()));
+                } else if let Some(pos) = final_config.find("[channels_config]\n") {
+                    let insert_at = pos + "[channels_config]\n".len();
+                    final_config.insert_str(insert_at, &format!("{}\n", key_line.trim()));
+                } else {
+                    final_config.push_str(&format!("\n[channels_config]\n{}\n", key_line.trim()));
                 }
+            }
+
+            // Insert sub-sections contiguously after [channels_config] block
+            if !sub_sections.is_empty() {
+                final_config = insert_after_channels_section(&final_config, &sub_sections);
             }
         }
         match write_validated_config(&final_config) {
@@ -1329,6 +1383,10 @@ select option{background:#1a1d27}
 .btn-danger:hover{background:#991b1b}
 .divider{height:1px;background:#2d3148;margin:20px 0}
 code{background:#1e2740;padding:1px 5px;border-radius:4px;font-family:monospace;color:#a5b4fc;font-size:12px}
+.hw-opts{display:flex;gap:8px;margin-bottom:10px}
+.hw-opt{flex:1;padding:12px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;transition:all .2s}
+.hw-opt:hover,.hw-opt.sel{border-color:#6366f1}.hw-opt.sel{background:#1e1d3f}
+.hw-opt-name{font-size:13px;font-weight:600;color:#e2e8f0}.hw-opt-desc{font-size:11px;color:#475569;margin-top:2px}
 "#;
 
 // ── Login page ─────────────────────────────────────────────────────────────────
@@ -1966,10 +2024,6 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
 .pcard:hover,.pcard.sel{{border-color:#6366f1;color:#a5b4fc}}.pcard.sel{{background:#1e1d3f}}
 .pcard-name{{font-size:13px;font-weight:600}}.pcard-desc{{font-size:11px;color:#475569;margin-top:1px}}
 .provider-creds{{display:none;margin-top:8px}}.provider-creds.vis{{display:block}}
-.hw-opts{{display:flex;gap:8px;margin-bottom:10px}}
-.hw-opt{{flex:1;padding:12px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;transition:all .2s}}
-.hw-opt:hover,.hw-opt.sel{{border-color:#6366f1}}.hw-opt.sel{{background:#1e1d3f}}
-.hw-opt-name{{font-size:13px;font-weight:600;color:#e2e8f0}}.hw-opt-desc{{font-size:11px;color:#475569;margin-top:2px}}
 .ch-chips{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;min-height:24px}}
 .ch-chip{{display:inline-flex;align-items:center;gap:6px;background:#1a1d27;border:1px solid #2d3148;border-radius:20px;padding:5px 10px 5px 12px;font-size:13px;color:#e2e8f0}}
 .ch-remove{{background:none;border:none;color:#475569;cursor:pointer;font-size:15px;padding:0 0 0 4px;line-height:1}}.ch-remove:hover{{color:#fca5a5}}
@@ -2640,12 +2694,13 @@ fn handle_submit(
         let channel_toml = build_channel_toml(body, channel);
         let config = strip_channel_sections(&config);
         let mut final_config = patch_openclaw_config(&config, level);
-        final_config.push('\n');
         if channel == "cli" {
             // CLI requires inject via add_channel_to_config (sets cli=true flag)
             final_config = add_channel_to_config(&final_config, "cli", "");
-        } else {
-            final_config.push_str(&channel_toml);
+        } else if !channel_toml.trim().is_empty() {
+            // Insert channel sub-section right after [channels_config] block
+            // so they remain contiguous (required by ZeroClaw's parser).
+            final_config = insert_after_channels_section(&final_config, &channel_toml);
         }
         if let Err(e) = write_validated_config(&final_config) {
             send_json_err(stream, 500, &e); return;
