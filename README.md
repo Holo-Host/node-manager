@@ -60,32 +60,26 @@ On startup the binary generates a random 12-character password, writes its SHA-2
 
 ### Onboarding wizard
 
-A four-step browser UI walks the operator through:
+A three-step browser UI walks the operator through:
 
 1. **Node identity & SSH** — node name (used as hostname slug) and optional SSH public key for the `holo` user
-2. **AI agent** — opt-in toggle (default off); if enabled, choose a chat platform and credentials
-3. **AI engine & hardware mode** — provider/model selection (if agent enabled), autonomy level, and initial container mode (EdgeNode or Wind Tunnel)
-4. **Review & initialize** — summary before committing
+2. **Hardware mode** — initial container mode (EdgeNode or Wind Tunnel)
+3. **Review & initialize** — summary before committing
 
-After the operator submits, the server configures everything, starts the appropriate container service, sends a welcome message through the chosen chat platform (if agent enabled), and redirects the browser to the management panel. The server **does not shut down** — it stays running permanently.
+After the operator submits, the server configures everything, starts the appropriate container service, and redirects the browser to the management panel.
 
 ### Management panel (`/manage`)
 
 After onboarding, `GET /` redirects to `/manage`. The panel (password-protected) lets the operator:
 
 - Add and remove SSH public keys for the `holo` user without physical access
-- Enable or disable the OpenClaw AI agent at any time
-- Hot-swap the AI provider, model, and API key without re-onboarding
 - Switch hardware mode between Standard EdgeNode and Wind Tunnel
 - Change the node password
 - Trigger an immediate software update check
-- View and switch the AI agent autonomy level (Read-Only, Supervised, Full Autonomy)
 
 ### Self-update
 
 A background thread wakes every hour, queries the GitHub Releases API for this repository, and compares the latest tag against the compiled-in `VERSION` constant. If a newer version exists it downloads the architecture-matched binary, atomically replaces the running binary on disk, and calls `systemctl restart node-manager.service`. The update check can also be triggered manually from the `/manage` panel.
-
-On every startup, `node-manager` also rewrites the fork config block in `/usr/local/bin/openclaw-update.sh` from its compiled-in constants (see [Switching OpenClaw forks](#switching-openclaw-forks) below). This ensures the hourly OpenClaw update timer is always pointed at the correct fork repo, even after a node-manager update changes the active fork.
 
 ---
 
@@ -151,7 +145,6 @@ cargo run
 node-manager/
 ├── src/
 │   └── main.rs              ← entire server (single file, std-only)
-├── holo-node.md             ← OpenClaw skill file, embedded via include_str!
 ├── Cargo.toml
 ├── Cargo.lock
 ├── .github/
@@ -228,38 +221,6 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 
 ---
 
-## Switching OpenClaw forks
-
-`node-manager` ships with an abstraction layer for the OpenClaw AI agent binary. The active fork is controlled by two constants in `src/main.rs`:
-
-```rust
-const OPENCLAW_FORKS: &[OpenClawFork] = &[
-    OpenClawFork {
-        id:           "zeroclaw",
-        display_name: "ZeroClaw",
-        repo:         "zeroclaw-labs/zeroclaw",
-        asset_prefix: "zeroclaw",
-        binary_name:  "zeroclaw",
-    },
-    // add future forks here
-];
-
-const ACTIVE_OPENCLAW_FORK: &str = "zeroclaw";
-```
-
-On every startup, `patch_openclaw_update_script()` rewrites the fork config block at the top of `/usr/local/bin/openclaw-update.sh` from these constants. The hourly `openclaw-update.timer` then pulls from whichever repo is compiled in.
-
-**To switch the entire fleet to a different fork:**
-
-1. Add the new fork entry to `OPENCLAW_FORKS` (if not already present).
-2. Change `ACTIVE_OPENCLAW_FORK` to the new fork's `id`.
-3. Bump `VERSION` in `src/main.rs` and `Cargo.toml`.
-4. Tag and push a release.
-
-All nodes update within 60 minutes. On startup after the update, `patch_openclaw_update_script()` rewrites the update script, and the next `openclaw-update.timer` tick installs the new fork binary to `/usr/local/bin/openclaw`. No ISO rebuild or SSH access to nodes is required.
-
----
-
 ## Routes reference
 
 | Method | Path | Auth | Description |
@@ -273,12 +234,9 @@ All nodes update within 60 minutes. On startup after the update, `patch_openclaw
 | `GET` | `/manage/status` | session | JSON node state snapshot |
 | `POST` | `/manage/ssh/add` | session | Add SSH public key |
 | `POST` | `/manage/ssh/remove` | session | Remove SSH key by index |
-| `POST` | `/manage/agent` | session | Enable/disable OpenClaw agent |
-| `POST` | `/manage/provider` | session | Hot-swap AI provider/model/key |
 | `POST` | `/manage/hardware` | session | Switch STANDARD ↔ WIND_TUNNEL |
 | `POST` | `/manage/password` | session | Change node password |
 | `POST` | `/manage/update` | session | Trigger immediate update check |
-| `POST` | `/manage/autonomy` | session | Change agent autonomy level |
 
 Session tokens are stored in-memory and cleared on restart — operators will need to log in again after an update.
 
@@ -291,14 +249,9 @@ Session tokens are stored in-memory and cleared on restart — operators will ne
 | `/etc/node-manager/state` | Key-value store of node state (node_name, hw_mode, agent_enabled, channel, provider, model) | 600 |
 | `/etc/node-manager/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
 | `/etc/node-manager/provider` | Provider credentials for agent re-enable | 600 |
-| `/etc/openclaw/config.toml` | OpenClaw agent configuration (if agent enabled) | 600 |
-| `/etc/openclaw/skills/holo-node.md` | Embedded OpenClaw skill | 644 |
-| `/usr/local/bin/openclaw` | Active OpenClaw fork binary (fork-agnostic path) | 755 |
-| `/usr/local/bin/openclaw-update.sh` | Hourly update script (fork config block managed by node-manager) | 755 |
 | `/etc/containers/systemd/edgenode.container` | Podman Quadlet for the EdgeNode container | 644 |
 | `/etc/containers/systemd/wind-tunnel.container` | Podman Quadlet for Wind Tunnel | 644 |
 | `/home/holo/.ssh/authorized_keys` | SSH public keys for the holo user | 600 |
-| `/var/lib/openclaw/workspace/mode_switch.txt` | Current hardware mode (STANDARD or WIND_TUNNEL) | 644 |
 | `/var/lib/edgenode/` | EdgeNode persistent data volume | — |
 
 ---
@@ -315,32 +268,9 @@ Sessions are 24-hour cookie-based tokens stored in-memory. They are cleared on s
 
 SSH access is provided only for the `holo` system user. Root login is disabled via `/etc/ssh/sshd_config.d/90-holo.conf`. Password authentication is disabled — SSH keys only. SSH is intended as a "break glass" access path, not the primary management interface. The `/manage` panel is the primary interface.
 
-### AI agent command allowlist
-
-The OpenClaw AI agent operates against a strict allowlist. `curl` and `wget` are intentionally excluded to prevent the agent from making arbitrary outbound HTTP requests. The full list:
-
-```
-ls, cat, grep, find, head, tail, wc, echo, pwd, date, git,
-podman, docker, systemctl, journalctl,
-chmod, chown, mkdir, rm, cp, mv, touch,
-df, du, ps, free, uname, env, which
-```
-
-The agent also cannot write outside `/var/lib/openclaw/workspace` (enforced by `allowed_roots` in the OpenClaw config) and cannot modify system files (enforced by `forbidden_paths`).
-
 ### Network exposure
 
 The server binds to `0.0.0.0:8080`. It is intended to be reachable only on the local network — the FCOS firewall configuration in `holo-node-iso` should not expose port 8080 to the internet. The UI has no HTTPS; TLS termination (if desired) should be handled at the network edge.
-
----
-
-## Adding a new chat channel
-
-1. Add a credentials block to the HTML in `build_onboarding_html()` (copy the pattern from the `cr-telegram` div).
-2. Add a case to `build_channel_toml()` that serialises the credentials to TOML.
-3. Add a case to `send_welcome_message()` that posts the welcome message via the channel's API.
-4. Add the channel to the `extract_channel_config()` parser if the section header differs from the `[channels_config.<n>]` pattern.
-5. Test locally; submit a PR.
 
 ---
 
