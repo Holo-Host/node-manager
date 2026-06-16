@@ -64,7 +64,11 @@ A three-step browser UI walks the operator through:
 2. **Hardware mode** — initial container mode (EdgeNode or Wind Tunnel)
 3. **Review & initialize** — summary before committing
 
-When Wind Tunnel mode is selected and an Unyt Agent ID is provided, the WT client name is `{node_name}-{full_agent_id}` (max 63 characters total). Each physical node should use a unique node name + Agent ID pair.
+When Wind Tunnel mode is selected, the WT client name is always `{node_name}-{suffix}`:
+- **With Unyt Agent ID:** suffix is the full Agent ID
+- **Without Agent ID:** suffix is a random 16-character hex string generated at setup (persisted in state as `wt_suffix`)
+
+The combined name must fit within 63 characters. Each physical node should use a unique node name + Agent ID pair.
 
 After the operator submits, the server configures everything, starts the appropriate container service, and redirects the browser to the management panel.
 
@@ -256,7 +260,7 @@ Session tokens are stored in-memory and cleared on restart — operators will ne
 
 | Path | Contents | Permissions |
 |------|----------|-------------|
-| `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`) | 600 |
+| `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`, `wt_suffix`) | 600 |
 | `/etc/node-manager/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
 | `/etc/containers/systemd/edgenode.container` | Podman Quadlet for the EdgeNode container | 644 |
 | `/etc/containers/systemd/wind-tunnel.container` | Podman Quadlet for Wind Tunnel | 644 |
