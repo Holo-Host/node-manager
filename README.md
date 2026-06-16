@@ -2,7 +2,7 @@
 
 The onboarding and management server that ships inside every Holo Node.
 
-It is a single Rust binary with zero external dependencies — no Tokio, no Axum, no serde. It serves a browser UI over plain TCP on port 8080 and handles the full lifecycle of a node: first-time setup, SSH key management, AI agent configuration, hardware mode switching, and binary self-updates pulled from this repository's GitHub Releases.
+It is a single Rust binary with zero external dependencies — no Tokio, no Axum, no serde. It serves a browser UI over plain TCP on port 8080 and handles the full lifecycle of a node: first-time setup, SSH key management, Unyt Agent ID linking for HoloFuel compensation, hardware mode switching, and binary self-updates pulled from this repository's GitHub Releases.
 
 ---
 
@@ -14,12 +14,10 @@ It is a single Rust binary with zero external dependencies — no Tokio, no Axum
 4. [Repository structure](#repository-structure)
 5. [Shipping a release](#shipping-a-release)
 6. [Self-update mechanism](#self-update-mechanism)
-7. [Switching OpenClaw forks](#switching-openclaw-forks)
-8. [Routes reference](#routes-reference)
-9. [File paths on the node](#file-paths-on-the-node)
-10. [Security model](#security-model)
-11. [Adding a new chat channel](#adding-a-new-chat-channel)
-12. [Contributing](#contributing)
+7. [Routes reference](#routes-reference)
+8. [File paths on the node](#file-paths-on-the-node)
+9. [Security model](#security-model)
+10. [Contributing](#contributing)
 
 ---
 
@@ -62,9 +60,11 @@ On startup the binary generates a random 12-character password, writes its SHA-2
 
 A three-step browser UI walks the operator through:
 
-1. **Node identity & SSH** — node name (used as hostname slug) and optional SSH public key for the `holo` user
+1. **Node identity & SSH** — node name (used as hostname slug), optional Unyt Agent ID for HoloFuel compensation, and optional SSH public key for the `holo` user
 2. **Hardware mode** — initial container mode (EdgeNode or Wind Tunnel)
 3. **Review & initialize** — summary before committing
+
+When Wind Tunnel mode is selected and an Unyt Agent ID is provided, the WT client name is `{node_name}-{full_agent_id}` (max 63 characters total). Each physical node should use a unique node name + Agent ID pair.
 
 After the operator submits, the server configures everything, starts the appropriate container service, and redirects the browser to the management panel.
 
@@ -73,6 +73,7 @@ After the operator submits, the server configures everything, starts the appropr
 After onboarding, `GET /` redirects to `/manage`. The panel (password-protected) lets the operator:
 
 - Add and remove SSH public keys for the `holo` user without physical access
+- Link or update a Unyt Agent ID for HoloFuel compensation
 - Switch hardware mode between Standard EdgeNode and Wind Tunnel
 - Change the node password
 - Trigger an immediate software update check
@@ -84,6 +85,14 @@ A background thread wakes every hour, queries the GitHub Releases API for this r
 ---
 
 ## Building locally
+
+### Branch workflow
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Production-ready releases. Tag pushes trigger GitHub Actions release builds. |
+| `develop` | Integration branch for in-progress features. Merge to `main` when ready to release. |
+| `feature/*` | Short-lived branches off `develop`. |
 
 ### Prerequisites
 
@@ -131,7 +140,7 @@ To simulate an already-onboarded node (skip to /manage):
 
 ```bash
 mkdir -p /etc/node-manager
-echo "onboarded=true\nnode_name=test\nhw_mode=STANDARD\nagent_enabled=false" \
+echo -e "onboarded=true\nnode_name=test\nhw_mode=STANDARD\nunyt_agent_id=" \
   > /etc/node-manager/state
 cargo run
 # GET / will redirect to /manage
@@ -170,23 +179,23 @@ Every release publishes two binary assets:
 
 ### Step-by-step release process
 
-1. Make your changes to `src/main.rs` (and/or `holo-node.md`).
+1. Make your changes on a `feature/*` branch off `develop`, then merge into `develop`.
 
-2. Update the version in **two places** — they must match exactly:
-   - `const VERSION: &str = "5.1.0";` in `src/main.rs`
-   - `version = "5.1.0"` in `Cargo.toml`
+2. When ready to release, merge `develop` into `main` and update the version in **two places** — they must match exactly:
+   - `const VERSION: &str = "6.1.0";` in `src/main.rs`
+   - `version = "6.1.0"` in `Cargo.toml`
 
 3. Commit:
    ```bash
    git add src/main.rs Cargo.toml
-   git commit -m "release: v5.1.0 — <one line summary of changes>"
+   git commit -m "release: v6.1.0 — <one line summary of changes>"
    ```
 
 4. Tag and push:
    ```bash
-   git tag v5.1.0
+   git tag v6.1.0
    git push origin main
-   git push origin v5.1.0
+   git push origin v6.1.0
    ```
 
 5. GitHub Actions (`.github/workflows/release.yml`) picks up the tag, builds both binaries using musl static linking, creates a GitHub Release, and attaches both binary assets automatically. No manual upload needed.
@@ -234,6 +243,7 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 | `GET` | `/manage/status` | session | JSON node state snapshot |
 | `POST` | `/manage/ssh/add` | session | Add SSH public key |
 | `POST` | `/manage/ssh/remove` | session | Remove SSH key by index |
+| `POST` | `/manage/unyt` | session | Save or update Unyt Agent ID |
 | `POST` | `/manage/hardware` | session | Switch STANDARD ↔ WIND_TUNNEL |
 | `POST` | `/manage/password` | session | Change node password |
 | `POST` | `/manage/update` | session | Trigger immediate update check |
@@ -246,9 +256,8 @@ Session tokens are stored in-memory and cleared on restart — operators will ne
 
 | Path | Contents | Permissions |
 |------|----------|-------------|
-| `/etc/node-manager/state` | Key-value store of node state (node_name, hw_mode, agent_enabled, channel, provider, model) | 600 |
+| `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`) | 600 |
 | `/etc/node-manager/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
-| `/etc/node-manager/provider` | Provider credentials for agent re-enable | 600 |
 | `/etc/containers/systemd/edgenode.container` | Podman Quadlet for the EdgeNode container | 644 |
 | `/etc/containers/systemd/wind-tunnel.container` | Podman Quadlet for Wind Tunnel | 644 |
 | `/home/holo/.ssh/authorized_keys` | SSH public keys for the holo user | 600 |

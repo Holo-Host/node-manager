@@ -14,7 +14,8 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.0.0";
+const VERSION: &str = "6.1.0";
+const WT_HOSTNAME_MAX: usize = 63;
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const QUADLET_DIR: &str = "/etc/containers/systemd";
@@ -27,12 +28,13 @@ const UPDATE_INTERVAL_SECS: u64 = 3600;
 // ── Shared application state ───────────────────────────────────────────────────
 
 struct AppState {
-    ap_mode:    bool,
-    start_time: SystemTime,
-    sessions:   Mutex<HashMap<String, SystemTime>>,
-    onboarded:  AtomicBool,
-    node_name:  Mutex<String>,
-    hw_mode:    Mutex<String>,
+    ap_mode:        bool,
+    start_time:     SystemTime,
+    sessions:       Mutex<HashMap<String, SystemTime>>,
+    onboarded:      AtomicBool,
+    node_name:      Mutex<String>,
+    hw_mode:        Mutex<String>,
+    unyt_agent_id:  Mutex<String>,
 }
 
 impl AppState {
@@ -43,8 +45,9 @@ impl AppState {
             start_time: SystemTime::now(),
             sessions:   Mutex::new(HashMap::new()),
             onboarded:  AtomicBool::new(kv.get("onboarded").map(|v| v == "true").unwrap_or(false)),
-            node_name:  Mutex::new(kv.get("node_name").cloned().unwrap_or_default()),
-            hw_mode:    Mutex::new(kv.get("hw_mode").cloned().unwrap_or_else(|| "STANDARD".into())),
+            node_name:     Mutex::new(kv.get("node_name").cloned().unwrap_or_default()),
+            hw_mode:       Mutex::new(kv.get("hw_mode").cloned().unwrap_or_else(|| "STANDARD".into())),
+            unyt_agent_id: Mutex::new(kv.get("unyt_agent_id").cloned().unwrap_or_default()),
         }
     }
 }
@@ -273,6 +276,56 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
     format!("[Unit]\nDescription=Holochain Wind Tunnel Runner\nAfter=network-online.target\nConflicts=edgenode.service\n\n[Container]\nImage={image}\nContainerName=wind-tunnel\nHostName={hostname}\nNetwork=host\nPodmanArgs=--cgroupns=host --privileged\nLabel=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n", hostname=hostname, image=image)
 }
 
+fn validate_unyt_agent_id(agent_id: &str) -> Option<String> {
+    let id = agent_id.trim();
+    if id.is_empty() { return None; }
+    if id.starts_with('-') || id.ends_with('-') {
+        return Some("Unyt Agent ID cannot start or end with a hyphen.".into());
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Some("Unyt Agent ID may only contain letters, numbers, and hyphens.".into());
+    }
+    None
+}
+
+fn build_wt_hostname(node_name: &str, unyt_agent_id: &str) -> String {
+    let agent = unyt_agent_id.trim();
+    if agent.is_empty() { node_name.to_string() } else { format!("{}-{}", node_name, agent) }
+}
+
+fn wt_hostname_error(node_name: &str, unyt_agent_id: &str) -> Option<String> {
+    if let Some(msg) = validate_unyt_agent_id(unyt_agent_id) { return Some(msg); }
+    let hostname = build_wt_hostname(node_name, unyt_agent_id);
+    if hostname.len() <= WT_HOSTNAME_MAX { return None; }
+    let agent = unyt_agent_id.trim();
+    let overhead = if agent.is_empty() { 0 } else { 1 + agent.len() };
+    let max_name = WT_HOSTNAME_MAX.saturating_sub(overhead);
+    Some(format!(
+        "Wind Tunnel client name would exceed {} characters (node name + full Agent ID). Shorten node name to at most {} characters.",
+        WT_HOSTNAME_MAX, max_name
+    ))
+}
+
+fn write_quadlets(node_name: &str, unyt_agent_id: &str) {
+    let wt_hostname    = build_wt_hostname(node_name, unyt_agent_id);
+    let edgenode_image = resolve_edgenode_image();
+    let wt_image       = resolve_wind_tunnel_image();
+    let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR),    build_edgenode_quadlet(&edgenode_image));
+    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&wt_hostname, &wt_image));
+    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+    eprintln!("[quadlet] WT hostname={}", wt_hostname);
+}
+
+fn restart_wind_tunnel_if_running() {
+    let status = Command::new("systemctl")
+        .args(["is-active", "wind-tunnel.service"])
+        .output();
+    if status.map(|o| o.status.success()).unwrap_or(false) {
+        let _ = Command::new("systemctl").args(["restart", "wind-tunnel.service"]).output();
+        eprintln!("[quadlet] wind-tunnel.service restarted");
+    }
+}
+
 // ── Self-update ────────────────────────────────────────────────────────────────
 
 fn check_and_apply_update(repo: &str) {
@@ -325,6 +378,11 @@ fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     let stop_svc  = if current == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
     let start_svc = if new_mode == "WIND_TUNNEL"  { "wind-tunnel.service" } else { "edgenode.service" };
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt", new_mode);
+    if new_mode == "WIND_TUNNEL" {
+        let node_name = state.node_name.lock().unwrap().clone();
+        let agent_id  = state.unyt_agent_id.lock().unwrap().clone();
+        write_quadlets(&node_name, &agent_id);
+    }
     if current != new_mode {
         eprintln!("[manage] Stopping {} → starting {}", stop_svc, start_svc);
         let _ = Command::new("systemctl").args(["stop",  stop_svc]).output();
@@ -492,6 +550,8 @@ fn build_login_html(error: bool) -> String {
 
 // ── Onboarding page ────────────────────────────────────────────────────────────
 
+const UNYT_INFO_COPY: &str = r#"<div class="info-box" style="margin-top:12px"><strong>HoloFuel compensation requires a Unyt Agent ID.</strong> Download the Unyt desktop app, sign in, and copy your Agent ID from the app settings. Setup can finish without it, but you will not receive HoloFuel payments until an Agent ID is saved.<br><br>Each physical node needs a unique node name + Agent ID pair. Do not reuse the same combination on multiple machines.</div>"#;
+
 fn build_onboarding_html(ap_mode: bool) -> String {
     let wifi_block = if ap_mode {
         r#"<div class="err-box">⚠ No Ethernet — connect to Wi-Fi to continue.</div>
@@ -531,9 +591,12 @@ fn build_onboarding_html(ap_mode: bool) -> String {
       <div class="sdsc">Name your node and optionally add your SSH public key for remote access.</div>
       <label>Node name *</label>
       <input type="text" id="nodeName" placeholder="e.g. alice, home-node-01" oninput="chkS1()">
-      <div class="hint">Lowercase letters, numbers and hyphens only. Used as hostname slug.</div>
+      <div class="hint" id="nameHint">Lowercase letters, numbers and hyphens only. Used as hostname slug.</div>
       <label>SSH public key <span style="color:#475569;font-weight:400">(recommended)</span></label>
       <textarea id="sshKey" placeholder="ssh-ed25519 AAAA...&#10;Leave blank to add keys later in /manage"></textarea>
+      <label>Unyt Agent ID <span style="color:#475569;font-weight:400">(optional)</span></label>
+      <input type="text" id="unytAgentId" placeholder="Paste your Agent ID from the Unyt desktop app" oninput="chkS1()">
+      {unyt_copy}
       <div class="brow"><button class="btn btn-primary" id="b1" onclick="gTo(2)" disabled>Continue →</button></div>
     </div>
 
@@ -561,7 +624,9 @@ fn build_onboarding_html(ap_mode: bool) -> String {
       <table class="rt">
         <tr><td>Node Name</td><td id="rv-nn">—</td></tr>
         <tr><td>SSH Key</td><td id="rv-sk">—</td></tr>
+        <tr><td>Unyt Agent ID</td><td id="rv-unyt">—</td></tr>
         <tr><td>Hardware Mode</td><td id="rv-hw">—</td></tr>
+        <tr id="rv-wt-row" style="display:none"><td>WT Client Name</td><td id="rv-wt">—</td></tr>
       </table>
       <div class="info-box" style="margin-top:16px">After initialization:<br>
         1. SSH access is configured for the <code>holo</code> user<br>
@@ -592,22 +657,44 @@ function gTo(n){{
 }}
 
 function chkS1(){{
-  const ok=/^[a-z0-9-]+$/.test(v('nodeName'));
+  const name=v('nodeName');
+  const agent=v('unytAgentId');
+  const ok=/^[a-z0-9-]+$/.test(name);
   document.getElementById('b1').disabled=!ok;
+  const hint=document.getElementById('nameHint');
+  if(!hint)return;
+  if(!ok){{hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';return;}}
+  const wtName=agent?name+'-'+agent.trim():name;
+  if(wtName.length>63){{hint.textContent='With this Agent ID, node name must be at most '+(63-(1+agent.trim().length))+' characters for Wind Tunnel.';document.getElementById('b1').disabled=true;return;}}
+  hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';
+}}
+
+function wtClientName(name,agent){{
+  const a=agent.trim();
+  return a?name+'-'+a:name;
 }}
 
 function bRev(){{
   const sk=v('sshKey');
+  const agent=v('unytAgentId');
   const set=(id,t)=>{{const e=document.getElementById(id);if(e)e.textContent=t;}};
   set('rv-nn',v('nodeName')||'—');
   set('rv-sk',sk?sk.split(' ')[0]+' ••••':'(not provided)');
+  set('rv-unyt',agent||'(not provided — compensation unavailable)');
   set('rv-hw',v('hw')==='WIND_TUNNEL'?'Wind Tunnel':'Standard EdgeNode');
+  const wtRow=document.getElementById('rv-wt-row');
+  if(v('hw')==='WIND_TUNNEL'){{
+    wtRow.style.display='';
+    set('rv-wt',wtClientName(v('nodeName'),agent));
+  }}else{{wtRow.style.display='none';}}
 }}
 
 async function doSubmit(){{
   const nodeName=v('nodeName');
+  const agent=v('unytAgentId');
   if(!nodeName)return alert('Node name is required.');
   if(!/^[a-z0-9-]+$/.test(nodeName))return alert('Node name must be lowercase letters, numbers and hyphens only.');
+  if(wtClientName(nodeName,agent).length>63)return alert('Node name is too long for Wind Tunnel tracking with this Agent ID. Shorten the node name.');
   const btn=document.getElementById('bsub');
   btn.disabled=true;
   document.getElementById('slbl-btn').style.display='none';
@@ -615,6 +702,7 @@ async function doSubmit(){{
   const p={{
     nodeName,
     sshKey:v('sshKey'),
+    unytAgentId:agent,
     hwMode:v('hw'),
     wifiSsid:v('wifiSsid'),
     wifiPass:v('wifiPass'),
@@ -634,17 +722,28 @@ async function doSubmit(){{
 </body></html>"#,
         css        = COMMON_CSS,
         wifi_block = wifi_block,
+        unyt_copy  = UNYT_INFO_COPY,
     )
 }
 
 // ── build_manage_html ──────────────────────────────────────────────────────────
 
 fn build_manage_html(state: &AppState) -> String {
-    let node_name = state.node_name.lock().unwrap().clone();
-    let hw_mode   = state.hw_mode.lock().unwrap().clone();
-    let ssh_keys  = read_ssh_keys();
-    let uptime_s  = state.start_time.elapsed().unwrap_or_default().as_secs();
-    let ip        = get_local_ip();
+    let node_name     = state.node_name.lock().unwrap().clone();
+    let hw_mode       = state.hw_mode.lock().unwrap().clone();
+    let unyt_agent_id = state.unyt_agent_id.lock().unwrap().clone();
+    let ssh_keys      = read_ssh_keys();
+    let uptime_s      = state.start_time.elapsed().unwrap_or_default().as_secs();
+    let ip            = get_local_ip();
+    let wt_client_name = build_wt_hostname(&node_name, &unyt_agent_id);
+
+    let unyt_display = if unyt_agent_id.is_empty() {
+        "(not set — compensation unavailable)".to_string()
+    } else {
+        unyt_agent_id.clone()
+    };
+    let unyt_badge = if unyt_agent_id.is_empty() { "badge-gray" } else { "badge-green" };
+    let unyt_badge_text = if unyt_agent_id.is_empty() { "not set" } else { "linked" };
 
     let keys_html: String = if ssh_keys.is_empty() {
         r#"<div class="no-keys">No SSH keys configured. Add one below to enable SSH access.</div>"#.to_string()
@@ -710,6 +809,23 @@ fn build_manage_html(state: &AppState) -> String {
   </div>
   <div class="info-row">
     <div class="info-item">Hardware <span id="info-hw">{hw_mode_display}</span></div>
+    <div class="info-item">Unyt <span id="info-unyt">{unyt_badge_text}</span></div>
+  </div>
+
+  <!-- UNYT COMPENSATION -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('unyt')">
+      <div class="section-title"><span>💰</span> Unyt Compensation <span class="section-badge {unyt_badge}" id="unyt-badge">{unyt_badge_text}</span></div>
+      <span class="section-arrow" id="arr-unyt">▼</span>
+    </div>
+    <div class="section-body" id="sec-unyt">
+      {unyt_copy}
+      <p style="font-size:13px;color:#64748b;margin:14px 0">Current Agent ID: <strong style="color:#e2e8f0">{unyt_display}</strong></p>
+      <p style="font-size:12px;color:#475569;margin-bottom:14px">Wind Tunnel client name: <code>{wt_client_name}</code></p>
+      <label>Unyt Agent ID</label>
+      <input type="text" id="unytAgentId" value="{unyt_agent_id_escaped}" placeholder="Paste your Agent ID from the Unyt desktop app">
+      <div style="margin-top:10px"><button class="btn btn-primary" onclick="saveUnyt()">Save Agent ID</button></div>
+    </div>
   </div>
 
   <!-- SSH KEYS -->
@@ -789,7 +905,7 @@ function toggleSection(id){{
   body.style.display=open?'none':'block';
   if(arr)arr.textContent=open?'▶':'▼';
 }}
-['hw','pw','upd'].forEach(id=>toggleSection(id));
+['unyt','hw','pw','upd'].forEach(id=>toggleSection(id));
 
 function toast(msg,ok){{
   const t=document.getElementById('toast');
@@ -823,6 +939,15 @@ function selHw(mode,el){{
   curHw=mode;
   document.querySelectorAll('.hw-opt').forEach(o=>o.classList.remove('sel'));
   el.classList.add('sel');
+}}
+
+async function saveUnyt(){{
+  const agent=v('unytAgentId');
+  try{{
+    await api('/manage/unyt',{{unytAgentId:agent}});
+    toast('Unyt Agent ID saved — reloading…',true);
+    setTimeout(()=>location.reload(),800);
+  }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
 async function saveHardware(){{
@@ -859,18 +984,24 @@ async function triggerUpdate(){{
 }}
 </script>
 </body></html>"#,
-        css              = COMMON_CSS,
-        node_name        = html_escape(&node_name),
-        version          = VERSION,
-        ip               = html_escape(&ip),
-        uptime           = fmt_uptime(uptime_s),
-        keys_html        = keys_html,
-        ssh_count        = ssh_count,
-        ssh_plural       = ssh_plural,
-        hw_mode          = hw_mode,
-        hw_mode_display  = hw_mode_display,
-        sel_std          = sel_std,
-        sel_wt           = sel_wt,
+        css                  = COMMON_CSS,
+        node_name            = html_escape(&node_name),
+        version              = VERSION,
+        ip                   = html_escape(&ip),
+        uptime               = fmt_uptime(uptime_s),
+        keys_html            = keys_html,
+        ssh_count            = ssh_count,
+        ssh_plural           = ssh_plural,
+        hw_mode              = hw_mode,
+        hw_mode_display      = hw_mode_display,
+        sel_std              = sel_std,
+        sel_wt               = sel_wt,
+        unyt_copy            = UNYT_INFO_COPY,
+        unyt_display         = html_escape(&unyt_display),
+        unyt_badge           = unyt_badge,
+        unyt_badge_text      = unyt_badge_text,
+        unyt_agent_id_escaped = html_escape(&unyt_agent_id),
+        wt_client_name       = html_escape(&wt_client_name),
     )
 }
 
@@ -882,12 +1013,16 @@ fn handle_submit(
     state: &AppState,
     _auth_hash: &Arc<Mutex<String>>,
 ) {
-    let body      = &req.body;
-    let node_name = json_str(body, "nodeName");
-    let ssh_key   = json_str(body, "sshKey");
-    let hw_mode   = json_str(body, "hwMode");
+    let body           = &req.body;
+    let node_name      = json_str(body, "nodeName");
+    let ssh_key        = json_str(body, "sshKey");
+    let hw_mode        = json_str(body, "hwMode");
+    let unyt_agent_id  = json_str(body, "unytAgentId");
 
     if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
+    if let Some(msg) = wt_hostname_error(node_name, unyt_agent_id) {
+        send_json_err(stream, 400, &msg); return;
+    }
 
     // ── WiFi (AP mode) ───────────────────────────────────────────────────────
     let wifi_ssid = json_str(body, "wifiSsid");
@@ -918,12 +1053,7 @@ fn handle_submit(
     }
 
     // ── Quadlets ─────────────────────────────────────────────────────────────
-    let wt_hostname    = format!("nomad-client-{}", node_name);
-    let edgenode_image = resolve_edgenode_image();
-    let wt_image       = resolve_wind_tunnel_image();
-    let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR),    build_edgenode_quadlet(&edgenode_image));
-    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&wt_hostname, &wt_image));
-    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+    write_quadlets(node_name, unyt_agent_id);
 
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt",
         if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" });
@@ -935,27 +1065,36 @@ fn handle_submit(
     kv.insert("onboarded".into(), "true".into());
     kv.insert("node_name".into(), node_name.to_string());
     kv.insert("hw_mode".into(), if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string());
+    kv.insert("unyt_agent_id".into(), unyt_agent_id.to_string());
     write_state_file(&kv);
 
-    *state.node_name.lock().unwrap() = node_name.to_string();
-    *state.hw_mode.lock().unwrap()   = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string();
+    *state.node_name.lock().unwrap()     = node_name.to_string();
+    *state.hw_mode.lock().unwrap()       = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string();
+    *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
     state.onboarded.store(true, Ordering::Relaxed);
 
-    eprintln!("[onboard] Complete. node={} hw={}", node_name, hw_mode);
+    eprintln!("[onboard] Complete. node={} hw={} unyt={}", node_name, hw_mode, if unyt_agent_id.is_empty() { "(none)" } else { "set" });
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
 fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
-    let node_name = state.node_name.lock().unwrap().clone();
-    let hw_mode   = state.hw_mode.lock().unwrap().clone();
+    let node_name     = state.node_name.lock().unwrap().clone();
+    let hw_mode       = state.hw_mode.lock().unwrap().clone();
+    let unyt_agent_id = state.unyt_agent_id.lock().unwrap().clone();
+    let wt_client_name = build_wt_hostname(&node_name, &unyt_agent_id);
     let uptime    = state.start_time.elapsed().unwrap_or_default().as_secs();
     let keys      = read_ssh_keys();
     let keys_json: String = keys.iter()
         .map(|k| format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>().join(",");
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
-        VERSION, node_name, hw_mode, keys.len(), keys_json, uptime
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","wt_client_name":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
+        VERSION,
+        node_name.replace('\\', "\\\\").replace('"', "\\\""),
+        hw_mode,
+        unyt_agent_id.replace('\\', "\\\\").replace('"', "\\\""),
+        wt_client_name.replace('\\', "\\\\").replace('"', "\\\""),
+        keys.len(), keys_json, uptime
     ));
 }
 
@@ -992,6 +1131,33 @@ fn handle_ssh_remove(stream: &mut TcpStream, req: &Req) {
         Ok(()) => send_json_ok(stream, r#"{"status":"removed"}"#),
         Err(e) => send_json_err(stream, 500, &e),
     }
+}
+
+fn handle_unyt(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
+    let unyt_agent_id = json_str(&req.body, "unytAgentId");
+    let node_name     = state.node_name.lock().unwrap().clone();
+    if let Some(msg) = wt_hostname_error(&node_name, unyt_agent_id) {
+        send_json_err(stream, 400, &msg); return;
+    }
+
+    update_state_key("unyt_agent_id", unyt_agent_id);
+    *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
+
+    write_quadlets(&node_name, unyt_agent_id);
+    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
+        restart_wind_tunnel_if_running();
+    }
+
+    let wt_client_name = build_wt_hostname(&node_name, unyt_agent_id);
+    eprintln!("[manage] Unyt Agent ID updated. wt_client_name={}", wt_client_name);
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","wt_client_name":"{}"}}"#,
+        wt_client_name.replace('\\', "\\\\").replace('"', "\\\"")
+    ));
 }
 
 fn handle_hardware(
@@ -1137,6 +1303,14 @@ fn main() {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
                         handle_ssh_remove(&mut stream, &req);
+                    }
+                },
+
+                ("POST", "/manage/unyt") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_unyt(&mut stream, &req, &state);
                     }
                 },
 
