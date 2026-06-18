@@ -19,6 +19,7 @@ const WT_HOSTNAME_MAX: usize = 63;
 const WT_RANDOM_SUFFIX_LEN: usize = 16;
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
+const WIND_TUNNEL_ENV: &str = "/etc/node-manager/wind-tunnel.env";
 const QUADLET_DIR: &str = "/etc/containers/systemd";
 const AUTHORIZED_KEYS: &str = "/home/holo/.ssh/authorized_keys";
 const UPDATE_REPO_ENV: &str = "UPDATE_REPO";
@@ -276,7 +277,28 @@ fn build_edgenode_quadlet(image: &str) -> String {
 }
 
 fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
-    format!("[Unit]\nDescription=Holochain Wind Tunnel Runner\nAfter=network-online.target\nConflicts=edgenode.service\n\n[Container]\nImage={image}\nContainerName=wind-tunnel\nHostName={hostname}\nNetwork=host\nPodmanArgs=--cgroupns=host --privileged\nLabel=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n", hostname=hostname, image=image)
+    format!(
+        "[Unit]\n\
+         Description=Holochain Wind Tunnel Runner\n\
+         After=network-online.target\n\
+         Conflicts=edgenode.service\n\n\
+         [Container]\n\
+         Image={image}\n\
+         ContainerName=wind-tunnel\n\
+         HostName={hostname}\n\
+         Network=host\n\
+         EnvironmentFile={env_file}\n\
+         PodmanArgs=--cgroupns=host --privileged\n\
+         Label=io.containers.autoupdate=registry\n\n\
+         [Service]\n\
+         Restart=always\n\
+         RestartSec=5\n\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        hostname = hostname,
+        image = image,
+        env_file = WIND_TUNNEL_ENV,
+    )
 }
 
 fn generate_wt_suffix() -> String {
@@ -304,7 +326,7 @@ fn validate_unyt_agent_id(agent_id: &str) -> Option<String> {
     None
 }
 
-fn build_wt_hostname(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) -> String {
+fn build_wt_client_name(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) -> String {
     let agent = unyt_agent_id.trim();
     if agent.is_empty() {
         format!("{}-{}", node_name, wt_suffix)
@@ -313,7 +335,7 @@ fn build_wt_hostname(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) -> S
     }
 }
 
-fn wt_hostname_error(node_name: &str, unyt_agent_id: &str) -> Option<String> {
+fn wt_client_name_error(node_name: &str, unyt_agent_id: &str) -> Option<String> {
     if let Some(msg) = validate_unyt_agent_id(unyt_agent_id) { return Some(msg); }
     let agent = unyt_agent_id.trim();
     let overhead = if agent.is_empty() {
@@ -334,21 +356,25 @@ fn wt_hostname_error(node_name: &str, unyt_agent_id: &str) -> Option<String> {
     ))
 }
 
-fn write_quadlets(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) {
-    let wt_hostname = build_wt_hostname(node_name, unyt_agent_id, wt_suffix);
+fn write_wind_tunnel_env(unyt_agent_id: &str) {
+    let env_content = format!("UNYT_AGENT_ID={}\n", unyt_agent_id);
+    let _ = fs::create_dir_all("/etc/node-manager");
+    let _ = fs::write(WIND_TUNNEL_ENV, env_content);
+    let _ = Command::new("chmod").args(["600", WIND_TUNNEL_ENV]).output();
+}
+
+fn write_quadlets(node_name: &str) {
     let edgenode_image = resolve_edgenode_image();
     let wt_image       = resolve_wind_tunnel_image();
     let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR),    build_edgenode_quadlet(&edgenode_image));
-    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&wt_hostname, &wt_image));
+    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(node_name, &wt_image));
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-    eprintln!("[quadlet] WT hostname={}", wt_hostname);
+    eprintln!("[quadlet] WT hostname={}", node_name);
 }
 
 fn write_quadlets_for_state(state: &AppState) {
     let node_name = state.node_name.lock().unwrap().clone();
-    let agent_id  = state.unyt_agent_id.lock().unwrap().clone();
-    let suffix    = ensure_wt_suffix(state);
-    write_quadlets(&node_name, &agent_id, &suffix);
+    write_quadlets(&node_name);
 }
 
 fn restart_wind_tunnel_if_running() {
@@ -776,7 +802,7 @@ fn build_manage_html(state: &AppState) -> String {
     let ssh_keys       = read_ssh_keys();
     let uptime_s       = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip             = get_local_ip();
-    let wt_client_name = build_wt_hostname(&node_name, &unyt_agent_id, &wt_suffix);
+    let wt_client_name = build_wt_client_name(&node_name, &unyt_agent_id, &wt_suffix);
 
     let unyt_display = if unyt_agent_id.is_empty() {
         "(not set — compensation unavailable)".to_string()
@@ -1061,7 +1087,7 @@ fn handle_submit(
     let unyt_agent_id  = json_str(body, "unytAgentId");
 
     if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
-    if let Some(msg) = wt_hostname_error(node_name, unyt_agent_id) {
+    if let Some(msg) = wt_client_name_error(node_name, unyt_agent_id) {
         send_json_err(stream, 400, &msg); return;
     }
 
@@ -1094,8 +1120,9 @@ fn handle_submit(
     }
 
     // ── Quadlets ─────────────────────────────────────────────────────────────
+    write_wind_tunnel_env(unyt_agent_id);
     let wt_suffix = generate_wt_suffix();
-    write_quadlets(node_name, unyt_agent_id, &wt_suffix);
+    write_quadlets(node_name);
 
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt",
         if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" });
@@ -1126,7 +1153,7 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let hw_mode       = state.hw_mode.lock().unwrap().clone();
     let unyt_agent_id  = state.unyt_agent_id.lock().unwrap().clone();
     let wt_suffix      = ensure_wt_suffix(state);
-    let wt_client_name = build_wt_hostname(&node_name, &unyt_agent_id, &wt_suffix);
+    let wt_client_name = build_wt_client_name(&node_name, &unyt_agent_id, &wt_suffix);
     let uptime    = state.start_time.elapsed().unwrap_or_default().as_secs();
     let keys      = read_ssh_keys();
     let keys_json: String = keys.iter()
@@ -1185,20 +1212,21 @@ fn handle_unyt(
 ) {
     let unyt_agent_id = json_str(&req.body, "unytAgentId");
     let node_name     = state.node_name.lock().unwrap().clone();
-    if let Some(msg) = wt_hostname_error(&node_name, unyt_agent_id) {
+    if let Some(msg) = wt_client_name_error(&node_name, unyt_agent_id) {
         send_json_err(stream, 400, &msg); return;
     }
 
     update_state_key("unyt_agent_id", unyt_agent_id);
     *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
 
+    write_wind_tunnel_env(unyt_agent_id);
     write_quadlets_for_state(state);
     if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
         restart_wind_tunnel_if_running();
     }
 
     let suffix    = ensure_wt_suffix(state);
-    let wt_client_name = build_wt_hostname(&node_name, unyt_agent_id, &suffix);
+    let wt_client_name = build_wt_client_name(&node_name, unyt_agent_id, &suffix);
     eprintln!("[manage] Unyt Agent ID updated. wt_client_name={}", wt_client_name);
     send_json_ok(stream, &format!(
         r#"{{"status":"ok","wt_client_name":"{}"}}"#,
