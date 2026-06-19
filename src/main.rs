@@ -14,7 +14,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.1.4";
+const VERSION: &str = "6.1.5";
 const WT_HOSTNAME_MAX: usize = 63;
 const WT_RANDOM_SUFFIX_LEN: usize = 16;
 const STATE_FILE: &str = "/etc/node-manager/state";
@@ -26,6 +26,8 @@ const QUADLET_DIR: &str = "/etc/containers/systemd";
 const AUTHORIZED_KEYS: &str = "/home/holo/.ssh/authorized_keys";
 const UPDATE_REPO_ENV: &str = "UPDATE_REPO";
 const UPDATE_REPO_DEFAULT: &str = "holo-host/node-manager";
+const WT_IMAGE_ENV: &str = "WIND_TUNNEL_IMAGE";
+const WT_ENTRYPOINT_ENV: &str = "WIND_TUNNEL_ENTRYPOINT_BIND";
 const SESSION_TTL_SECS: u64 = 86400;
 const UPDATE_INTERVAL_SECS: u64 = 3600;
 
@@ -38,8 +40,10 @@ struct AppState {
     onboarded:      AtomicBool,
     node_name:      Mutex<String>,
     hw_mode:        Mutex<String>,
-    unyt_agent_id:  Mutex<String>,
-    wt_suffix:      Mutex<String>,
+    unyt_agent_id:       Mutex<String>,
+    wt_suffix:           Mutex<String>,
+    wt_image_override:   Mutex<String>,
+    wt_entrypoint_bind:  Mutex<String>,
 }
 
 impl AppState {
@@ -52,8 +56,10 @@ impl AppState {
             onboarded:  AtomicBool::new(kv.get("onboarded").map(|v| v == "true").unwrap_or(false)),
             node_name:     Mutex::new(kv.get("node_name").cloned().unwrap_or_default()),
             hw_mode:       Mutex::new(kv.get("hw_mode").cloned().unwrap_or_else(|| "STANDARD".into())),
-            unyt_agent_id: Mutex::new(kv.get("unyt_agent_id").cloned().unwrap_or_default()),
-            wt_suffix:     Mutex::new(kv.get("wt_suffix").cloned().unwrap_or_default()),
+            unyt_agent_id:      Mutex::new(kv.get("unyt_agent_id").cloned().unwrap_or_default()),
+            wt_suffix:          Mutex::new(kv.get("wt_suffix").cloned().unwrap_or_default()),
+            wt_image_override:  Mutex::new(kv.get("wt_image_override").cloned().unwrap_or_default()),
+            wt_entrypoint_bind: Mutex::new(kv.get("wt_entrypoint_bind").cloned().unwrap_or_default()),
         }
     }
 }
@@ -311,7 +317,10 @@ fn build_edgenode_quadlet(image: &str) -> String {
     format!("[Unit]\nDescription=Holo EdgeNode\nAfter=network-online.target\nConflicts=wind-tunnel.service\n\n[Container]\nImage={image}\nContainerName=edgenode\nVolume=/var/lib/edgenode:/data:Z\nLabel=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n", image=image)
 }
 
-fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
+fn build_wind_tunnel_quadlet(hostname: &str, image: &str, entrypoint_bind: Option<&str>) -> String {
+    let entrypoint_volume = entrypoint_bind
+        .map(|p| format!("Volume={}:/entrypoint.sh:ro,Z\n", p))
+        .unwrap_or_default();
     format!(
         "[Unit]\n\
          Description=Holochain Wind Tunnel Runner\n\
@@ -323,6 +332,7 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
          HostName={hostname}\n\
          Network=host\n\
          Volume={client_meta}:/etc/nomad.d/client-meta.json:ro,Z\n\
+         {entrypoint_volume}\
          PodmanArgs=--cgroupns=host --privileged\n\
          Label=io.containers.autoupdate=registry\n\n\
          [Service]\n\
@@ -333,6 +343,7 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
         hostname = hostname,
         image = image,
         client_meta = WIND_TUNNEL_CLIENT_META,
+        entrypoint_volume = entrypoint_volume,
     )
 }
 
@@ -421,19 +432,90 @@ fn validate_node_name(node_name: &str) -> Option<String> {
     None
 }
 
-fn write_quadlets(node_name: &str) {
-    let edgenode_image = resolve_edgenode_image();
-    let wt_image       = resolve_wind_tunnel_image();
-    let wt_hostname    = build_wt_hostname(node_name);
-    let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR),    build_edgenode_quadlet(&edgenode_image));
-    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&wt_hostname, &wt_image));
-    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-    eprintln!("[quadlet] WT hostname={}", wt_hostname);
+struct WindTunnelConfig {
+    hostname: String,
+    image: String,
+    entrypoint_bind: Option<String>,
 }
 
-fn write_quadlets_for_state(state: &AppState) {
+fn validate_wt_image_override(image: &str) -> Option<String> {
+    let image = image.trim();
+    if image.is_empty() { return None; }
+    if image.chars().any(|c| c == ';' || c == '|' || c == '`' || c == '$' || c == '\n' || c == ' ') {
+        return Some("Image override contains invalid characters.".into());
+    }
+    if !image.contains(':') {
+        return Some("Image override must include a tag (e.g. registry/image:tag).".into());
+    }
+    if !image.chars().all(|c| c.is_ascii_alphanumeric() || "/:._-@".contains(c)) {
+        return Some("Image override has invalid characters.".into());
+    }
+    None
+}
+
+fn validate_wt_entrypoint_bind(path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() { return None; }
+    if !path.starts_with("/home/holo/") {
+        return Some("Entrypoint bind must be under /home/holo/.".into());
+    }
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Some(format!("Entrypoint file not found: {}", path)),
+    };
+    if !meta.is_file() {
+        return Some("Entrypoint bind must point to a regular file.".into());
+    }
+    None
+}
+
+fn resolve_wt_image_override(state: &AppState) -> Option<String> {
+    let from_state = state.wt_image_override.lock().unwrap().trim().to_string();
+    if !from_state.is_empty() { return Some(from_state); }
+    env::var(WT_IMAGE_ENV).ok().filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string())
+}
+
+fn resolve_wt_entrypoint_bind(state: &AppState) -> Option<String> {
+    let from_state = state.wt_entrypoint_bind.lock().unwrap().trim().to_string();
+    if !from_state.is_empty() { return Some(from_state); }
+    env::var(WT_ENTRYPOINT_ENV).ok().filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string())
+}
+
+fn resolve_wind_tunnel_config(state: &AppState) -> WindTunnelConfig {
     let node_name = state.node_name.lock().unwrap().clone();
-    write_quadlets(&node_name);
+    let hostname = build_wt_hostname(&node_name);
+    let image = match resolve_wt_image_override(state) {
+        Some(override_img) => override_img,
+        None => resolve_wind_tunnel_image(),
+    };
+    let entrypoint_bind = resolve_wt_entrypoint_bind(state);
+    WindTunnelConfig { hostname, image, entrypoint_bind }
+}
+
+fn write_quadlets_from_state(state: &AppState) {
+    let cfg = resolve_wind_tunnel_config(state);
+    let unyt = state.unyt_agent_id.lock().unwrap().clone();
+    write_wind_tunnel_client_meta(&unyt);
+    let edgenode_image = resolve_edgenode_image();
+    let wt_quadlet = build_wind_tunnel_quadlet(
+        &cfg.hostname,
+        &cfg.image,
+        cfg.entrypoint_bind.as_deref(),
+    );
+    let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR), build_edgenode_quadlet(&edgenode_image));
+    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), wt_quadlet);
+    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+    eprintln!("[quadlet] WT hostname={} image={}", cfg.hostname, cfg.image);
+    if let Some(ep) = cfg.entrypoint_bind.as_deref() {
+        eprintln!("[quadlet] entrypoint bind={}", ep);
+    }
+}
+
+fn apply_wind_tunnel_config(state: &AppState) {
+    write_quadlets_from_state(state);
+    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
+        restart_wind_tunnel_if_running();
+    }
 }
 
 fn restart_wind_tunnel_if_running() {
@@ -498,13 +580,9 @@ fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     let stop_svc  = if current == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
     let start_svc = if new_mode == "WIND_TUNNEL"  { "wind-tunnel.service" } else { "edgenode.service" };
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt", new_mode);
-    if new_mode == "WIND_TUNNEL" {
-        let unyt_agent_id = state.unyt_agent_id.lock().unwrap().clone();
-        write_wind_tunnel_client_meta(&unyt_agent_id);
-    }
     *state.hw_mode.lock().unwrap() = new_mode.to_string();
     update_state_key("hw_mode", new_mode);
-    write_quadlets_for_state(state);
+    write_quadlets_from_state(state);
     if current != new_mode {
         eprintln!("[manage] Stopping {} → starting {}", stop_svc, start_svc);
         let _ = Command::new("systemctl").args(["stop",  stop_svc]).output();
@@ -513,6 +591,16 @@ fn apply_hardware_mode(new_mode: &str, state: &AppState) {
 }
 
 // ── JSON / HTML helpers ────────────────────────────────────────────────────────
+
+fn json_has_key(json: &str, key: &str) -> bool {
+    json.contains(&format!("\"{}\"", key))
+}
+
+fn json_bool(json: &str, key: &str, default: bool) -> bool {
+    if !json_has_key(json, key) { return default; }
+    let v = json_str(json, key);
+    !matches!(v, "false" | "0")
+}
 
 fn json_str<'a>(json: &'a str, key: &str) -> &'a str {
     let needle = format!("\"{}\"", key);
@@ -880,6 +968,12 @@ fn build_manage_html(state: &AppState) -> String {
     let uptime_s       = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip             = get_local_ip();
     let wt_hostname    = build_wt_hostname(&node_name);
+    let wt_image_override  = state.wt_image_override.lock().unwrap().clone();
+    let wt_entrypoint_bind = state.wt_entrypoint_bind.lock().unwrap().clone();
+    let wt_cfg = resolve_wind_tunnel_config(state);
+    let wt_effective_image = wt_cfg.image.clone();
+    let wt_entrypoint_display = wt_cfg.entrypoint_bind.as_deref().map(|s| s.to_string()).unwrap_or_else(|| "(none)".into());
+    let wt_status_link = wt_status_url(&wt_hostname);
 
     let unyt_display = if unyt_agent_id.is_empty() {
         "(not set — compensation unavailable)".to_string()
@@ -1001,6 +1095,32 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
   </div>
 
+  <!-- WIND TUNNEL -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('wt')">
+      <div class="section-title"><span>🌀</span> Wind Tunnel</div>
+      <span class="section-arrow" id="arr-wt">▼</span>
+    </div>
+    <div class="section-body" id="sec-wt">
+      <p style="font-size:13px;color:#64748b;margin-bottom:14px">
+        Nomad hostname: <code>{wt_hostname}</code><br>
+        Effective image: <code>{wt_effective_image}</code><br>
+        Entrypoint bind: <code>{wt_entrypoint_display}</code><br>
+        <a href="{wt_status_link}" target="_blank" rel="noopener" style="color:#818cf8;font-size:12px">Check Wind Tunnel runner status</a>
+      </p>
+      <p style="font-size:12px;color:#475569;margin-bottom:14px">
+        Optional overrides for testing patched entrypoints or custom images. Leave empty to use production defaults.
+      </p>
+      <label>Image override</label>
+      <input type="text" id="wtImageOverride" value="{wt_image_override_escaped}" placeholder="ghcr.io/holochain/wind-tunnel-runner:latest">
+      <div class="hint">Full image reference including tag. Empty = auto-resolve latest for this architecture.</div>
+      <label style="margin-top:12px">Entrypoint bind</label>
+      <input type="text" id="wtEntrypointBind" value="{wt_entrypoint_bind_escaped}" placeholder="/home/holo/entrypoint.sh">
+      <div class="hint">Host path under /home/holo/ mounted read-only as /entrypoint.sh in the container.</div>
+      <div style="margin-top:14px"><button class="btn btn-primary" onclick="applyWindTunnel()">Apply Wind Tunnel Config</button></div>
+    </div>
+  </div>
+
   <!-- SSH KEYS -->
   <div class="section">
     <div class="section-hdr" onclick="toggleSection('ssh')">
@@ -1078,7 +1198,7 @@ function toggleSection(id){{
   body.style.display=open?'none':'block';
   if(arr)arr.textContent=open?'▶':'▼';
 }}
-['name','unyt','hw','pw','upd'].forEach(id=>toggleSection(id));
+['name','unyt','wt','hw','pw','upd'].forEach(id=>toggleSection(id));
 
 const ORIGINAL_NODE_NAME='{node_name_js}';
 
@@ -1151,6 +1271,18 @@ async function saveUnyt(){{
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
+async function applyWindTunnel(){{
+  try{{
+    const r=await api('/manage/wind-tunnel',{{
+      wtImageOverride:v('wtImageOverride'),
+      wtEntrypointBind:v('wtEntrypointBind'),
+      apply:true
+    }});
+    toast('Wind Tunnel config applied — reloading…',true);
+    setTimeout(()=>location.reload(),800);
+  }}catch(e){{toast('Error: '+e.message,false);}}
+}}
+
 async function saveHardware(){{
   try{{
     await api('/manage/hardware',{{mode:curHw}});
@@ -1205,6 +1337,12 @@ async function triggerUpdate(){{
         unyt_badge_text      = unyt_badge_text,
         unyt_agent_id_escaped = html_escape(&unyt_agent_id),
         wt_hostname_html     = wt_hostname_html,
+        wt_hostname          = html_escape(&wt_hostname),
+        wt_effective_image   = html_escape(&wt_effective_image),
+        wt_entrypoint_display = html_escape(&wt_entrypoint_display),
+        wt_status_link       = html_escape(&wt_status_link),
+        wt_image_override_escaped = html_escape(&wt_image_override),
+        wt_entrypoint_bind_escaped = html_escape(&wt_entrypoint_bind),
     )
 }
 
@@ -1256,29 +1394,28 @@ fn handle_submit(
     }
 
     // ── Quadlets ─────────────────────────────────────────────────────────────
-    write_wind_tunnel_client_meta(unyt_agent_id);
     let wt_suffix = generate_wt_suffix();
-    write_quadlets(node_name);
+    let hw_mode_val = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
 
-    let _ = fs::write("/var/lib/edgenode/mode_switch.txt",
-        if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" });
-    let initial_svc = if hw_mode == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
-    let _ = Command::new("systemctl").args(["start", initial_svc]).output();
+    *state.node_name.lock().unwrap()     = node_name.to_string();
+    *state.hw_mode.lock().unwrap()       = hw_mode_val.to_string();
+    *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
+    *state.wt_suffix.lock().unwrap()     = wt_suffix.clone();
+    state.onboarded.store(true, Ordering::Relaxed);
 
-    // ── Persist state ────────────────────────────────────────────────────────
     let mut kv = HashMap::new();
     kv.insert("onboarded".into(), "true".into());
     kv.insert("node_name".into(), node_name.to_string());
-    kv.insert("hw_mode".into(), if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string());
+    kv.insert("hw_mode".into(), hw_mode_val.to_string());
     kv.insert("unyt_agent_id".into(), unyt_agent_id.to_string());
     kv.insert("wt_suffix".into(), wt_suffix.clone());
     write_state_file(&kv);
 
-    *state.node_name.lock().unwrap()     = node_name.to_string();
-    *state.hw_mode.lock().unwrap()       = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" }.to_string();
-    *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
-    *state.wt_suffix.lock().unwrap()     = wt_suffix;
-    state.onboarded.store(true, Ordering::Relaxed);
+    write_quadlets_from_state(state);
+
+    let _ = fs::write("/var/lib/edgenode/mode_switch.txt", hw_mode_val);
+    let initial_svc = if hw_mode == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
+    let _ = Command::new("systemctl").args(["start", initial_svc]).output();
 
     eprintln!("[onboard] Complete. node={} hw={} unyt={}", node_name, hw_mode, if unyt_agent_id.is_empty() { "(none)" } else { "set" });
     send_json_ok(stream, r#"{"status":"ok"}"#);
@@ -1362,10 +1499,7 @@ fn handle_nodename(
 
     update_state_key("node_name", node_name);
     *state.node_name.lock().unwrap() = node_name.to_string();
-    write_quadlets_for_state(state);
-    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
-        restart_wind_tunnel_if_running();
-    }
+    apply_wind_tunnel_config(state);
 
     let wt_hostname = build_wt_hostname(node_name);
     eprintln!("[manage] Node name updated to {} (wt_hostname={})", node_name, wt_hostname);
@@ -1390,11 +1524,7 @@ fn handle_unyt(
     update_state_key("unyt_agent_id", unyt_agent_id);
     *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
 
-    write_wind_tunnel_client_meta(unyt_agent_id);
-    write_quadlets_for_state(state);
-    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
-        restart_wind_tunnel_if_running();
-    }
+    apply_wind_tunnel_config(state);
 
     let suffix    = ensure_wt_suffix(state);
     let wt_client_name = build_wt_client_name(&node_name, unyt_agent_id, &suffix);
@@ -1415,6 +1545,46 @@ fn handle_hardware(
     apply_hardware_mode(mode, state);
     eprintln!("[manage] Hardware mode switched to {}", mode);
     send_json_ok(stream, r#"{"status":"ok"}"#);
+}
+
+fn handle_wind_tunnel(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
+    let body = &req.body;
+
+    if json_has_key(body, "wtImageOverride") {
+        let val = json_str(body, "wtImageOverride").trim().to_string();
+        if let Some(msg) = validate_wt_image_override(&val) {
+            send_json_err(stream, 400, &msg); return;
+        }
+        update_state_key("wt_image_override", &val);
+        *state.wt_image_override.lock().unwrap() = val;
+    }
+
+    if json_has_key(body, "wtEntrypointBind") {
+        let val = json_str(body, "wtEntrypointBind").trim().to_string();
+        if let Some(msg) = validate_wt_entrypoint_bind(&val) {
+            send_json_err(stream, 400, &msg); return;
+        }
+        update_state_key("wt_entrypoint_bind", &val);
+        *state.wt_entrypoint_bind.lock().unwrap() = val;
+    }
+
+    if json_bool(body, "apply", true) {
+        apply_wind_tunnel_config(state);
+    }
+
+    let cfg = resolve_wind_tunnel_config(state);
+    let ep = cfg.entrypoint_bind.as_deref().unwrap_or("");
+    eprintln!("[manage] Wind Tunnel config applied. image={} hostname={}", cfg.image, cfg.hostname);
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","image":"{}","hostname":"{}","entrypoint_bind":"{}"}}"#,
+        cfg.image.replace('\\', "\\\\").replace('"', "\\\""),
+        cfg.hostname.replace('\\', "\\\\").replace('"', "\\\""),
+        ep.replace('\\', "\\\\").replace('"', "\\\"")
+    ));
 }
 
 fn handle_password(
@@ -1463,7 +1633,7 @@ fn main() {
     let state = Arc::new(AppState::new(ap_mode));
 
     if state.onboarded.load(Ordering::Relaxed) {
-        write_quadlets_for_state(&state);
+        write_quadlets_from_state(&state);
     }
 
     // Spawn background update checker
@@ -1576,6 +1746,14 @@ fn main() {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
                         handle_hardware(&mut stream, &req, &state);
+                    }
+                },
+
+                ("POST", "/manage/wind-tunnel") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_wind_tunnel(&mut stream, &req, &state);
                     }
                 },
 
