@@ -19,7 +19,8 @@ const WT_HOSTNAME_MAX: usize = 63;
 const WT_RANDOM_SUFFIX_LEN: usize = 16;
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
-const WIND_TUNNEL_ENV: &str = "/etc/node-manager/wind-tunnel.env";
+const WIND_TUNNEL_CLIENT_META: &str = "/etc/node-manager/client-meta.json";
+const WIND_TUNNEL_LEGACY_ENV: &str = "/etc/node-manager/wind-tunnel.env";
 const QUADLET_DIR: &str = "/etc/containers/systemd";
 const AUTHORIZED_KEYS: &str = "/home/holo/.ssh/authorized_keys";
 const UPDATE_REPO_ENV: &str = "UPDATE_REPO";
@@ -287,7 +288,7 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
          ContainerName=wind-tunnel\n\
          HostName={hostname}\n\
          Network=host\n\
-         EnvironmentFile={env_file}\n\
+         Volume={client_meta}:/etc/nomad.d/client-meta.json:ro,Z\n\
          PodmanArgs=--cgroupns=host --privileged\n\
          Label=io.containers.autoupdate=registry\n\n\
          [Service]\n\
@@ -297,7 +298,7 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
          WantedBy=multi-user.target\n",
         hostname = hostname,
         image = image,
-        env_file = WIND_TUNNEL_ENV,
+        client_meta = WIND_TUNNEL_CLIENT_META,
     )
 }
 
@@ -356,11 +357,20 @@ fn wt_client_name_error(node_name: &str, unyt_agent_id: &str) -> Option<String> 
     ))
 }
 
-fn write_wind_tunnel_env(unyt_agent_id: &str) {
-    let env_content = format!("UNYT_AGENT_ID={}\n", unyt_agent_id);
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn write_wind_tunnel_client_meta(unyt_agent_id: &str) {
+    let id = json_escape(unyt_agent_id.trim());
+    let json = format!(
+        "{{\n  \"client\": {{\n    \"meta\": {{\n      \"unyt_agent_id\": \"{}\"\n    }}\n  }}\n}}\n",
+        id
+    );
     let _ = fs::create_dir_all("/etc/node-manager");
-    let _ = fs::write(WIND_TUNNEL_ENV, env_content);
-    let _ = Command::new("chmod").args(["600", WIND_TUNNEL_ENV]).output();
+    let _ = fs::write(WIND_TUNNEL_CLIENT_META, json);
+    let _ = Command::new("chmod").args(["600", WIND_TUNNEL_CLIENT_META]).output();
+    let _ = fs::remove_file(WIND_TUNNEL_LEGACY_ENV);
 }
 
 fn write_quadlets(node_name: &str) {
@@ -440,6 +450,8 @@ fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     let start_svc = if new_mode == "WIND_TUNNEL"  { "wind-tunnel.service" } else { "edgenode.service" };
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt", new_mode);
     if new_mode == "WIND_TUNNEL" {
+        let unyt_agent_id = state.unyt_agent_id.lock().unwrap().clone();
+        write_wind_tunnel_client_meta(&unyt_agent_id);
         write_quadlets_for_state(state);
     }
     if current != new_mode {
@@ -1120,7 +1132,7 @@ fn handle_submit(
     }
 
     // ── Quadlets ─────────────────────────────────────────────────────────────
-    write_wind_tunnel_env(unyt_agent_id);
+    write_wind_tunnel_client_meta(unyt_agent_id);
     let wt_suffix = generate_wt_suffix();
     write_quadlets(node_name);
 
@@ -1219,7 +1231,7 @@ fn handle_unyt(
     update_state_key("unyt_agent_id", unyt_agent_id);
     *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
 
-    write_wind_tunnel_env(unyt_agent_id);
+    write_wind_tunnel_client_meta(unyt_agent_id);
     write_quadlets_for_state(state);
     if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
         restart_wind_tunnel_if_running();

@@ -262,6 +262,7 @@ Session tokens are stored in-memory and cleared on restart — operators will ne
 |------|----------|-------------|
 | `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`, `wt_suffix`) | 600 |
 | `/etc/node-manager/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
+| `/etc/node-manager/client-meta.json` | Nomad client meta drop-in for Wind Tunnel (`unyt_agent_id`); bind-mounted read-only into the container at `/etc/nomad.d/client-meta.json` | 600 |
 | `/etc/containers/systemd/edgenode.container` | Podman Quadlet for the EdgeNode container | 644 |
 | `/etc/containers/systemd/wind-tunnel.container` | Podman Quadlet for Wind Tunnel | 644 |
 | `/home/holo/.ssh/authorized_keys` | SSH public keys for the holo user | 600 |
