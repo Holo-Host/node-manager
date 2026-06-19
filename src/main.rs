@@ -14,10 +14,9 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.1.2";
+const VERSION: &str = "6.1.4";
 const WT_HOSTNAME_MAX: usize = 63;
 const WT_RANDOM_SUFFIX_LEN: usize = 16;
-const NOMAD_CLIENT_PREFIX: &str = "nomad-client-";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const SESSIONS_FILE: &str = "/etc/node-manager/sessions";
@@ -324,7 +323,7 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str) -> String {
          HostName={hostname}\n\
          Network=host\n\
          Volume={client_meta}:/etc/nomad.d/client-meta.json:ro,Z\n\
-         PodmanArgs=--cgroupns=host --uts=host --privileged\n\
+         PodmanArgs=--cgroupns=host --privileged\n\
          Label=io.containers.autoupdate=registry\n\n\
          [Service]\n\
          Restart=always\n\
@@ -362,6 +361,10 @@ fn validate_unyt_agent_id(agent_id: &str) -> Option<String> {
     None
 }
 
+fn build_wt_hostname(node_name: &str) -> String {
+    format!("nomad-client-{}", node_name)
+}
+
 fn build_wt_client_name(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) -> String {
     let agent = unyt_agent_id.trim();
     if agent.is_empty() {
@@ -369,24 +372,6 @@ fn build_wt_client_name(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) -
     } else {
         format!("{}-{}", node_name, agent)
     }
-}
-
-fn build_wt_hostname_slug(node_name: &str, wt_suffix: &str) -> String {
-    format!("{}-{}", node_name, wt_suffix)
-}
-
-fn build_wt_hostname(node_name: &str, wt_suffix: &str) -> String {
-    format!("{}{}", NOMAD_CLIENT_PREFIX, build_wt_hostname_slug(node_name, wt_suffix))
-}
-
-fn wt_hostname_slug_error(node_name: &str) -> Option<String> {
-    let overhead = 1 + WT_RANDOM_SUFFIX_LEN;
-    if node_name.len() + overhead <= WT_HOSTNAME_MAX { return None; }
-    let max_name = WT_HOSTNAME_MAX.saturating_sub(overhead);
-    Some(format!(
-        "Wind Tunnel hostname would exceed {} characters (node name + random suffix). Shorten node name to at most {} characters.",
-        WT_HOSTNAME_MAX, max_name
-    ))
 }
 
 fn wt_client_name_error(node_name: &str, unyt_agent_id: &str) -> Option<String> {
@@ -426,42 +411,6 @@ fn write_wind_tunnel_client_meta(unyt_agent_id: &str) {
     let _ = fs::remove_file(WIND_TUNNEL_LEGACY_ENV);
 }
 
-fn get_system_hostname() -> String {
-    Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-}
-
-fn effective_hostname(node_name: &str, wt_suffix: &str, hw_mode: &str) -> String {
-    if hw_mode == "WIND_TUNNEL" {
-        build_wt_hostname_slug(node_name, wt_suffix)
-    } else {
-        node_name.to_string()
-    }
-}
-
-fn apply_system_hostname(hostname: &str) {
-    if hostname.is_empty() { return; }
-    let _ = Command::new("hostnamectl").args(["set-hostname", hostname]).output();
-    eprintln!("[hostname] System hostname set to {}", hostname);
-}
-
-fn sync_host_identity(state: &AppState) {
-    let node_name = state.node_name.lock().unwrap().clone();
-    if node_name.is_empty() { return; }
-    let hw_mode   = state.hw_mode.lock().unwrap().clone();
-    let wt_suffix = ensure_wt_suffix(state);
-    let hostname  = effective_hostname(&node_name, &wt_suffix, &hw_mode);
-    let current   = get_system_hostname();
-    if current == hostname { return; }
-    apply_system_hostname(&hostname);
-    if hw_mode == "WIND_TUNNEL" {
-        restart_wind_tunnel_if_running();
-    }
-}
-
 fn validate_node_name(node_name: &str) -> Option<String> {
     if node_name.is_empty() {
         return Some("Node name is required.".into());
@@ -472,21 +421,19 @@ fn validate_node_name(node_name: &str) -> Option<String> {
     None
 }
 
-fn write_quadlets(node_name: &str, wt_suffix: &str) {
+fn write_quadlets(node_name: &str) {
     let edgenode_image = resolve_edgenode_image();
     let wt_image       = resolve_wind_tunnel_image();
-    let hostname_slug  = build_wt_hostname_slug(node_name, wt_suffix);
+    let wt_hostname    = build_wt_hostname(node_name);
     let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR),    build_edgenode_quadlet(&edgenode_image));
-    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&hostname_slug, &wt_image));
+    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&wt_hostname, &wt_image));
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-    eprintln!("[quadlet] WT nomad hostname={}", build_wt_hostname(node_name, wt_suffix));
+    eprintln!("[quadlet] WT hostname={}", wt_hostname);
 }
 
 fn write_quadlets_for_state(state: &AppState) {
     let node_name = state.node_name.lock().unwrap().clone();
-    let wt_suffix = ensure_wt_suffix(state);
-    write_quadlets(&node_name, &wt_suffix);
-    sync_host_identity(state);
+    write_quadlets(&node_name);
 }
 
 fn restart_wind_tunnel_if_running() {
@@ -857,22 +804,18 @@ function chkS1(){{
   const hint=document.getElementById('nameHint');
   if(!hint)return;
   if(!ok){{hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';return;}}
-  const wtSuffixLen=16;
-  const wtName=agent?name+'-'+agent.trim():name+'-'+('0'.repeat(wtSuffixLen));
-  const wtSlugLen=name.length+1+wtSuffixLen;
-  if(wtName.length>63){{hint.textContent='With this Agent ID, node name must be at most '+(63-(1+(agent?agent.trim().length:wtSuffixLen)))+' characters for Wind Tunnel.';document.getElementById('b1').disabled=true;return;}}
-  if(wtSlugLen>63){{hint.textContent='Node name must be at most '+(63-(1+wtSuffixLen))+' characters for Wind Tunnel hostname.';document.getElementById('b1').disabled=true;return;}}
+  const wtName=agent?name+'-'+agent.trim():name+'-'+('0'.repeat(16));
+  if(wtName.length>63){{hint.textContent='With this Agent ID, node name must be at most '+(63-(1+(agent?agent.trim().length:16)))+' characters for Wind Tunnel client tracking.';document.getElementById('b1').disabled=true;return;}}
   hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';
 }}
 
 function wtNameLen(name,agent){{
   const a=agent.trim();
-  const suffixLen=16;
-  return a?name.length+1+a.length:name.length+1+suffixLen;
+  return a?name.length+1+a.length:name.length+1+16;
 }}
 
 function wtHostname(name){{
-  return 'nomad-client-'+name+'-&lt;random suffix&gt;';
+  return 'nomad-client-'+name;
 }}
 
 function bRev(){{
@@ -896,7 +839,6 @@ async function doSubmit(){{
   if(!nodeName)return alert('Node name is required.');
   if(!/^[a-z0-9-]+$/.test(nodeName))return alert('Node name must be lowercase letters, numbers and hyphens only.');
   if(wtNameLen(nodeName,agent)>63)return alert('Node name is too long for Wind Tunnel tracking with this Agent ID. Shorten the node name.');
-  if(nodeName.length+1+16>63)return alert('Node name is too long for Wind Tunnel hostname. Shorten the node name.');
   const btn=document.getElementById('bsub');
   btn.disabled=true;
   document.getElementById('slbl-btn').style.display='none';
@@ -934,12 +876,10 @@ fn build_manage_html(state: &AppState) -> String {
     let node_name     = state.node_name.lock().unwrap().clone();
     let hw_mode       = state.hw_mode.lock().unwrap().clone();
     let unyt_agent_id  = state.unyt_agent_id.lock().unwrap().clone();
-    let wt_suffix      = ensure_wt_suffix(state);
     let ssh_keys       = read_ssh_keys();
     let uptime_s       = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip             = get_local_ip();
-    let wt_hostname    = build_wt_hostname(&node_name, &wt_suffix);
-    let system_hostname = get_system_hostname();
+    let wt_hostname    = build_wt_hostname(&node_name);
 
     let unyt_display = if unyt_agent_id.is_empty() {
         "(not set — compensation unavailable)".to_string()
@@ -1024,26 +964,25 @@ fn build_manage_html(state: &AppState) -> String {
   </div>
   <div class="info-row">
     <div class="info-item">Hardware <span id="info-hw">{hw_mode_display}</span></div>
-    <div class="info-item">Hostname <span id="info-hostname">{system_hostname}</span></div>
     <div class="info-item">Unyt <span id="info-unyt">{unyt_badge_text}</span></div>
   </div>
 
-  <!-- NODE HOSTNAME -->
+  <!-- NODE NAME -->
   <div class="section">
     <div class="section-hdr" onclick="toggleSection('name')">
-      <div class="section-title"><span>🏷</span> Node Hostname</div>
+      <div class="section-title"><span>🏷</span> Node Name</div>
       <span class="section-arrow" id="arr-name">▼</span>
     </div>
     <div class="section-body" id="sec-name">
       <p style="font-size:13px;color:#64748b;margin-bottom:14px">
-        System hostname: <strong style="color:#e2e8f0">{system_hostname}</strong><br>
-        Node name slug: <strong style="color:#e2e8f0">{node_name}</strong>
+        Current node name: <strong style="color:#e2e8f0">{node_name}</strong><br>
+        Wind Tunnel Nomad hostname: <code>nomad-client-&lt;node name&gt;</code>
       </p>
       {wt_hostname_html}
       <label>Node name</label>
       <input type="text" id="nodeName" value="{node_name_escaped}" placeholder="e.g. alice, home-node-01" oninput="chkNodeName()">
-      <div class="hint" id="nodeNameHint">Lowercase letters, numbers and hyphens only. Used as the hostname slug.</div>
-      <div style="margin-top:10px"><button class="btn btn-primary" id="nodeNameBtn" onclick="saveNodeName()">Save Node Name</button></div>
+      <div class="hint" id="nodeNameHint">Lowercase letters, numbers and hyphens only.</div>
+      <div style="margin-top:10px"><button class="btn btn-primary" id="nodeNameBtn" onclick="saveNodeName()" disabled>Save Node Name</button></div>
     </div>
   </div>
 
@@ -1141,16 +1080,19 @@ function toggleSection(id){{
 }}
 ['name','unyt','hw','pw','upd'].forEach(id=>toggleSection(id));
 
+const ORIGINAL_NODE_NAME='{node_name_js}';
+
 function chkNodeName(){{
   const name=v('nodeName');
   const ok=/^[a-z0-9-]+$/.test(name);
+  const changed=name!==ORIGINAL_NODE_NAME;
   const btn=document.getElementById('nodeNameBtn');
   const hint=document.getElementById('nodeNameHint');
-  if(btn)btn.disabled=!ok||!name;
+  if(btn)btn.disabled=!ok||!name||!changed;
   if(!hint)return;
   if(!name){{hint.textContent='Node name is required.';return;}}
   if(!ok){{hint.textContent='Lowercase letters, numbers and hyphens only.';return;}}
-  hint.textContent='Lowercase letters, numbers and hyphens only. Used as the hostname slug.';
+  hint.textContent=changed?'Press Save to apply the new node name.':'Change the node name above to enable Save.';
 }}
 
 async function saveNodeName(){{
@@ -1246,7 +1188,7 @@ async function triggerUpdate(){{
         css                  = COMMON_CSS,
         node_name            = html_escape(&node_name),
         node_name_escaped    = html_escape(&node_name),
-        system_hostname      = html_escape(&system_hostname),
+        node_name_js         = node_name.replace('\\', "\\\\").replace('\'', "\\'"),
         version              = VERSION,
         ip                   = html_escape(&ip),
         uptime               = fmt_uptime(uptime_s),
@@ -1284,9 +1226,6 @@ fn handle_submit(
     if let Some(msg) = wt_client_name_error(node_name, unyt_agent_id) {
         send_json_err(stream, 400, &msg); return;
     }
-    if let Some(msg) = wt_hostname_slug_error(node_name) {
-        send_json_err(stream, 400, &msg); return;
-    }
 
     // ── WiFi (AP mode) ───────────────────────────────────────────────────────
     let wifi_ssid = json_str(body, "wifiSsid");
@@ -1319,7 +1258,7 @@ fn handle_submit(
     // ── Quadlets ─────────────────────────────────────────────────────────────
     write_wind_tunnel_client_meta(unyt_agent_id);
     let wt_suffix = generate_wt_suffix();
-    write_quadlets(node_name, &wt_suffix);
+    write_quadlets(node_name);
 
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt",
         if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" });
@@ -1341,8 +1280,6 @@ fn handle_submit(
     *state.wt_suffix.lock().unwrap()     = wt_suffix;
     state.onboarded.store(true, Ordering::Relaxed);
 
-    sync_host_identity(state);
-
     eprintln!("[onboard] Complete. node={} hw={} unyt={}", node_name, hw_mode, if unyt_agent_id.is_empty() { "(none)" } else { "set" });
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
@@ -1353,7 +1290,7 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let unyt_agent_id  = state.unyt_agent_id.lock().unwrap().clone();
     let wt_suffix      = ensure_wt_suffix(state);
     let wt_client_name = build_wt_client_name(&node_name, &unyt_agent_id, &wt_suffix);
-    let wt_hostname    = build_wt_hostname(&node_name, &wt_suffix);
+    let wt_hostname    = build_wt_hostname(&node_name);
     let uptime    = state.start_time.elapsed().unwrap_or_default().as_secs();
     let keys      = read_ssh_keys();
     let keys_json: String = keys.iter()
@@ -1415,25 +1352,26 @@ fn handle_nodename(
     if let Some(msg) = validate_node_name(node_name) {
         send_json_err(stream, 400, &msg); return;
     }
+    if node_name == state.node_name.lock().unwrap().as_str() {
+        send_json_err(stream, 400, "Node name unchanged"); return;
+    }
     let unyt_agent_id = state.unyt_agent_id.lock().unwrap().clone();
     if let Some(msg) = wt_client_name_error(node_name, &unyt_agent_id) {
-        send_json_err(stream, 400, &msg); return;
-    }
-    if let Some(msg) = wt_hostname_slug_error(node_name) {
         send_json_err(stream, 400, &msg); return;
     }
 
     update_state_key("node_name", node_name);
     *state.node_name.lock().unwrap() = node_name.to_string();
     write_quadlets_for_state(state);
+    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
+        restart_wind_tunnel_if_running();
+    }
 
-    let wt_suffix = state.wt_suffix.lock().unwrap().clone();
-    let wt_hostname = build_wt_hostname(node_name, &wt_suffix);
-    eprintln!("[manage] Node name updated to {} (hostname={})", node_name, get_system_hostname());
+    let wt_hostname = build_wt_hostname(node_name);
+    eprintln!("[manage] Node name updated to {} (wt_hostname={})", node_name, wt_hostname);
     send_json_ok(stream, &format!(
-        r#"{{"status":"ok","node_name":"{}","system_hostname":"{}","wt_hostname":"{}"}}"#,
+        r#"{{"status":"ok","node_name":"{}","wt_hostname":"{}"}}"#,
         node_name.replace('\\', "\\\\").replace('"', "\\\""),
-        get_system_hostname().replace('\\', "\\\\").replace('"', "\\\""),
         wt_hostname.replace('\\', "\\\\").replace('"', "\\\"")
     ));
 }
