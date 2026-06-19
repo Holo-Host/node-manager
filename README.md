@@ -247,6 +247,7 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 | `GET` | `/manage/status` | session | JSON node state snapshot |
 | `POST` | `/manage/ssh/add` | session | Add SSH public key |
 | `POST` | `/manage/ssh/remove` | session | Remove SSH key by index |
+| `POST` | `/manage/nodename` | session | Change node name and system hostname |
 | `POST` | `/manage/unyt` | session | Save or update Unyt Agent ID |
 | `POST` | `/manage/hardware` | session | Switch STANDARD ↔ WIND_TUNNEL |
 | `POST` | `/manage/password` | session | Change node password |
