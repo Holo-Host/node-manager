@@ -14,11 +14,13 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.1.0";
+const VERSION: &str = "6.1.1";
 const WT_HOSTNAME_MAX: usize = 63;
 const WT_RANDOM_SUFFIX_LEN: usize = 16;
+const NOMAD_CLIENT_PREFIX: &str = "nomad-client-";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
+const SESSIONS_FILE: &str = "/etc/node-manager/sessions";
 const WIND_TUNNEL_CLIENT_META: &str = "/etc/node-manager/client-meta.json";
 const WIND_TUNNEL_LEGACY_ENV: &str = "/etc/node-manager/wind-tunnel.env";
 const QUADLET_DIR: &str = "/etc/containers/systemd";
@@ -47,7 +49,7 @@ impl AppState {
         AppState {
             ap_mode,
             start_time: SystemTime::now(),
-            sessions:   Mutex::new(HashMap::new()),
+            sessions:   Mutex::new(load_sessions()),
             onboarded:  AtomicBool::new(kv.get("onboarded").map(|v| v == "true").unwrap_or(false)),
             node_name:     Mutex::new(kv.get("node_name").cloned().unwrap_or_default()),
             hw_mode:       Mutex::new(kv.get("hw_mode").cloned().unwrap_or_else(|| "STANDARD".into())),
@@ -168,23 +170,56 @@ fn display_password_on_tty(password: &str) {
 
 // ── Session management ─────────────────────────────────────────────────────────
 
+fn load_sessions() -> HashMap<String, SystemTime> {
+    let mut sessions = HashMap::new();
+    let now = SystemTime::now();
+    for line in fs::read_to_string(SESSIONS_FILE).unwrap_or_default().lines() {
+        if let Some(eq) = line.find('=') {
+            let token = line[..eq].trim().to_string();
+            if let Ok(secs) = line[eq + 1..].trim().parse::<u64>() {
+                if let Some(exp) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs)) {
+                    if now < exp {
+                        sessions.insert(token, exp);
+                    }
+                }
+            }
+        }
+    }
+    sessions
+}
+
+fn save_sessions(sessions: &HashMap<String, SystemTime>) {
+    let _ = fs::create_dir_all("/etc/node-manager");
+    let content: String = sessions.iter()
+        .filter_map(|(token, exp)| {
+            exp.duration_since(SystemTime::UNIX_EPOCH).ok()
+                .map(|d| format!("{}={}\n", token, d.as_secs()))
+        })
+        .collect();
+    let _ = fs::write(SESSIONS_FILE, content);
+    let _ = Command::new("chmod").args(["600", SESSIONS_FILE]).output();
+}
+
 fn create_session(state: &AppState) -> String {
     let token = random_hex(32);
     let exp = SystemTime::now() + Duration::from_secs(SESSION_TTL_SECS);
     let mut sessions = state.sessions.lock().unwrap();
     sessions.retain(|_, &mut e| SystemTime::now() < e);
     sessions.insert(token.clone(), exp);
+    save_sessions(&sessions);
     token
 }
 
 fn is_authenticated(req: &Req, state: &AppState) -> bool {
     let token = match get_cookie(&req.headers, "session") { Some(t) => t, None => return false };
     let mut sessions = state.sessions.lock().unwrap();
-    match sessions.get(&token) {
+    let ok = match sessions.get(&token) {
         Some(&exp) if SystemTime::now() < exp => true,
         Some(_) => { sessions.remove(&token); false }
         None => false,
-    }
+    };
+    if !ok { save_sessions(&sessions); }
+    ok
 }
 
 fn session_cookie(token: &str) -> String { format!("session={}; HttpOnly; SameSite=Strict; Path=/", token) }
@@ -336,6 +371,24 @@ fn build_wt_client_name(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) -
     }
 }
 
+fn build_wt_hostname_slug(node_name: &str, wt_suffix: &str) -> String {
+    format!("{}-{}", node_name, wt_suffix)
+}
+
+fn build_wt_hostname(node_name: &str, wt_suffix: &str) -> String {
+    format!("{}{}", NOMAD_CLIENT_PREFIX, build_wt_hostname_slug(node_name, wt_suffix))
+}
+
+fn wt_hostname_slug_error(node_name: &str) -> Option<String> {
+    let overhead = 1 + WT_RANDOM_SUFFIX_LEN;
+    if node_name.len() + overhead <= WT_HOSTNAME_MAX { return None; }
+    let max_name = WT_HOSTNAME_MAX.saturating_sub(overhead);
+    Some(format!(
+        "Wind Tunnel hostname would exceed {} characters (node name + random suffix). Shorten node name to at most {} characters.",
+        WT_HOSTNAME_MAX, max_name
+    ))
+}
+
 fn wt_client_name_error(node_name: &str, unyt_agent_id: &str) -> Option<String> {
     if let Some(msg) = validate_unyt_agent_id(unyt_agent_id) { return Some(msg); }
     let agent = unyt_agent_id.trim();
@@ -373,18 +426,20 @@ fn write_wind_tunnel_client_meta(unyt_agent_id: &str) {
     let _ = fs::remove_file(WIND_TUNNEL_LEGACY_ENV);
 }
 
-fn write_quadlets(node_name: &str) {
+fn write_quadlets(node_name: &str, wt_suffix: &str) {
     let edgenode_image = resolve_edgenode_image();
     let wt_image       = resolve_wind_tunnel_image();
+    let hostname_slug  = build_wt_hostname_slug(node_name, wt_suffix);
     let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR),    build_edgenode_quadlet(&edgenode_image));
-    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(node_name, &wt_image));
+    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), build_wind_tunnel_quadlet(&hostname_slug, &wt_image));
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-    eprintln!("[quadlet] WT hostname={}", node_name);
+    eprintln!("[quadlet] WT hostname={}", build_wt_hostname(node_name, wt_suffix));
 }
 
 fn write_quadlets_for_state(state: &AppState) {
     let node_name = state.node_name.lock().unwrap().clone();
-    write_quadlets(&node_name);
+    let wt_suffix = ensure_wt_suffix(state);
+    write_quadlets(&node_name, &wt_suffix);
 }
 
 fn restart_wind_tunnel_if_running() {
@@ -697,7 +752,7 @@ fn build_onboarding_html(ap_mode: bool) -> String {
         <tr><td>SSH Key</td><td id="rv-sk">—</td></tr>
         <tr><td>Unyt Agent ID</td><td id="rv-unyt">—</td></tr>
         <tr><td>Hardware Mode</td><td id="rv-hw">—</td></tr>
-        <tr id="rv-wt-row" style="display:none"><td>WT Client Name</td><td id="rv-wt">—</td></tr>
+        <tr id="rv-wt-row" style="display:none"><td>Wind Tunnel hostname</td><td id="rv-wt">—</td></tr>
       </table>
       <div class="info-box" style="margin-top:16px">After initialization:<br>
         1. SSH access is configured for the <code>holo</code> user<br>
@@ -737,7 +792,9 @@ function chkS1(){{
   if(!ok){{hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';return;}}
   const wtSuffixLen=16;
   const wtName=agent?name+'-'+agent.trim():name+'-'+('0'.repeat(wtSuffixLen));
+  const wtSlugLen=name.length+1+wtSuffixLen;
   if(wtName.length>63){{hint.textContent='With this Agent ID, node name must be at most '+(63-(1+(agent?agent.trim().length:wtSuffixLen)))+' characters for Wind Tunnel.';document.getElementById('b1').disabled=true;return;}}
+  if(wtSlugLen>63){{hint.textContent='Node name must be at most '+(63-(1+wtSuffixLen))+' characters for Wind Tunnel hostname.';document.getElementById('b1').disabled=true;return;}}
   hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';
 }}
 
@@ -747,9 +804,8 @@ function wtNameLen(name,agent){{
   return a?name.length+1+a.length:name.length+1+suffixLen;
 }}
 
-function wtClientName(name,agent){{
-  const a=agent.trim();
-  return a?name+'-'+a:name+'-&lt;random suffix&gt;';
+function wtHostname(name){{
+  return 'nomad-client-'+name+'-&lt;random suffix&gt;';
 }}
 
 function bRev(){{
@@ -763,7 +819,7 @@ function bRev(){{
   const wtRow=document.getElementById('rv-wt-row');
   if(v('hw')==='WIND_TUNNEL'){{
     wtRow.style.display='';
-    set('rv-wt',wtClientName(v('nodeName'),agent));
+    set('rv-wt',wtHostname(v('nodeName')));
   }}else{{wtRow.style.display='none';}}
 }}
 
@@ -773,6 +829,7 @@ async function doSubmit(){{
   if(!nodeName)return alert('Node name is required.');
   if(!/^[a-z0-9-]+$/.test(nodeName))return alert('Node name must be lowercase letters, numbers and hyphens only.');
   if(wtNameLen(nodeName,agent)>63)return alert('Node name is too long for Wind Tunnel tracking with this Agent ID. Shorten the node name.');
+  if(nodeName.length+1+16>63)return alert('Node name is too long for Wind Tunnel hostname. Shorten the node name.');
   const btn=document.getElementById('bsub');
   btn.disabled=true;
   document.getElementById('slbl-btn').style.display='none';
@@ -814,7 +871,7 @@ fn build_manage_html(state: &AppState) -> String {
     let ssh_keys       = read_ssh_keys();
     let uptime_s       = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip             = get_local_ip();
-    let wt_client_name = build_wt_client_name(&node_name, &unyt_agent_id, &wt_suffix);
+    let wt_hostname    = build_wt_hostname(&node_name, &wt_suffix);
 
     let unyt_display = if unyt_agent_id.is_empty() {
         "(not set — compensation unavailable)".to_string()
@@ -843,6 +900,15 @@ fn build_manage_html(state: &AppState) -> String {
 
     let ssh_count  = ssh_keys.len();
     let ssh_plural = if ssh_count == 1 { "" } else { "s" };
+
+    let wt_hostname_html = if hw_mode == "WIND_TUNNEL" {
+        format!(
+            r#"<p style="font-size:12px;color:#475569;margin-bottom:14px">Wind Tunnel hostname: <code>{wt_hostname}</code><br><span style="font-size:11px;color:#64748b">Copy this value into the <a href="https://wind-tunnel-runner-status.holochain.org/" target="_blank" rel="noopener" style="color:#818cf8">Wind Tunnel runner status page</a>.</span></p>"#,
+            wt_hostname = html_escape(&wt_hostname)
+        )
+    } else {
+        String::new()
+    };
 
     format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -891,16 +957,16 @@ fn build_manage_html(state: &AppState) -> String {
     <div class="info-item">Unyt <span id="info-unyt">{unyt_badge_text}</span></div>
   </div>
 
-  <!-- UNYT COMPENSATION -->
+  <!-- HOLOFUEL -->
   <div class="section">
     <div class="section-hdr" onclick="toggleSection('unyt')">
-      <div class="section-title"><span>💰</span> Unyt Compensation <span class="section-badge {unyt_badge}" id="unyt-badge">{unyt_badge_text}</span></div>
+      <div class="section-title"><span>💰</span> HoloFuel <span class="section-badge {unyt_badge}" id="unyt-badge">{unyt_badge_text}</span></div>
       <span class="section-arrow" id="arr-unyt">▼</span>
     </div>
     <div class="section-body" id="sec-unyt">
       {unyt_copy}
       <p style="font-size:13px;color:#64748b;margin:14px 0">Current Agent ID: <strong style="color:#e2e8f0">{unyt_display}</strong></p>
-      <p style="font-size:12px;color:#475569;margin-bottom:14px">Wind Tunnel client name: <code>{wt_client_name}</code></p>
+      {wt_hostname_html}
       <label>Unyt Agent ID</label>
       <input type="text" id="unytAgentId" value="{unyt_agent_id_escaped}" placeholder="Paste your Agent ID from the Unyt desktop app">
       <div style="margin-top:10px"><button class="btn btn-primary" onclick="saveUnyt()">Save Agent ID</button></div>
@@ -994,7 +1060,8 @@ function toast(msg,ok){{
 }}
 
 async function api(path,payload){{
-  const r=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
+  const r=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},credentials:'same-origin',body:JSON.stringify(payload)}});
+  if(r.status===401){{location.href='/login';throw new Error('Session expired — please log in again');}}
   const text=await r.text();
   if(!r.ok)throw new Error(text||'Server error '+r.status);
   try{{return JSON.parse(text);}}catch{{return {{}};}}
@@ -1080,7 +1147,7 @@ async function triggerUpdate(){{
         unyt_badge           = unyt_badge,
         unyt_badge_text      = unyt_badge_text,
         unyt_agent_id_escaped = html_escape(&unyt_agent_id),
-        wt_client_name       = html_escape(&wt_client_name),
+        wt_hostname_html     = wt_hostname_html,
     )
 }
 
@@ -1100,6 +1167,9 @@ fn handle_submit(
 
     if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
     if let Some(msg) = wt_client_name_error(node_name, unyt_agent_id) {
+        send_json_err(stream, 400, &msg); return;
+    }
+    if let Some(msg) = wt_hostname_slug_error(node_name) {
         send_json_err(stream, 400, &msg); return;
     }
 
@@ -1134,7 +1204,7 @@ fn handle_submit(
     // ── Quadlets ─────────────────────────────────────────────────────────────
     write_wind_tunnel_client_meta(unyt_agent_id);
     let wt_suffix = generate_wt_suffix();
-    write_quadlets(node_name);
+    write_quadlets(node_name, &wt_suffix);
 
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt",
         if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" });
@@ -1166,18 +1236,20 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let unyt_agent_id  = state.unyt_agent_id.lock().unwrap().clone();
     let wt_suffix      = ensure_wt_suffix(state);
     let wt_client_name = build_wt_client_name(&node_name, &unyt_agent_id, &wt_suffix);
+    let wt_hostname    = build_wt_hostname(&node_name, &wt_suffix);
     let uptime    = state.start_time.elapsed().unwrap_or_default().as_secs();
     let keys      = read_ssh_keys();
     let keys_json: String = keys.iter()
         .map(|k| format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>().join(",");
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","wt_client_name":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","wt_client_name":"{}","wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
         VERSION,
         node_name.replace('\\', "\\\\").replace('"', "\\\""),
         hw_mode,
         unyt_agent_id.replace('\\', "\\\\").replace('"', "\\\""),
         wt_client_name.replace('\\', "\\\\").replace('"', "\\\""),
+        wt_hostname.replace('\\', "\\\\").replace('"', "\\\""),
         keys.len(), keys_json, uptime
     ));
 }
@@ -1302,6 +1374,10 @@ fn main() {
     let ap_mode = env::args().any(|a| a == "--ap-mode");
     let auth_hash = Arc::new(Mutex::new(load_or_create_auth()));
     let state = Arc::new(AppState::new(ap_mode));
+
+    if state.onboarded.load(Ordering::Relaxed) {
+        write_quadlets_for_state(&state);
+    }
 
     // Spawn background update checker
     let repo = env::var(UPDATE_REPO_ENV).unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
