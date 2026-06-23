@@ -78,6 +78,8 @@ After onboarding, `GET /` redirects to `/manage`. The panel (password-protected)
 
 - Add and remove SSH public keys for the `holo` user without physical access
 - Link or update a Unyt Agent ID for HoloFuel compensation
+- Configure the Log Collector URL for Unyt resource accounting on hosted hApps
+- Host hApps on the EdgeNode: paste or enter a manifest, validate, deploy, pause/resume, remove, and view logs
 - Switch hardware mode between Standard EdgeNode and Wind Tunnel
 - Change the node password
 - Trigger an immediate software update check
@@ -249,6 +251,14 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 | `POST` | `/manage/ssh/remove` | session | Remove SSH key by index |
 | `POST` | `/manage/nodename` | session | Change node name and system hostname |
 | `POST` | `/manage/unyt` | session | Save or update Unyt Agent ID |
+| `POST` | `/manage/log-sender` | session | Save Log Collector URL (`LOG_SENDER_ENDPOINT`) |
+| `GET` | `/manage/happs` | session | List hosted hApps with deployment status |
+| `POST` | `/manage/happs/validate` | session | Validate a hApp manifest JSON |
+| `POST` | `/manage/happs/deploy` | session | Deploy a hApp (async install) |
+| `POST` | `/manage/happs/enable` | session | Resume a paused hApp |
+| `POST` | `/manage/happs/disable` | session | Pause a running hApp |
+| `POST` | `/manage/happs/uninstall` | session | Remove a hApp from the node |
+| `GET` | `/manage/happs/logs` | session | Install + holochain + log-sender logs (`?id=`) |
 | `POST` | `/manage/hardware` | session | Switch STANDARD ↔ WIND_TUNNEL |
 | `POST` | `/manage/password` | session | Change node password |
 | `POST` | `/manage/update` | session | Trigger immediate update check |
@@ -261,7 +271,10 @@ Session tokens are stored in-memory and cleared on restart — operators will ne
 
 | Path | Contents | Permissions |
 |------|----------|-------------|
-| `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`, `wt_suffix`) | 600 |
+| `/etc/node-manager/state` | Key-value store of node state (`onboarded`, `node_name`, `hw_mode`, `unyt_agent_id`, `log_sender_endpoint`, `wt_suffix`) | 600 |
+| `/etc/node-manager/deployments.json` | Hosted hApp deployment records | 600 |
+| `/etc/node-manager/happ-logs/` | Per-deployment install output logs | 600 |
+| `/var/lib/edgenode/manifests/` | hApp manifest JSON files passed to `install_happ` | — |
 | `/etc/node-manager/auth` | Password hash: `sha256:<salt>:<hash>` | 600 |
 | `/etc/node-manager/client-meta.json` | Nomad client meta drop-in for Wind Tunnel (`unyt_agent_id`); bind-mounted read-only into the container at `/etc/nomad.d/client-meta.json` | 600 |
 | `/etc/containers/systemd/edgenode.container` | Podman Quadlet for the EdgeNode container | 644 |
