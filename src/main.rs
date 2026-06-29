@@ -14,7 +14,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.2.0";
+const VERSION: &str = "6.2.1";
 const WT_HOSTNAME_MAX: usize = 63;
 const WT_RANDOM_SUFFIX_LEN: usize = 16;
 const STATE_FILE: &str = "/etc/node-manager/state";
@@ -976,7 +976,7 @@ fn reconcile_deployment_status(d: &Deployment, live: &[LiveHapp]) -> String {
 
 fn happs_prereq_error(state: &AppState) -> Option<String> {
     if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
-        return Some("Switch to Standard EdgeNode mode in Hardware Mode before managing hApps.".into());
+        return Some("Switch to Standard EdgeNode mode in Mode before managing hApps.".into());
     }
     if !edgenode_running() {
         return Some("EdgeNode is not running. Start Standard EdgeNode mode first.".into());
@@ -1072,18 +1072,31 @@ fn spawn_update_checker(repo: String) {
 
 // ── Node operations ────────────────────────────────────────────────────────────
 
+fn container_services_for_mode(hw_mode: &str) -> (&'static str, &'static str) {
+    if hw_mode == "WIND_TUNNEL" {
+        ("wind-tunnel.service", "edgenode.service")
+    } else {
+        ("edgenode.service", "wind-tunnel.service")
+    }
+}
+
+fn sync_container_services(hw_mode: &str) {
+    let (active, inactive) = container_services_for_mode(hw_mode);
+    let _ = Command::new("systemctl").args(["disable", "--now", inactive]).output();
+    let _ = Command::new("systemctl").args(["enable", "--now", active]).output();
+    eprintln!("[container] enabled {} disabled {}", active, inactive);
+}
+
 fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     let current = state.hw_mode.lock().unwrap().clone();
-    let stop_svc  = if current == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
-    let start_svc = if new_mode == "WIND_TUNNEL"  { "wind-tunnel.service" } else { "edgenode.service" };
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt", new_mode);
     *state.hw_mode.lock().unwrap() = new_mode.to_string();
     update_state_key("hw_mode", new_mode);
     write_quadlets_from_state(state);
     if current != new_mode {
-        eprintln!("[manage] Stopping {} → starting {}", stop_svc, start_svc);
-        let _ = Command::new("systemctl").args(["stop",  stop_svc]).output();
-        let _ = Command::new("systemctl").args(["start", start_svc]).output();
+        let (active, inactive) = container_services_for_mode(new_mode);
+        eprintln!("[manage] Switching {} → {}", inactive, active);
+        sync_container_services(new_mode);
     }
 }
 
@@ -1338,46 +1351,35 @@ fn build_onboarding_html(ap_mode: bool) -> String {
 
     <!-- STEP 1: IDENTITY + SSH -->
     <div class="step active" id="s1">
-      <div class="slbl">Step 1 of 3</div>
+      <div class="slbl">Step 1 of 2</div>
       <div class="stit">Node identity &amp; SSH access</div>
       <div class="sdsc">Name your node and optionally add your SSH public key for remote access.</div>
       <label>Node name *</label>
       <input type="text" id="nodeName" placeholder="e.g. alice, home-node-01" oninput="chkS1()">
       <div class="hint" id="nameHint">Lowercase letters, numbers and hyphens only. Used as hostname slug.</div>
+      <label>Mode</label>
+      <select id="hw">
+        <option value="STANDARD">Standard EdgeNode — always-on Holochain peer</option>
+        <option value="WIND_TUNNEL">Holochain Wind Tunnel — network stress-tester</option>
+      </select>
       <label>SSH public key <span style="color:#475569;font-weight:400">(recommended)</span></label>
       <textarea id="sshKey" placeholder="ssh-ed25519 AAAA...&#10;Leave blank to add keys later in /manage"></textarea>
       <label>Unyt Agent ID <span style="color:#475569;font-weight:400">(optional)</span></label>
       <input type="text" id="unytAgentId" placeholder="Paste your Agent ID from the Unyt desktop app" oninput="chkS1()">
       {unyt_copy}
-      <div class="brow"><button class="btn btn-primary" id="b1" onclick="gTo(2)" disabled>Continue →</button></div>
+      <div class="brow"><button class="btn btn-primary" id="b1" onclick="gTo(2)" disabled>Review →</button></div>
     </div>
 
-    <!-- STEP 2: HARDWARE MODE -->
+    <!-- STEP 2: REVIEW -->
     <div class="step" id="s2">
-      <div class="slbl">Step 2 of 3</div>
-      <div class="stit">Hardware mode</div>
-      <div class="sdsc">Choose the initial container mode for your node.</div>
-      <label>Hardware mode</label>
-      <select id="hw">
-        <option value="STANDARD">Standard EdgeNode — always-on Holochain peer</option>
-        <option value="WIND_TUNNEL">Holochain Wind Tunnel — network stress-tester</option>
-      </select>
-      <div class="brow">
-        <button class="btn btn-secondary" onclick="gTo(1)">← Back</button>
-        <button class="btn btn-primary" onclick="gTo(3)">Review →</button>
-      </div>
-    </div>
-
-    <!-- STEP 3: REVIEW -->
-    <div class="step" id="s3">
-      <div class="slbl">Step 3 of 3</div>
+      <div class="slbl">Step 2 of 2</div>
       <div class="stit">Review &amp; initialize</div>
       <div class="sdsc">Check your settings, then start the node.</div>
       <table class="rt">
         <tr><td>Node Name</td><td id="rv-nn">—</td></tr>
+        <tr><td>Mode</td><td id="rv-hw">—</td></tr>
         <tr><td>SSH Key</td><td id="rv-sk">—</td></tr>
         <tr><td>Unyt Agent ID</td><td id="rv-unyt">—</td></tr>
-        <tr><td>Hardware Mode</td><td id="rv-hw">—</td></tr>
         <tr id="rv-wt-row" style="display:none"><td>Wind Tunnel hostname</td><td id="rv-wt">—</td></tr>
       </table>
       <div class="info-box" style="margin-top:16px">After initialization:<br>
@@ -1385,7 +1387,7 @@ fn build_onboarding_html(ap_mode: bool) -> String {
         2. Podman Quadlet services are registered with systemd<br>
         3. You will be redirected to the management panel</div>
       <div class="brow">
-        <button class="btn btn-secondary" onclick="gTo(2)">← Back</button>
+        <button class="btn btn-secondary" onclick="gTo(1)">← Back</button>
         <button class="btn btn-primary" id="bsub" onclick="doSubmit()">
           <span id="slbl-btn">Initialize Node</span>
           <div class="spin" id="spin"></div>
@@ -1402,9 +1404,9 @@ function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}
 
 function gTo(n){{
   document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
-  document.getElementById(n===4?'suc':'s'+n).classList.add('active');
-  document.getElementById('prog').style.width=(Math.min(n,3)/3*100)+'%';
-  if(n===3)bRev();
+  document.getElementById(n===3?'suc':'s'+n).classList.add('active');
+  document.getElementById('prog').style.width=(Math.min(n,2)/2*100)+'%';
+  if(n===2)bRev();
   window.scrollTo(0,0);
 }}
 
@@ -1465,7 +1467,7 @@ async function doSubmit(){{
   }};
   try{{
     const r=await fetch('/submit',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}});
-    if(r.ok){{gTo(4);setTimeout(()=>window.location.href='/manage',2000);}}
+    if(r.ok){{gTo(3);setTimeout(()=>window.location.href='/manage',2000);}}
     else{{throw new Error('Server error '+r.status+': '+(await r.text()));}}
   }}catch(e){{
     btn.disabled=false;
@@ -1506,7 +1508,7 @@ fn build_manage_html(state: &AppState) -> String {
         unyt_agent_id.clone()
     };
     let unyt_badge = if unyt_agent_id.is_empty() { "badge-gray" } else { "badge-green" };
-    let unyt_badge_text = if unyt_agent_id.is_empty() { "not set" } else { "linked" };
+    let unyt_badge_text = if unyt_agent_id.is_empty() { "not set" } else { "set" };
 
     let keys_html: String = if ssh_keys.is_empty() {
         r#"<div class="no-keys">No SSH keys configured. Add one below to enable SSH access.</div>"#.to_string()
@@ -1526,7 +1528,7 @@ fn build_manage_html(state: &AppState) -> String {
     let hw_mode_display = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" };
     let happs_disabled = hw_mode == "WIND_TUNNEL";
     let happs_disabled_msg = if happs_disabled {
-        r#"<div class="info-box" style="margin-bottom:14px">hApp hosting is only available in Standard EdgeNode mode. Switch hardware mode below to host applications.</div>"#
+        r#"<div class="info-box" style="margin-bottom:14px">hApp hosting is only available in Standard EdgeNode mode. Switch to Standard EdgeNode mode above to host applications.</div>"#
     } else if !edgenode_running() {
         r#"<div class="err-box" style="margin-bottom:14px">EdgeNode is not running. Switch to Standard EdgeNode mode and ensure the container is started.</div>"#
     } else {
@@ -1592,7 +1594,7 @@ fn build_manage_html(state: &AppState) -> String {
     <form method="POST" action="/logout" style="margin:0"><button type="submit" class="logout">Log out</button></form>
   </div>
   <div class="info-row">
-    <div class="info-item">Hardware <span id="info-hw">{hw_mode_display}</span></div>
+    <div class="info-item">Mode <span id="info-hw">{hw_mode_display}</span></div>
     <div class="info-item">Unyt <span id="info-unyt">{unyt_badge_text}</span></div>
   </div>
 
@@ -1610,6 +1612,27 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
   </div>
 
+  <!-- MODE -->
+  <div class="section">
+    <div class="section-hdr" onclick="toggleSection('hw')">
+      <div class="section-title"><span>⚙️</span> Mode <span class="section-badge badge-green" id="hw-badge">{hw_mode_display}</span></div>
+      <span class="section-arrow" id="arr-hw">▼</span>
+    </div>
+    <div class="section-body" id="sec-hw">
+      <div class="hw-opts">
+        <div class="hw-opt{sel_std}" onclick="selHw('STANDARD',this)">
+          <div class="hw-opt-name">🌐 Standard EdgeNode</div>
+          <div class="hw-opt-desc">Always-on Holochain peer</div>
+        </div>
+        <div class="hw-opt{sel_wt}" onclick="selHw('WIND_TUNNEL',this)">
+          <div class="hw-opt-name">🌀 Wind Tunnel</div>
+          <div class="hw-opt-desc">Network stress-tester</div>
+        </div>
+      </div>
+      <div style="margin-top:10px"><button class="btn btn-primary" onclick="saveHardware()">Apply Mode</button></div>
+    </div>
+  </div>
+
   <!-- HOLOFUEL -->
   <div class="section">
     <div class="section-hdr" onclick="toggleSection('unyt')">
@@ -1622,12 +1645,8 @@ fn build_manage_html(state: &AppState) -> String {
       <label>Unyt Agent ID</label>
       <input type="text" id="unytAgentId" value="{unyt_agent_id_escaped}" placeholder="Paste your Agent ID from the Unyt desktop app">
       <div class="hint">Your Unyt public key — used for HoloFuel compensation and as LOG_SENDER_UNYT_PUB_KEY for hosted hApp invoicing.</div>
-      <label style="margin-top:12px">Log Collector URL</label>
-      <input type="url" id="logSenderEndpoint" value="{log_sender_endpoint_escaped}" placeholder="https://your-log-collector.example.com">
-      <div class="hint">LOG_SENDER_ENDPOINT — required for Unyt resource accounting when hosting hApps with an economics section.</div>
-      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+      <div style="margin-top:10px">
         <button class="btn btn-primary" onclick="saveUnyt()">Save Agent ID</button>
-        <button class="btn btn-secondary" onclick="saveLogSender()">Save Log Collector URL</button>
       </div>
     </div>
   </div>
@@ -1669,32 +1688,6 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
   </div>
 
-  <!-- WIND TUNNEL -->
-  <div class="section">
-    <div class="section-hdr" onclick="toggleSection('wt')">
-      <div class="section-title"><span>🌀</span> Wind Tunnel</div>
-      <span class="section-arrow" id="arr-wt">▼</span>
-    </div>
-    <div class="section-body" id="sec-wt">
-      <p style="font-size:13px;color:#64748b;margin-bottom:14px">
-        Nomad hostname: <code>{wt_hostname}</code><br>
-        Effective image: <code>{wt_effective_image}</code><br>
-        Entrypoint bind: <code>{wt_entrypoint_display}</code><br>
-        <a href="{wt_status_link}" target="_blank" rel="noopener" style="color:#818cf8;font-size:12px">Check Wind Tunnel runner status</a>
-      </p>
-      <p style="font-size:12px;color:#475569;margin-bottom:14px">
-        Optional overrides for testing patched entrypoints or custom images. Leave empty to use production defaults.
-      </p>
-      <label>Image override</label>
-      <input type="text" id="wtImageOverride" value="{wt_image_override_escaped}" placeholder="ghcr.io/holochain/wind-tunnel-runner:latest">
-      <div class="hint">Full image reference including tag. Empty = auto-resolve latest for this architecture.</div>
-      <label style="margin-top:12px">Entrypoint bind</label>
-      <input type="text" id="wtEntrypointBind" value="{wt_entrypoint_bind_escaped}" placeholder="/home/holo/entrypoint.sh">
-      <div class="hint">Host path under /home/holo/ mounted read-only as /entrypoint.sh in the container.</div>
-      <div style="margin-top:14px"><button class="btn btn-primary" onclick="applyWindTunnel()">Apply Wind Tunnel Config</button></div>
-    </div>
-  </div>
-
   <!-- SSH KEYS -->
   <div class="section">
     <div class="section-hdr" onclick="toggleSection('ssh')">
@@ -1711,24 +1704,38 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
   </div>
 
-  <!-- HARDWARE MODE -->
+  <!-- ADVANCED -->
   <div class="section">
-    <div class="section-hdr" onclick="toggleSection('hw')">
-      <div class="section-title"><span>⚙️</span> Hardware Mode <span class="section-badge badge-green" id="hw-badge">{hw_mode_display}</span></div>
-      <span class="section-arrow" id="arr-hw">▼</span>
+    <div class="section-hdr" onclick="toggleSection('adv')">
+      <div class="section-title"><span>🔧</span> Advanced</div>
+      <span class="section-arrow" id="arr-adv">▼</span>
     </div>
-    <div class="section-body" id="sec-hw">
-      <div class="hw-opts">
-        <div class="hw-opt{sel_std}" onclick="selHw('STANDARD',this)">
-          <div class="hw-opt-name">🌐 Standard EdgeNode</div>
-          <div class="hw-opt-desc">Always-on Holochain peer</div>
-        </div>
-        <div class="hw-opt{sel_wt}" onclick="selHw('WIND_TUNNEL',this)">
-          <div class="hw-opt-name">🌀 Wind Tunnel</div>
-          <div class="hw-opt-desc">Network stress-tester</div>
-        </div>
+    <div class="section-body" id="sec-adv">
+      <div class="info-box" style="margin-top:0;margin-bottom:16px">These settings are for support and feature testing only. Do not change them unless you are explicitly testing features or working with support. Changing them may interfere with your ability to earn HoloFuel.</div>
+      <div class="section-title" style="margin-bottom:12px;font-size:13px"><span>📡</span> Log Collector URL</div>
+      <label>Log Collector URL</label>
+      <input type="url" id="logSenderEndpoint" value="{log_sender_endpoint_escaped}" placeholder="https://your-log-collector.example.com">
+      <div class="hint">LOG_SENDER_ENDPOINT — required for Unyt resource accounting when hosting hApps with an economics section.</div>
+      <div style="margin-top:10px"><button class="btn btn-secondary" onclick="saveLogSender()">Save Log Collector URL</button></div>
+      <div style="margin-top:20px;padding-top:16px;border-top:1px solid #2d3148">
+        <div class="section-title" style="margin-bottom:12px;font-size:13px"><span>🌀</span> Wind Tunnel</div>
+        <p style="font-size:13px;color:#64748b;margin-bottom:14px">
+          Nomad hostname: <code>{wt_hostname}</code><br>
+          Effective image: <code>{wt_effective_image}</code><br>
+          Entrypoint bind: <code>{wt_entrypoint_display}</code><br>
+          <a href="{wt_status_link}" target="_blank" rel="noopener" style="color:#818cf8;font-size:12px">Check Wind Tunnel runner status</a>
+        </p>
+        <p style="font-size:12px;color:#475569;margin-bottom:14px">
+          Optional overrides for testing patched entrypoints or custom images. Leave empty to use production defaults.
+        </p>
+        <label>Image override</label>
+        <input type="text" id="wtImageOverride" value="{wt_image_override_escaped}" placeholder="ghcr.io/holochain/wind-tunnel-runner:latest">
+        <div class="hint">Full image reference including tag. Empty = auto-resolve latest for this architecture.</div>
+        <label style="margin-top:12px">Entrypoint bind</label>
+        <input type="text" id="wtEntrypointBind" value="{wt_entrypoint_bind_escaped}" placeholder="/home/holo/entrypoint.sh">
+        <div class="hint">Host path under /home/holo/ mounted read-only as /entrypoint.sh in the container.</div>
+        <div style="margin-top:14px"><button class="btn btn-primary" onclick="applyWindTunnel()">Apply Wind Tunnel Config</button></div>
       </div>
-      <div style="margin-top:10px"><button class="btn btn-primary" onclick="saveHardware()">Apply Mode</button></div>
     </div>
   </div>
 
@@ -1772,7 +1779,7 @@ function toggleSection(id){{
   body.style.display=open?'none':'block';
   if(arr)arr.textContent=open?'▶':'▼';
 }}
-['name','unyt','happs','wt','hw','pw','upd'].forEach(id=>toggleSection(id));
+['name','hw','unyt','happs','adv','pw','upd'].forEach(id=>toggleSection(id));
 toggleSection('happs');
 document.getElementById('sec-happs').style.display='block';
 document.getElementById('arr-happs').textContent='▼';
@@ -2026,7 +2033,7 @@ async function saveHardware(){{
     await api('/manage/hardware',{{mode:curHw}});
     document.getElementById('hw-badge').textContent=curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
     document.getElementById('info-hw').textContent=curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
-    toast('Hardware mode updated',true);
+    toast('Mode updated',true);
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
@@ -2153,8 +2160,7 @@ fn handle_submit(
     write_quadlets_from_state(state);
 
     let _ = fs::write("/var/lib/edgenode/mode_switch.txt", hw_mode_val);
-    let initial_svc = if hw_mode == "WIND_TUNNEL" { "wind-tunnel.service" } else { "edgenode.service" };
-    let _ = Command::new("systemctl").args(["start", initial_svc]).output();
+    sync_container_services(hw_mode_val);
 
     eprintln!("[onboard] Complete. node={} hw={} unyt={}", node_name, hw_mode, if unyt_agent_id.is_empty() { "(none)" } else { "set" });
     send_json_ok(stream, r#"{"status":"ok"}"#);
@@ -2586,6 +2592,8 @@ fn main() {
 
     if state.onboarded.load(Ordering::Relaxed) {
         write_quadlets_from_state(&state);
+        let hw_mode = state.hw_mode.lock().unwrap().clone();
+        sync_container_services(&hw_mode);
     }
 
     // Spawn background update checker
