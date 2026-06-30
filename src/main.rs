@@ -14,9 +14,8 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.2.1";
+const VERSION: &str = "6.2.2";
 const WT_HOSTNAME_MAX: usize = 63;
-const WT_RANDOM_SUFFIX_LEN: usize = 16;
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const SESSIONS_FILE: &str = "/etc/node-manager/sessions";
@@ -46,7 +45,6 @@ struct AppState {
     hw_mode:        Mutex<String>,
     unyt_agent_id:       Mutex<String>,
     log_sender_endpoint: Mutex<String>,
-    wt_suffix:           Mutex<String>,
     wt_image_override:   Mutex<String>,
     wt_entrypoint_bind:  Mutex<String>,
 }
@@ -63,7 +61,6 @@ impl AppState {
             hw_mode:       Mutex::new(kv.get("hw_mode").cloned().unwrap_or_else(|| "STANDARD".into())),
             unyt_agent_id:      Mutex::new(kv.get("unyt_agent_id").cloned().unwrap_or_default()),
             log_sender_endpoint: Mutex::new(kv.get("log_sender_endpoint").cloned().unwrap_or_default()),
-            wt_suffix:          Mutex::new(kv.get("wt_suffix").cloned().unwrap_or_default()),
             wt_image_override:  Mutex::new(kv.get("wt_image_override").cloned().unwrap_or_default()),
             wt_entrypoint_bind: Mutex::new(kv.get("wt_entrypoint_bind").cloned().unwrap_or_default()),
         }
@@ -276,12 +273,12 @@ fn resolve_image(image_ref: &str, arm64_prefix: &str) -> String {
     if manifest.contains("arm64") || manifest.contains("aarch64") { return format!("{}:latest", image_ref); }
     let repo_path = image_ref.trim_start_matches("ghcr.io/");
     let token_json = Command::new("curl")
-        .args(["-sf", &format!("https://ghcr.io/token?scope=repository:{}:pull&service=ghcr.io", repo_path)])
+        .args(["-sf", "--max-time", "10", &format!("https://ghcr.io/token?scope=repository:{}:pull&service=ghcr.io", repo_path)])
         .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
     let token = extract_json_str(&token_json, "token");
     if token.is_empty() { return format!("{}:latest", image_ref); }
     let tags_json = Command::new("curl")
-        .args(["-sf", "-H", &format!("Authorization: Bearer {}", token),
+        .args(["-sf", "--max-time", "10", "-H", &format!("Authorization: Bearer {}", token),
             &format!("https://ghcr.io/v2/{}/tags/list", repo_path)])
         .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
     match pick_arm64_tag(&tags_json, arm64_prefix) {
@@ -330,7 +327,7 @@ fn build_edgenode_quadlet(image: &str, log_sender_endpoint: &str, unyt_agent_id:
         env_lines.push_str(&format!("Environment=LOG_SENDER_UNYT_PUB_KEY={}\n", unyt));
     }
     format!(
-        "[Unit]\nDescription=Holo EdgeNode\nAfter=network-online.target\nConflicts=wind-tunnel.service\n\n[Container]\nImage={image}\nContainerName=edgenode\nVolume=/var/lib/edgenode:/data:Z\n{env_lines}Label=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Quadlet]\nDefaultDependencies=false\n\n[Unit]\nDescription=Holo EdgeNode\nAfter=network.target podman.service\nWants=podman.service\nConflicts=wind-tunnel.service\n\n[Container]\nImage={image}\nContainerName=edgenode\nVolume=/var/lib/edgenode:/data:Z\n{env_lines}Label=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
         image = image,
         env_lines = env_lines,
     )
@@ -341,9 +338,12 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str, entrypoint_bind: Optio
         .map(|p| format!("Volume={}:/entrypoint.sh:ro,Z\n", p))
         .unwrap_or_default();
     format!(
-        "[Unit]\n\
+        "[Quadlet]\n\
+         DefaultDependencies=false\n\n\
+         [Unit]\n\
          Description=Holochain Wind Tunnel Runner\n\
-         After=network-online.target\n\
+         After=network.target podman.service\n\
+         Wants=podman.service\n\
          Conflicts=edgenode.service\n\n\
          [Container]\n\
          Image={image}\n\
@@ -366,27 +366,20 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str, entrypoint_bind: Optio
     )
 }
 
-fn generate_wt_suffix() -> String {
-    random_hex(8)
-}
-
-fn ensure_wt_suffix(state: &AppState) -> String {
-    let existing = state.wt_suffix.lock().unwrap().clone();
-    if !existing.is_empty() { return existing; }
-    let suffix = generate_wt_suffix();
-    update_state_key("wt_suffix", &suffix);
-    *state.wt_suffix.lock().unwrap() = suffix.clone();
-    suffix
-}
-
 fn validate_unyt_agent_id(agent_id: &str) -> Option<String> {
     let id = agent_id.trim();
     if id.is_empty() { return None; }
-    if id.starts_with('-') || id.ends_with('-') {
-        return Some("Unyt Agent ID cannot start or end with a hyphen.".into());
+    if !id.starts_with("uhCAk") {
+        return Some("Unyt Agent ID must be a Holochain AgentPubKey (starts with uhCAk).".into());
     }
-    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Some("Unyt Agent ID may only contain letters, numbers, and hyphens.".into());
+    if id.len() != 53 {
+        return Some(format!(
+            "Unyt Agent ID must be 53 characters (got {}). Copy the full ID from the Unyt desktop app.",
+            id.len()
+        ));
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Some("Unyt Agent ID may only contain base64url characters (letters, numbers, hyphens, underscores).".into());
     }
     None
 }
@@ -395,33 +388,14 @@ fn build_wt_hostname(node_name: &str) -> String {
     format!("nomad-client-{}", node_name)
 }
 
-fn build_wt_client_name(node_name: &str, unyt_agent_id: &str, wt_suffix: &str) -> String {
-    let agent = unyt_agent_id.trim();
-    if agent.is_empty() {
-        format!("{}-{}", node_name, wt_suffix)
-    } else {
-        format!("{}-{}", node_name, agent)
-    }
-}
-
-fn wt_client_name_error(node_name: &str, unyt_agent_id: &str) -> Option<String> {
-    if let Some(msg) = validate_unyt_agent_id(unyt_agent_id) { return Some(msg); }
-    let agent = unyt_agent_id.trim();
-    let overhead = if agent.is_empty() {
-        1 + WT_RANDOM_SUFFIX_LEN
-    } else {
-        1 + agent.len()
-    };
-    if node_name.len() + overhead <= WT_HOSTNAME_MAX { return None; }
-    let max_name = WT_HOSTNAME_MAX.saturating_sub(overhead);
-    let detail = if agent.is_empty() {
-        "random tracking suffix"
-    } else {
-        "full Agent ID"
-    };
+fn validate_wt_hostname(node_name: &str) -> Option<String> {
+    const PREFIX: &str = "nomad-client-";
+    let hostname = format!("{}{}", PREFIX, node_name);
+    if hostname.len() <= WT_HOSTNAME_MAX { return None; }
     Some(format!(
-        "Wind Tunnel client name would exceed {} characters (node name + {}). Shorten node name to at most {} characters.",
-        WT_HOSTNAME_MAX, detail, max_name
+        "Wind Tunnel hostname would exceed {} characters. Shorten node name to at most {} characters.",
+        WT_HOSTNAME_MAX,
+        WT_HOSTNAME_MAX - PREFIX.len()
     ))
 }
 
@@ -1080,11 +1054,34 @@ fn container_services_for_mode(hw_mode: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn container_service_active(hw_mode: &str) -> bool {
+    let (active, _) = container_services_for_mode(hw_mode);
+    Command::new("systemctl")
+        .args(["is-active", active])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn sync_container_services(hw_mode: &str) {
     let (active, inactive) = container_services_for_mode(hw_mode);
     let _ = Command::new("systemctl").args(["disable", "--now", inactive]).output();
-    let _ = Command::new("systemctl").args(["enable", "--now", active]).output();
-    eprintln!("[container] enabled {} disabled {}", active, inactive);
+    let _ = Command::new("systemctl").args(["reset-failed", active]).output();
+    let out = Command::new("systemctl").args(["enable", "--now", active]).output();
+    match &out {
+        Ok(o) if o.status.success() => {
+            eprintln!("[container] enabled {} disabled {}", active, inactive);
+        }
+        Ok(o) => {
+            eprintln!(
+                "[container] enable --now {} failed: {}{}",
+                active,
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout),
+            );
+        }
+        Err(e) => eprintln!("[container] enable --now {} error: {}", active, e),
+    }
 }
 
 fn apply_hardware_mode(new_mode: &str, state: &AppState) {
@@ -1412,20 +1409,13 @@ function gTo(n){{
 
 function chkS1(){{
   const name=v('nodeName');
-  const agent=v('unytAgentId');
   const ok=/^[a-z0-9-]+$/.test(name);
   document.getElementById('b1').disabled=!ok;
   const hint=document.getElementById('nameHint');
   if(!hint)return;
   if(!ok){{hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';return;}}
-  const wtName=agent?name+'-'+agent.trim():name+'-'+('0'.repeat(16));
-  if(wtName.length>63){{hint.textContent='With this Agent ID, node name must be at most '+(63-(1+(agent?agent.trim().length:16)))+' characters for Wind Tunnel client tracking.';document.getElementById('b1').disabled=true;return;}}
+  if(('nomad-client-'+name).length>63){{hint.textContent='Node name must be at most 50 characters for Wind Tunnel hostname (nomad-client- prefix).';document.getElementById('b1').disabled=true;return;}}
   hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';
-}}
-
-function wtNameLen(name,agent){{
-  const a=agent.trim();
-  return a?name.length+1+a.length:name.length+1+16;
 }}
 
 function wtHostname(name){{
@@ -1452,7 +1442,7 @@ async function doSubmit(){{
   const agent=v('unytAgentId');
   if(!nodeName)return alert('Node name is required.');
   if(!/^[a-z0-9-]+$/.test(nodeName))return alert('Node name must be lowercase letters, numbers and hyphens only.');
-  if(wtNameLen(nodeName,agent)>63)return alert('Node name is too long for Wind Tunnel tracking with this Agent ID. Shorten the node name.');
+  if(('nomad-client-'+nodeName).length>63)return alert('Node name must be at most 50 characters for Wind Tunnel hostname.');
   const btn=document.getElementById('bsub');
   btn.disabled=true;
   document.getElementById('slbl-btn').style.display='none';
@@ -2107,7 +2097,10 @@ fn handle_submit(
     let unyt_agent_id  = json_str(body, "unytAgentId");
 
     if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
-    if let Some(msg) = wt_client_name_error(node_name, unyt_agent_id) {
+    if let Some(msg) = validate_unyt_agent_id(unyt_agent_id) {
+        send_json_err(stream, 400, &msg); return;
+    }
+    if let Some(msg) = validate_wt_hostname(node_name) {
         send_json_err(stream, 400, &msg); return;
     }
 
@@ -2140,13 +2133,11 @@ fn handle_submit(
     }
 
     // ── Quadlets ─────────────────────────────────────────────────────────────
-    let wt_suffix = generate_wt_suffix();
     let hw_mode_val = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
 
     *state.node_name.lock().unwrap()     = node_name.to_string();
     *state.hw_mode.lock().unwrap()       = hw_mode_val.to_string();
     *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
-    *state.wt_suffix.lock().unwrap()     = wt_suffix.clone();
     state.onboarded.store(true, Ordering::Relaxed);
 
     let mut kv = HashMap::new();
@@ -2154,7 +2145,6 @@ fn handle_submit(
     kv.insert("node_name".into(), node_name.to_string());
     kv.insert("hw_mode".into(), hw_mode_val.to_string());
     kv.insert("unyt_agent_id".into(), unyt_agent_id.to_string());
-    kv.insert("wt_suffix".into(), wt_suffix.clone());
     write_state_file(&kv);
 
     write_quadlets_from_state(state);
@@ -2170,8 +2160,6 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let node_name     = state.node_name.lock().unwrap().clone();
     let hw_mode       = state.hw_mode.lock().unwrap().clone();
     let unyt_agent_id  = state.unyt_agent_id.lock().unwrap().clone();
-    let wt_suffix      = ensure_wt_suffix(state);
-    let wt_client_name = build_wt_client_name(&node_name, &unyt_agent_id, &wt_suffix);
     let wt_hostname    = build_wt_hostname(&node_name);
     let uptime    = state.start_time.elapsed().unwrap_or_default().as_secs();
     let keys      = read_ssh_keys();
@@ -2182,7 +2170,7 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let happs_count = read_deployments().len();
     let edgenode_up = edgenode_running();
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"happs_count":{},"wt_client_name":"{}","wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"happs_count":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
         VERSION,
         node_name.replace('\\', "\\\\").replace('"', "\\\""),
         hw_mode,
@@ -2190,7 +2178,6 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
         log_sender_endpoint.replace('\\', "\\\\").replace('"', "\\\""),
         if edgenode_up { "true" } else { "false" },
         happs_count,
-        wt_client_name.replace('\\', "\\\\").replace('"', "\\\""),
         wt_hostname.replace('\\', "\\\\").replace('"', "\\\""),
         keys.len(), keys_json, uptime
     ));
@@ -2243,8 +2230,7 @@ fn handle_nodename(
     if node_name == state.node_name.lock().unwrap().as_str() {
         send_json_err(stream, 400, "Node name unchanged"); return;
     }
-    let unyt_agent_id = state.unyt_agent_id.lock().unwrap().clone();
-    if let Some(msg) = wt_client_name_error(node_name, &unyt_agent_id) {
+    if let Some(msg) = validate_wt_hostname(node_name) {
         send_json_err(stream, 400, &msg); return;
     }
 
@@ -2267,8 +2253,7 @@ fn handle_unyt(
     state: &AppState,
 ) {
     let unyt_agent_id = json_str(&req.body, "unytAgentId");
-    let node_name     = state.node_name.lock().unwrap().clone();
-    if let Some(msg) = wt_client_name_error(&node_name, unyt_agent_id) {
+    if let Some(msg) = validate_unyt_agent_id(unyt_agent_id) {
         send_json_err(stream, 400, &msg); return;
     }
 
@@ -2278,13 +2263,8 @@ fn handle_unyt(
     apply_wind_tunnel_config(state);
     apply_edgenode_config(state);
 
-    let suffix    = ensure_wt_suffix(state);
-    let wt_client_name = build_wt_client_name(&node_name, unyt_agent_id, &suffix);
-    eprintln!("[manage] Unyt Agent ID updated. wt_client_name={}", wt_client_name);
-    send_json_ok(stream, &format!(
-        r#"{{"status":"ok","wt_client_name":"{}"}}"#,
-        wt_client_name.replace('\\', "\\\\").replace('"', "\\\"")
-    ));
+    eprintln!("[manage] Unyt Agent ID updated.");
+    send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
 fn handle_hardware(
@@ -2591,9 +2571,26 @@ fn main() {
     let state = Arc::new(AppState::new(ap_mode));
 
     if state.onboarded.load(Ordering::Relaxed) {
-        write_quadlets_from_state(&state);
         let hw_mode = state.hw_mode.lock().unwrap().clone();
         sync_container_services(&hw_mode);
+
+        let state_bg = Arc::clone(&state);
+        thread::spawn(move || {
+            write_quadlets_from_state(&state_bg);
+            let mode = state_bg.hw_mode.lock().unwrap().clone();
+            sync_container_services(&mode);
+        });
+
+        let hw_retry = hw_mode.clone();
+        thread::spawn(move || {
+            for secs in [30u64, 60, 120] {
+                thread::sleep(Duration::from_secs(secs));
+                if !container_service_active(&hw_retry) {
+                    eprintln!("[container] retry sync after {}s", secs);
+                    sync_container_services(&hw_retry);
+                }
+            }
+        });
     }
 
     // Spawn background update checker
@@ -2802,5 +2799,60 @@ fn main() {
                 },
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_unyt_agent_id, validate_wt_hostname};
+
+    const USER_AGENT_ID: &str = "uhCAkEgwsRQmYpVUGWSdNyziQgQZu1sfXVlVIR0sbEZJBd5N6wYr_";
+    const HOLOCHAIN_EXAMPLE: &str = "uhCAkJ9p-IlfMpeP_HeygQt2jqHDXu4-YRAQezq3L0m9nz3wCa0Mh";
+
+    #[test]
+    fn empty_agent_id_is_valid() {
+        assert!(validate_unyt_agent_id("").is_none());
+        assert!(validate_unyt_agent_id("   ").is_none());
+    }
+
+    #[test]
+    fn valid_agent_ids_pass() {
+        assert!(validate_unyt_agent_id(USER_AGENT_ID).is_none());
+        assert!(validate_unyt_agent_id(HOLOCHAIN_EXAMPLE).is_none());
+    }
+
+    #[test]
+    fn wrong_prefix_fails() {
+        let err = validate_unyt_agent_id("uhCkkJ9p-IlfMpeP_HeygQt2jqHDXu4-YRAQezq3L0m9nz3wCa0Mh");
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("uhCAk"));
+    }
+
+    #[test]
+    fn wrong_length_fails() {
+        assert!(validate_unyt_agent_id("uhCAkshort").is_some());
+        assert!(validate_unyt_agent_id(&format!("{}extra", USER_AGENT_ID)).is_some());
+    }
+
+    #[test]
+    fn invalid_charset_fails() {
+        let with_plus = USER_AGENT_ID.replace('Y', "+");
+        assert!(validate_unyt_agent_id(&with_plus).is_some());
+        let with_slash = USER_AGENT_ID.replace('Y', "/");
+        assert!(validate_unyt_agent_id(&with_slash).is_some());
+        let with_space = USER_AGENT_ID.replacen('Y', " ", 1);
+        assert!(validate_unyt_agent_id(&with_space).is_some());
+    }
+
+    #[test]
+    fn wt_hostname_accepts_max_node_name() {
+        let name = "a".repeat(50);
+        assert!(validate_wt_hostname(&name).is_none());
+    }
+
+    #[test]
+    fn wt_hostname_rejects_too_long_node_name() {
+        let name = "a".repeat(51);
+        assert!(validate_wt_hostname(&name).is_some());
     }
 }
