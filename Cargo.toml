@@ -1,6 +1,6 @@
 [package]
 name = "node-manager"
-version = "6.2.2"
+version = "6.2.3"
 edition = "2021"
 
 # No external dependencies — only std.
