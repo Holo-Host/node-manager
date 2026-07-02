@@ -14,7 +14,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.2.2";
+const VERSION: &str = "6.2.3";
 const WT_HOSTNAME_MAX: usize = 63;
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
@@ -316,7 +316,7 @@ fn pick_arm64_tag(tags_json: &str, prefix: &str) -> Option<String> {
 
 // ── Quadlet builders ───────────────────────────────────────────────────────────
 
-fn build_edgenode_quadlet(image: &str, log_sender_endpoint: &str, unyt_agent_id: &str) -> String {
+fn build_edgenode_quadlet(image: &str, log_sender_endpoint: &str, unyt_agent_id: &str, autostart: bool) -> String {
     let mut env_lines = String::new();
     let endpoint = log_sender_endpoint.trim();
     let unyt = unyt_agent_id.trim();
@@ -326,24 +326,37 @@ fn build_edgenode_quadlet(image: &str, log_sender_endpoint: &str, unyt_agent_id:
     if !unyt.is_empty() {
         env_lines.push_str(&format!("Environment=LOG_SENDER_UNYT_PUB_KEY={}\n", unyt));
     }
+    let install = if autostart {
+        "\n[Install]\nWantedBy=multi-user.target\n"
+    } else {
+        ""
+    };
     format!(
-        "[Quadlet]\nDefaultDependencies=false\n\n[Unit]\nDescription=Holo EdgeNode\nAfter=network.target podman.service\nWants=podman.service\nConflicts=wind-tunnel.service\n\n[Container]\nImage={image}\nContainerName=edgenode\nVolume=/var/lib/edgenode:/data:Z\n{env_lines}Label=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Quadlet]\nDefaultDependencies=false\n\n[Unit]\nDescription=Holo EdgeNode\nWants=network-online.target\nAfter=network-online.target\nWants=podman.service\nAfter=podman.service\nConflicts=wind-tunnel.service\n\n[Container]\nImage={image}\nContainerName=edgenode\nVolume=/var/lib/edgenode:/data:Z\n{env_lines}Label=io.containers.autoupdate=registry\n\n[Service]\nRestart=always\nRestartSec=5{install}",
         image = image,
         env_lines = env_lines,
+        install = install,
     )
 }
 
-fn build_wind_tunnel_quadlet(hostname: &str, image: &str, entrypoint_bind: Option<&str>) -> String {
+fn build_wind_tunnel_quadlet(hostname: &str, image: &str, entrypoint_bind: Option<&str>, autostart: bool) -> String {
     let entrypoint_volume = entrypoint_bind
         .map(|p| format!("Volume={}:/entrypoint.sh:ro,Z\n", p))
         .unwrap_or_default();
+    let install = if autostart {
+        "\n[Install]\nWantedBy=multi-user.target\n"
+    } else {
+        ""
+    };
     format!(
         "[Quadlet]\n\
          DefaultDependencies=false\n\n\
          [Unit]\n\
          Description=Holochain Wind Tunnel Runner\n\
-         After=network.target podman.service\n\
+         Wants=network-online.target\n\
+         After=network-online.target\n\
          Wants=podman.service\n\
+         After=podman.service\n\
          Conflicts=edgenode.service\n\n\
          [Container]\n\
          Image={image}\n\
@@ -356,13 +369,12 @@ fn build_wind_tunnel_quadlet(hostname: &str, image: &str, entrypoint_bind: Optio
          Label=io.containers.autoupdate=registry\n\n\
          [Service]\n\
          Restart=always\n\
-         RestartSec=5\n\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n",
+         RestartSec=5{install}",
         hostname = hostname,
         image = image,
         client_meta = WIND_TUNNEL_CLIENT_META,
         entrypoint_volume = entrypoint_volume,
+        install = install,
     )
 }
 
@@ -485,23 +497,27 @@ fn resolve_wind_tunnel_config(state: &AppState) -> WindTunnelConfig {
     WindTunnelConfig { hostname, image, entrypoint_bind }
 }
 
-fn write_quadlets_from_state(state: &AppState) {
+fn write_container_quadlets(hw_mode: &str, state: &AppState) {
     let cfg = resolve_wind_tunnel_config(state);
     let unyt = state.unyt_agent_id.lock().unwrap().clone();
     write_wind_tunnel_client_meta(&unyt);
     let edgenode_image = resolve_edgenode_image();
+    let log_sender = state.log_sender_endpoint.lock().unwrap().clone();
+    let edgenode_autostart = hw_mode != "WIND_TUNNEL";
+    let wt_autostart = hw_mode == "WIND_TUNNEL";
+    let edgenode_quadlet = build_edgenode_quadlet(&edgenode_image, &log_sender, &unyt, edgenode_autostart);
     let wt_quadlet = build_wind_tunnel_quadlet(
         &cfg.hostname,
         &cfg.image,
         cfg.entrypoint_bind.as_deref(),
+        wt_autostart,
     );
-    let log_sender = state.log_sender_endpoint.lock().unwrap().clone();
-    let _ = fs::write(
-        format!("{}/edgenode.container", QUADLET_DIR),
-        build_edgenode_quadlet(&edgenode_image, &log_sender, &unyt),
-    );
+    let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR), edgenode_quadlet);
     let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), wt_quadlet);
-    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+    eprintln!(
+        "[quadlet] hw_mode={} edgenode_autostart={} wt_autostart={}",
+        hw_mode, edgenode_autostart, wt_autostart
+    );
     eprintln!("[quadlet] WT hostname={} image={}", cfg.hostname, cfg.image);
     if let Some(ep) = cfg.entrypoint_bind.as_deref() {
         eprintln!("[quadlet] entrypoint bind={}", ep);
@@ -509,8 +525,10 @@ fn write_quadlets_from_state(state: &AppState) {
 }
 
 fn apply_wind_tunnel_config(state: &AppState) {
-    write_quadlets_from_state(state);
-    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
+    let hw_mode = state.hw_mode.lock().unwrap().clone();
+    write_container_quadlets(&hw_mode, state);
+    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+    if hw_mode == "WIND_TUNNEL" {
         restart_wind_tunnel_if_running();
     }
 }
@@ -536,8 +554,10 @@ fn restart_edgenode_if_running() {
 }
 
 fn apply_edgenode_config(state: &AppState) {
-    write_quadlets_from_state(state);
-    if state.hw_mode.lock().unwrap().as_str() != "WIND_TUNNEL" {
+    let hw_mode = state.hw_mode.lock().unwrap().clone();
+    write_container_quadlets(&hw_mode, state);
+    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+    if hw_mode != "WIND_TUNNEL" {
         restart_edgenode_if_running();
     }
 }
@@ -1063,37 +1083,38 @@ fn container_service_active(hw_mode: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn sync_container_services(hw_mode: &str) {
+fn sync_container_services(hw_mode: &str, state: &AppState) {
+    write_container_quadlets(hw_mode, state);
+    let _ = fs::write("/var/lib/edgenode/mode_switch.txt", hw_mode);
+    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
     let (active, inactive) = container_services_for_mode(hw_mode);
-    let _ = Command::new("systemctl").args(["disable", "--now", inactive]).output();
+    let _ = Command::new("systemctl").args(["stop", inactive]).output();
     let _ = Command::new("systemctl").args(["reset-failed", active]).output();
-    let out = Command::new("systemctl").args(["enable", "--now", active]).output();
+    let out = Command::new("systemctl").args(["start", active]).output();
     match &out {
         Ok(o) if o.status.success() => {
-            eprintln!("[container] enabled {} disabled {}", active, inactive);
+            eprintln!("[container] started {} stopped {}", active, inactive);
         }
         Ok(o) => {
             eprintln!(
-                "[container] enable --now {} failed: {}{}",
+                "[container] start {} failed: {}{}",
                 active,
                 String::from_utf8_lossy(&o.stderr),
                 String::from_utf8_lossy(&o.stdout),
             );
         }
-        Err(e) => eprintln!("[container] enable --now {} error: {}", active, e),
+        Err(e) => eprintln!("[container] start {} error: {}", active, e),
     }
 }
 
 fn apply_hardware_mode(new_mode: &str, state: &AppState) {
     let current = state.hw_mode.lock().unwrap().clone();
-    let _ = fs::write("/var/lib/edgenode/mode_switch.txt", new_mode);
     *state.hw_mode.lock().unwrap() = new_mode.to_string();
     update_state_key("hw_mode", new_mode);
-    write_quadlets_from_state(state);
     if current != new_mode {
         let (active, inactive) = container_services_for_mode(new_mode);
         eprintln!("[manage] Switching {} → {}", inactive, active);
-        sync_container_services(new_mode);
+        sync_container_services(new_mode, state);
     }
 }
 
@@ -2147,10 +2168,7 @@ fn handle_submit(
     kv.insert("unyt_agent_id".into(), unyt_agent_id.to_string());
     write_state_file(&kv);
 
-    write_quadlets_from_state(state);
-
-    let _ = fs::write("/var/lib/edgenode/mode_switch.txt", hw_mode_val);
-    sync_container_services(hw_mode_val);
+    sync_container_services(hw_mode_val, state);
 
     eprintln!("[onboard] Complete. node={} hw={} unyt={}", node_name, hw_mode, if unyt_agent_id.is_empty() { "(none)" } else { "set" });
     send_json_ok(stream, r#"{"status":"ok"}"#);
@@ -2572,22 +2590,16 @@ fn main() {
 
     if state.onboarded.load(Ordering::Relaxed) {
         let hw_mode = state.hw_mode.lock().unwrap().clone();
-        sync_container_services(&hw_mode);
+        sync_container_services(&hw_mode, &state);
 
-        let state_bg = Arc::clone(&state);
-        thread::spawn(move || {
-            write_quadlets_from_state(&state_bg);
-            let mode = state_bg.hw_mode.lock().unwrap().clone();
-            sync_container_services(&mode);
-        });
-
+        let state_retry = Arc::clone(&state);
         let hw_retry = hw_mode.clone();
         thread::spawn(move || {
             for secs in [30u64, 60, 120] {
                 thread::sleep(Duration::from_secs(secs));
                 if !container_service_active(&hw_retry) {
                     eprintln!("[container] retry sync after {}s", secs);
-                    sync_container_services(&hw_retry);
+                    sync_container_services(&hw_retry, &state_retry);
                 }
             }
         });
