@@ -12,9 +12,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use bip39::{Language, Mnemonic};
+
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.2.3";
+const VERSION: &str = "6.2.4";
 const WT_HOSTNAME_MAX: usize = 63;
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
@@ -29,9 +31,7 @@ const WT_IMAGE_ENV: &str = "WIND_TUNNEL_IMAGE";
 const WT_ENTRYPOINT_ENV: &str = "WIND_TUNNEL_ENTRYPOINT_BIND";
 const SESSION_TTL_SECS: u64 = 86400;
 const UPDATE_INTERVAL_SECS: u64 = 3600;
-const DEPLOYMENTS_FILE: &str = "/etc/node-manager/deployments.json";
-const HAPP_LOGS_DIR: &str = "/etc/node-manager/happ-logs";
-const HAPP_MANIFESTS_DIR: &str = "/var/lib/edgenode/manifests";
+const WDOCKER_PASS_FILE: &str = "/etc/node-manager/wdocker_pass";
 const EDGENODE_CONTAINER: &str = "edgenode";
 
 // ── Shared application state ───────────────────────────────────────────────────
@@ -133,18 +133,58 @@ fn verify_password(input: &str, stored: &str) -> bool {
     !actual.is_empty() && actual == parts[2].trim()
 }
 
-fn load_or_create_auth() -> String {
-    if let Ok(h) = fs::read_to_string(AUTH_FILE) {
-        let h = h.trim().to_string();
-        if !h.is_empty() { return h; }
+fn load_auth() -> String {
+    fs::read_to_string(AUTH_FILE)
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn generate_seed_phrase() -> Result<String, String> {
+    let entropy = random_bytes(16);
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
+        .map_err(|e| format!("Failed to generate seed phrase: {}", e))?;
+    Ok(mnemonic.to_string())
+}
+
+fn normalize_seed_phrase(input: &str) -> Result<String, String> {
+    Mnemonic::parse_in(Language::English, input.trim())
+        .map(|m| m.to_string())
+        .map_err(|_| "Invalid seed phrase".into())
+}
+
+fn has_seed_phrase() -> bool {
+    read_state_file()
+        .get("seed_hash")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn store_auth_hash(hash: &str) {
+    let _ = fs::create_dir_all("/etc/node-manager");
+    let _ = fs::write(AUTH_FILE, hash);
+    let _ = Command::new("chmod").args(["600", AUTH_FILE]).output();
+}
+
+fn load_or_create_wdocker_password() -> String {
+    if let Ok(p) = fs::read_to_string(WDOCKER_PASS_FILE) {
+        let p = p.trim().to_string();
+        if !p.is_empty() { return p; }
     }
     let password = generate_password();
-    let hash = hash_password(&password);
     let _ = fs::create_dir_all("/etc/node-manager");
-    let _ = fs::write(AUTH_FILE, &hash);
-    let _ = Command::new("chmod").args(["600", AUTH_FILE]).output();
-    display_password_on_tty(&password);
-    hash
+    let _ = fs::write(WDOCKER_PASS_FILE, &password);
+    let _ = Command::new("chmod").args(["600", WDOCKER_PASS_FILE]).output();
+    eprintln!("[wdocker] Generated conductor password at {}", WDOCKER_PASS_FILE);
+    password
+}
+
+fn read_wdocker_password() -> Result<String, String> {
+    let password = load_or_create_wdocker_password();
+    if password.is_empty() {
+        Err("wdocker password unavailable".into())
+    } else {
+        Ok(password)
+    }
 }
 
 fn get_local_ip() -> String {
@@ -153,27 +193,6 @@ fn get_local_ip() -> String {
         .output().ok()
         .and_then(|o| { let s = String::from_utf8_lossy(&o.stdout).trim().to_string(); if s.is_empty() { None } else { Some(s) } })
         .unwrap_or_else(|| "<node-ip>".to_string())
-}
-
-fn display_password_on_tty(password: &str) {
-    let ip = get_local_ip();
-    let msg = format!(
-        "\x1b[2J\x1b[H\n\
-         \x1b[1;36m  ╔══════════════════════════════════════════╗\n\
-         \x1b[1;36m  ║      🜲  HOLO NODE SETUP                 ║\n\
-         \x1b[1;36m  ╚══════════════════════════════════════════╝\x1b[0m\n\n\
-         \x1b[1m  Open a browser on your local network and visit:\x1b[0m\n\
-         \x1b[1;33m  http://{}:8080\x1b[0m\n\n\
-         \x1b[1m  One-time setup password:\x1b[0m\n\
-         \x1b[1;32m  {}\x1b[0m\n\n\
-         \x1b[31m  ⚠  Write this password down. It will NOT show again.\x1b[0m\n\n",
-        ip, password
-    );
-    if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty1") { let _ = tty.write_all(msg.as_bytes()); }
-    let issue = format!("\n\x1b[1;36m╔═══════════════════════════════╗\x1b[0m\n\x1b[1;36m║  HOLO NODE SETUP              ║\x1b[0m\n\x1b[1;36m╚═══════════════════════════════╝\x1b[0m\n\x1b[1mURL:\x1b[0m      http://{}:8080\n\x1b[1mPassword:\x1b[0m \x1b[1;32m{}\x1b[0m\n\n", ip, password);
-    let _ = fs::create_dir_all("/run/issue.d");
-    let _ = fs::write("/run/issue.d/51-node-manager.issue", issue.as_bytes());
-    eprintln!("[onboard] *** SETUP PASSWORD: {} | URL: http://{}:8080 ***", password, ip);
 }
 
 // ── Session management ─────────────────────────────────────────────────────────
@@ -574,19 +593,7 @@ fn validate_log_sender_endpoint(url: &str) -> Option<String> {
     None
 }
 
-// ── hApp / EdgeNode bridge ─────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct Deployment {
-    id: String,
-    app_name: String,
-    app_version: String,
-    app_id: String,
-    status: String,
-    deployed_at: String,
-    last_error: String,
-    manifest: String,
-}
+// ── EdgeNode / Moss bridge ─────────────────────────────────────────────────────
 
 fn edgenode_running() -> bool {
     Command::new("systemctl")
@@ -600,8 +607,28 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn podman_exec_nonroot(cmd: &str) -> (i32, String, String) {
-    let quoted = shell_single_quote(cmd);
+fn podman_exec_wdocker(
+    cmd: &str,
+    profile_name: Option<&str>,
+    node_description: Option<&str>,
+) -> (i32, String, String) {
+    let password = match read_wdocker_password() {
+        Ok(p) => p,
+        Err(e) => return (1, String::new(), e),
+    };
+    let mut inner = format!("WDOCKER_PASSWORD={} ", shell_single_quote(&password));
+    if let Some(name) = profile_name {
+        if !name.is_empty() {
+            inner.push_str(&format!("WDOCKER_PROFILE_NAME={} ", shell_single_quote(name)));
+        }
+    }
+    if let Some(desc) = node_description {
+        if !desc.is_empty() {
+            inner.push_str(&format!("WDOCKER_NODE_DESCRIPTION={} ", shell_single_quote(desc)));
+        }
+    }
+    inner.push_str(cmd);
+    let quoted = shell_single_quote(&inner);
     let script = format!("podman exec {} su - nonroot -c {}", EDGENODE_CONTAINER, quoted);
     match Command::new("sh").args(["-c", &script]).output() {
         Ok(o) => {
@@ -616,361 +643,9 @@ fn podman_exec_nonroot(cmd: &str) -> (i32, String, String) {
     }
 }
 
-fn json_block<'a>(json: &'a str, key: &str) -> &'a str {
-    let needle = format!("\"{}\":", key);
-    let pos = match json.find(&needle) { Some(p) => p, None => return "" };
-    let after = json[pos + needle.len()..].trim_start();
-    if !after.starts_with('{') { return ""; }
-    let mut depth = 0i32;
-    for (i, ch) in after.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 { return &after[..=i]; }
-            }
-            _ => {}
-        }
-    }
-    ""
-}
-
-fn json_nested_str<'a>(json: &'a str, outer: &str, inner: &str) -> &'a str {
-    let block = json_block(json, outer);
-    if block.is_empty() { return ""; }
-    json_str(block, inner)
-}
-
-fn manifest_app_name(manifest: &str) -> String {
-    json_nested_str(manifest, "app", "name").to_string()
-}
-
-fn manifest_app_version(manifest: &str) -> String {
-    json_nested_str(manifest, "app", "version").to_string()
-}
-
-fn manifest_has_economics_agreement(manifest: &str) -> bool {
-    let econ = json_block(manifest, "economics");
-    !econ.is_empty() && !json_str(econ, "agreementHash").is_empty()
-}
-
-fn deployment_to_json(d: &Deployment) -> String {
-    format!(
-        r#"{{"id":"{}","app_name":"{}","app_version":"{}","app_id":"{}","status":"{}","deployed_at":"{}","last_error":"{}","manifest":{}}}"#,
-        json_escape(&d.id),
-        json_escape(&d.app_name),
-        json_escape(&d.app_version),
-        json_escape(&d.app_id),
-        json_escape(&d.status),
-        json_escape(&d.deployed_at),
-        json_escape(&d.last_error),
-        d.manifest,
-    )
-}
-
-fn read_deployments() -> Vec<Deployment> {
-    let content = fs::read_to_string(DEPLOYMENTS_FILE).unwrap_or_default();
-    let trimmed = content.trim();
-    if trimmed.is_empty() || trimmed == "[]" { return Vec::new(); }
-    let inner = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(trimmed);
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (i, ch) in inner.char_indices() {
-        match ch {
-            '{' => {
-                if depth == 0 { start = i; }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let obj = &inner[start..=i];
-                    out.push(Deployment {
-                        id: json_str(obj, "id").to_string(),
-                        app_name: json_str(obj, "app_name").to_string(),
-                        app_version: json_str(obj, "app_version").to_string(),
-                        app_id: json_str(obj, "app_id").to_string(),
-                        status: json_str(obj, "status").to_string(),
-                        deployed_at: json_str(obj, "deployed_at").to_string(),
-                        last_error: json_str(obj, "last_error").to_string(),
-                        manifest: extract_manifest_field(obj),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn extract_manifest_field(obj: &str) -> String {
-    let needle = "\"manifest\":";
-    let pos = match obj.find(needle) { Some(p) => p, None => return "{}".into() };
-    let after = obj[pos + needle.len()..].trim_start();
-    if after.starts_with('{') {
-        let mut depth = 0i32;
-        for (i, ch) in after.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 { return after[..=i].to_string(); }
-                }
-                _ => {}
-            }
-        }
-    }
-    "{}".into()
-}
-
-fn write_deployments(deployments: &[Deployment]) {
-    let _ = fs::create_dir_all("/etc/node-manager");
-    let body: String = deployments.iter().map(deployment_to_json).collect::<Vec<_>>().join(",");
-    let content = format!("[{}]", body);
-    let _ = fs::write(DEPLOYMENTS_FILE, content);
-    let _ = Command::new("chmod").args(["600", DEPLOYMENTS_FILE]).output();
-}
-
-fn upsert_deployment(deployments: &mut Vec<Deployment>, d: Deployment) {
-    if let Some(pos) = deployments.iter().position(|x| x.id == d.id) {
-        deployments[pos] = d;
-    } else {
-        deployments.push(d);
-    }
-    write_deployments(deployments);
-}
-
-fn remove_deployment(deployments: &mut Vec<Deployment>, id: &str) {
-    deployments.retain(|d| d.id != id);
-    write_deployments(deployments);
-}
-
-fn generate_deployment_id() -> String {
-    random_hex(16)
-}
-
-fn utc_now_iso() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format_unix_iso(secs)
-}
-
-fn format_unix_iso(secs: u64) -> String {
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let s = rem % 60;
-    let (y, mo, d) = days_to_ymd(days);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
-}
-
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    let mut y = 1970u64;
-    let mut remaining = days;
-    loop {
-        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-        let year_days = if leap { 366 } else { 365 };
-        if remaining < year_days { break; }
-        remaining -= year_days;
-        y += 1;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut mo = 1u64;
-    for &md in &month_days {
-        if remaining < md { break; }
-        remaining -= md;
-        mo += 1;
-    }
-    (y, mo, remaining + 1)
-}
-
-fn parse_iso_to_secs(iso: &str) -> Option<u64> {
-    if iso.len() < 19 { return None; }
-    let y: u64 = iso[0..4].parse().ok()?;
-    let mo: u64 = iso[5..7].parse().ok()?;
-    let d: u64 = iso[8..10].parse().ok()?;
-    let h: u64 = iso[11..13].parse().ok()?;
-    let m: u64 = iso[14..16].parse().ok()?;
-    let s: u64 = iso[17..19].parse().ok()?;
-    let mut days = 0u64;
-    for year in 1970..y {
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        days += if leap { 366 } else { 365 };
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for md in &month_days[..(mo as usize - 1).min(12)] {
-        days += *md as u64;
-    }
-    days += d - 1;
-    Some(days * 86400 + h * 3600 + m * 60 + s)
-}
-
-fn deployed_duration(iso: &str) -> String {
-    if iso.is_empty() { return "—".into(); }
-    let deployed = match parse_iso_to_secs(iso) {
-        Some(s) => s,
-        None => return "—".into(),
-    };
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now <= deployed { return "just now".into(); }
-    fmt_uptime(now - deployed)
-}
-
-fn write_happ_manifest(name: &str, version: &str, manifest: &str) -> Result<String, String> {
-    let safe_name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
-    let safe_ver: String = version.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-').collect();
-    if safe_name.is_empty() || safe_ver.is_empty() {
-        return Err("Invalid app name or version for manifest file".into());
-    }
-    let _ = fs::create_dir_all(HAPP_MANIFESTS_DIR);
-    let filename = format!("{}-{}.json", safe_name, safe_ver);
-    let host_path = format!("{}/{}", HAPP_MANIFESTS_DIR, filename);
-    fs::write(&host_path, manifest).map_err(|e| e.to_string())?;
-    Ok(format!("/data/manifests/{}", filename))
-}
-
-fn extract_app_id_from_install_output(output: &str) -> String {
-    for line in output.lines() {
-        if let Some(start) = line.find('(') {
-            if let Some(end) = line[start + 1..].find(')') {
-                let candidate = &line[start + 1..start + 1 + end];
-                if candidate.contains("::") && candidate.starts_with("uhC") == false {
-                    return candidate.to_string();
-                }
-                if candidate.contains("::") {
-                    return candidate.to_string();
-                }
-            }
-        }
-    }
-    for part in output.split_whitespace() {
-        if part.matches("::").count() >= 2 && part.len() > 10 {
-            return part.trim_matches(|c: char| c == ')' || c == '(' || c == '!').to_string();
-        }
-    }
-    String::new()
-}
-
-struct LiveHapp {
-    app_id: String,
-    enabled: bool,
-}
-
-fn parse_list_happs_output(output: &str) -> Vec<LiveHapp> {
-    let mut out = Vec::new();
-    let lower = output.to_lowercase();
-    if lower.contains("installed") || lower.contains("enabled") {
-        for line in output.lines() {
-            let lid = line.to_lowercase();
-            let enabled = lid.contains("enabled") && !lid.contains("disabled");
-            let disabled = lid.contains("disabled");
-            for token in line.split_whitespace() {
-                if token.matches("::").count() >= 2 {
-                    let app_id = token.trim_matches(|c: char| c == ',' || c == ')' || c == '(' || c == '"' || c == '\'');
-                    if app_id.contains("::") {
-                        out.push(LiveHapp {
-                            app_id: app_id.to_string(),
-                            enabled: if disabled { false } else { enabled || !lid.contains("disabled") },
-                        });
-                    }
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        for token in output.split(|c: char| c == '"' || c == ',' || c == ' ' || c == '\n' || c == '[' || c == ']') {
-            if token.matches("::").count() >= 2 && token.len() > 5 {
-                out.push(LiveHapp { app_id: token.to_string(), enabled: true });
-            }
-        }
-    }
-    out
-}
-
-fn list_installed_happs() -> Result<Vec<LiveHapp>, String> {
-    if !edgenode_running() {
-        return Err("EdgeNode is not running".into());
-    }
-    let (code, stdout, stderr) = podman_exec_nonroot("list_happs");
-    if code != 0 && stdout.is_empty() {
-        return Err(if stderr.is_empty() { format!("list_happs failed (exit {})", code) } else { stderr });
-    }
-    Ok(parse_list_happs_output(&format!("{}\n{}", stdout, stderr)))
-}
-
-fn validate_happ_manifest(container_path: &str) -> (bool, String) {
-    let cmd = format!("happ_config_file validate --input {}", container_path);
-    let (code, stdout, stderr) = podman_exec_nonroot(&cmd);
-    let combined = format!("{}{}", stdout, stderr);
-    (code == 0, combined)
-}
-
-fn run_install_happ(container_path: &str, node_name: &str) -> (i32, String) {
-    let cmd = if node_name.is_empty() {
-        format!("install_happ {}", container_path)
-    } else {
-        format!("install_happ {} {}", container_path, node_name)
-    };
-    let (code, stdout, stderr) = podman_exec_nonroot(&cmd);
-    (code, format!("{}\n{}", stdout, stderr))
-}
-
-fn enable_happ(app_id: &str) -> Result<String, String> {
-    let (code, stdout, stderr) = podman_exec_nonroot(&format!("enable_happ {}", app_id));
-    let out = format!("{}\n{}", stdout, stderr);
-    if code != 0 { Err(out) } else { Ok(out) }
-}
-
-fn disable_happ(app_id: &str) -> Result<String, String> {
-    let (code, stdout, stderr) = podman_exec_nonroot(&format!("disable_happ {}", app_id));
-    let out = format!("{}\n{}", stdout, stderr);
-    if code != 0 { Err(out) } else { Ok(out) }
-}
-
-fn uninstall_happ(app_id: &str) -> Result<String, String> {
-    let (code, stdout, stderr) = podman_exec_nonroot(&format!("uninstall_happ {}", app_id));
-    let out = format!("{}\n{}", stdout, stderr);
-    if code != 0 { Err(out) } else { Ok(out) }
-}
-
-fn read_happ_install_log(id: &str) -> String {
-    let path = format!("{}/{}.log", HAPP_LOGS_DIR, id);
-    fs::read_to_string(&path).unwrap_or_else(|_| "(no install log available)".into())
-}
-
-fn tail_container_log(container_path: &str, lines: usize) -> String {
-    let cmd = format!("tail -n {} {}", lines, container_path);
-    let (_, stdout, stderr) = podman_exec_nonroot(&cmd);
-    let out = format!("{}{}", stdout, stderr);
-    if out.trim().is_empty() { "(log empty or unavailable)".into() } else { out }
-}
-
-fn reconcile_deployment_status(d: &Deployment, live: &[LiveHapp]) -> String {
-    if d.status == "installing" { return "installing".into(); }
-    if d.app_id.is_empty() {
-        return if d.status == "error" { "error".into() } else { d.status.clone() };
-    }
-    if let Some(h) = live.iter().find(|h| h.app_id == d.app_id) {
-        if h.enabled { "running".into() } else { "paused".into() }
-    } else if d.status == "error" {
-        "error".into()
-    } else {
-        "error".into()
-    }
-}
-
-fn happs_prereq_error(state: &AppState) -> Option<String> {
+fn moss_prereq_error(state: &AppState) -> Option<String> {
     if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
-        return Some("Switch to Standard EdgeNode mode in Mode before managing hApps.".into());
+        return Some("Switch to Standard EdgeNode mode in Mode before managing Moss groups.".into());
     }
     if !edgenode_running() {
         return Some("EdgeNode is not running. Start Standard EdgeNode mode first.".into());
@@ -978,45 +653,32 @@ fn happs_prereq_error(state: &AppState) -> Option<String> {
     None
 }
 
-fn spawn_install_job(deployment_id: String, container_path: String, node_name: String) {
-    thread::spawn(move || {
-        let _ = fs::create_dir_all(HAPP_LOGS_DIR);
-        let log_path = format!("{}/{}.log", HAPP_LOGS_DIR, deployment_id);
-        let (code, output) = run_install_happ(&container_path, &node_name);
-        let _ = fs::write(&log_path, &output);
-        let mut deployments = read_deployments();
-        let app_id = extract_app_id_from_install_output(&output);
-        if let Some(d) = deployments.iter_mut().find(|d| d.id == deployment_id) {
-            if code == 0 && !app_id.is_empty() {
-                d.status = "running".into();
-                d.app_id = app_id;
-                d.deployed_at = utc_now_iso();
-                d.last_error = String::new();
-            } else {
-                d.status = "error".into();
-                d.last_error = if output.len() > 2000 {
-                    output[..2000].to_string()
-                } else {
-                    output.clone()
-                };
-            }
-            write_deployments(&deployments);
-        }
-        eprintln!("[happs] Install job {} finished (exit {})", deployment_id, code);
-    });
+fn run_wdocker(
+    cmd: &str,
+    profile_name: Option<&str>,
+    node_description: Option<&str>,
+) -> Result<String, String> {
+    if !edgenode_running() {
+        return Err("EdgeNode is not running. Start Standard EdgeNode mode first.".into());
+    }
+    let (code, stdout, stderr) = podman_exec_wdocker(cmd, profile_name, node_description);
+    let combined = format!("{}{}", stdout, stderr);
+    if code != 0 {
+        Err(if combined.trim().is_empty() {
+            format!("wdocker failed (exit {})", code)
+        } else {
+            combined.trim().to_string()
+        })
+    } else {
+        Ok(combined)
+    }
 }
 
-fn get_query_param(query: &str, key: &str) -> String {
-    for pair in query.split('&') {
-        if let Some(eq) = pair.find('=') {
-            if &pair[..eq] == key {
-                return url_decode(&pair[eq + 1..]);
-            }
-        } else if pair == key {
-            return String::new();
-        }
-    }
-    String::new()
+fn send_wdocker_ok(stream: &mut TcpStream, output: &str) {
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","output":"{}"}}"#,
+        json_escape(output.trim())
+    ));
 }
 
 // ── Self-update ────────────────────────────────────────────────────────────────
@@ -1137,30 +799,6 @@ fn json_str<'a>(json: &'a str, key: &str) -> &'a str {
     if after.starts_with('"') { let inner = &after[1..]; &inner[..inner.find('"').unwrap_or(0)] } else { "" }
 }
 
-fn json_raw_value(json: &str, key: &str) -> String {
-    let needle = format!("\"{}\":", key);
-    let pos = match json.find(&needle) { Some(p) => p, None => return String::new() };
-    let after = json[pos + needle.len()..].trim_start();
-    if after.starts_with('"') {
-        let inner = &after[1..];
-        let end = inner.find('"').unwrap_or(0);
-        return inner[..end].to_string();
-    }
-    if after.starts_with('{') || after.starts_with('[') {
-        let open = after.chars().next().unwrap();
-        let close = if open == '{' { '}' } else { ']' };
-        let mut depth = 0i32;
-        for (i, ch) in after.char_indices() {
-            if ch == open { depth += 1; }
-            else if ch == close {
-                depth -= 1;
-                if depth == 0 { return after[..=i].to_string(); }
-            }
-        }
-    }
-    String::new()
-}
-
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -1228,7 +866,7 @@ fn send_redirect_with_cookie(stream: &mut TcpStream, location: &str, cookie: &st
     let _ = stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nSet-Cookie: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", location, cookie).as_bytes());
 }
 
-struct Req { method: String, path: String, query: String, headers: String, body: String }
+struct Req { method: String, path: String, headers: String, body: String }
 
 fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut r = BufReader::new(stream.try_clone().ok()?);
@@ -1236,10 +874,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut parts = line0.trim().splitn(3, ' ');
     let method   = parts.next()?.to_string();
     let path_raw = parts.next()?.to_string();
-    let (path, query) = match path_raw.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (path_raw, String::new()),
-    };
+    let path = path_raw.split_once('?').map(|(p, _)| p.to_string()).unwrap_or(path_raw);
     let mut cl: usize = 0; let mut headers = String::new();
     loop {
         let mut line = String::new(); r.read_line(&mut line).ok()?;
@@ -1250,7 +885,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
     }
     let mut body = vec![0u8; cl.min(1 << 20)];
     if cl > 0 { r.read_exact(&mut body).ok()?; }
-    Some(Req { method, path, query, headers, body: String::from_utf8_lossy(&body).into_owned() })
+    Some(Req { method, path, headers, body: String::from_utf8_lossy(&body).into_owned() })
 }
 
 fn get_cookie(headers: &str, name: &str) -> Option<String> {
@@ -1318,17 +953,60 @@ fn build_login_html(error: bool) -> String {
     format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Holo Node — Login</title>
-<style>{css}body{{align-items:center}}.card{{max-width:400px}}.hdr{{text-align:center}}.icon{{font-size:42px;margin-bottom:10px}}form .btn{{width:100%;margin-top:18px}}</style></head><body>
+<style>{css}body{{align-items:center}}.card{{max-width:400px}}.hdr{{text-align:center}}.icon{{font-size:42px;margin-bottom:10px}}form .btn{{width:100%;margin-top:18px}}.link-btn{{background:none;border:none;color:#818cf8;font-size:13px;cursor:pointer;padding:0;margin-top:14px;text-decoration:underline}}.link-btn:hover{{color:#a5b4fc}}.view{{display:none}}.view.active{{display:block}}textarea{{min-height:80px;resize:vertical}}</style></head><body>
 <div class="card">
-  <div class="hdr"><div class="icon">🜲</div><h1>Holo Node</h1><p>Enter your node password to continue.</p></div>
-  <div class="body">{err}
-    <form method="POST" action="/login">
-      <label for="pw">Password</label>
-      <input type="password" id="pw" name="password" autofocus autocomplete="current-password">
-      <button type="submit" class="btn btn-primary">Unlock →</button>
-    </form>
+  <div class="hdr"><div class="icon">🜲</div><h1>Holo Node</h1><p id="hdr-sub">Enter your node password to continue.</p></div>
+  <div class="body">
+    <div class="view active" id="login-view">{err}
+      <form method="POST" action="/login">
+        <label for="pw">Password</label>
+        <input type="password" id="pw" name="password" autofocus autocomplete="current-password">
+        <button type="submit" class="btn btn-primary">Unlock →</button>
+      </form>
+      <button type="button" class="link-btn" onclick="showRecover()">Forgot Password?</button>
+    </div>
+    <div class="view" id="recover-view">
+      <div class="info-box" style="margin-bottom:16px">Enter your 12-word recovery seed phrase and choose a new password.</div>
+      <label for="seed">Recovery seed phrase</label>
+      <textarea id="seed" placeholder="word1 word2 word3 … word12" autocomplete="off"></textarea>
+      <label for="newpw">New password</label>
+      <input type="password" id="newpw" autocomplete="new-password">
+      <button type="button" class="btn btn-primary" id="recover-btn" onclick="doRecover()">Reset Password</button>
+      <button type="button" class="link-btn" onclick="showLogin()">← Back to login</button>
+    </div>
   </div>
-</div></body></html>"#, css=COMMON_CSS, err=err)
+</div>
+<script>
+function showRecover(){{
+  document.getElementById('login-view').classList.remove('active');
+  document.getElementById('recover-view').classList.add('active');
+  document.getElementById('hdr-sub').textContent='Recover your node password with your seed phrase.';
+  document.getElementById('seed').focus();
+}}
+function showLogin(){{
+  document.getElementById('recover-view').classList.remove('active');
+  document.getElementById('login-view').classList.add('active');
+  document.getElementById('hdr-sub').textContent='Enter your node password to continue.';
+  document.getElementById('pw').focus();
+}}
+async function doRecover(){{
+  const seed=document.getElementById('seed').value.trim();
+  const newPassword=document.getElementById('newpw').value;
+  if(!seed||!newPassword)return alert('Seed phrase and new password are required.');
+  const btn=document.getElementById('recover-btn');
+  btn.disabled=true;
+  try{{
+    const r=await fetch('/manage/auth/recover',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{seed_phrase:seed,new_password:newPassword}})}});
+    const data=await r.json().catch(()=>({{}}));
+    if(r.ok){{alert('Password reset successfully. Please log in with your new password.');window.location.href='/login';}}
+    else{{throw new Error(data.error||('Server error '+r.status));}}
+  }}catch(e){{
+    alert('Error: '+e.message);
+  }}finally{{
+    btn.disabled=false;
+  }}
+}}
+</script></body></html>"#, css=COMMON_CSS, err=err)
 }
 
 // ── Onboarding page ────────────────────────────────────────────────────────────
@@ -1385,6 +1063,9 @@ fn build_onboarding_html(ap_mode: bool) -> String {
       <label>Unyt Agent ID <span style="color:#475569;font-weight:400">(optional)</span></label>
       <input type="text" id="unytAgentId" placeholder="Paste your Agent ID from the Unyt desktop app" oninput="chkS1()">
       {unyt_copy}
+      <label>Create password *</label>
+      <input type="password" id="password" placeholder="At least 8 characters" oninput="chkS1()" autocomplete="new-password">
+      <div class="hint" id="pwHint">This password protects your node management panel.</div>
       <div class="brow"><button class="btn btn-primary" id="b1" onclick="gTo(2)" disabled>Review →</button></div>
     </div>
 
@@ -1398,6 +1079,7 @@ fn build_onboarding_html(ap_mode: bool) -> String {
         <tr><td>Mode</td><td id="rv-hw">—</td></tr>
         <tr><td>SSH Key</td><td id="rv-sk">—</td></tr>
         <tr><td>Unyt Agent ID</td><td id="rv-unyt">—</td></tr>
+        <tr><td>Password</td><td id="rv-pw">—</td></tr>
         <tr id="rv-wt-row" style="display:none"><td>Wind Tunnel hostname</td><td id="rv-wt">—</td></tr>
       </table>
       <div class="info-box" style="margin-top:16px">After initialization:<br>
@@ -1413,8 +1095,17 @@ fn build_onboarding_html(ap_mode: bool) -> String {
       </div>
     </div>
 
-    <!-- SUCCESS -->
-    <div class="step" id="suc"><div class="suc"><div style="font-size:48px;margin-bottom:16px">🜲</div><h2>Node Initialized!</h2><p>Redirecting to the management panel…</p></div></div>
+    <!-- SUCCESS / SEED PHRASE -->
+    <div class="step" id="suc">
+      <div class="suc">
+        <div style="font-size:48px;margin-bottom:16px">🜲</div>
+        <h2>Node Initialized!</h2>
+        <p>Save your recovery seed phrase before continuing. You will need it to reset your password if you forget it.</p>
+        <div class="err-box" style="text-align:left;margin:20px 0">⚠ Write down these 12 words in order and store them somewhere safe. This is the only time they will be shown. Without your seed phrase, you cannot recover access to your node if you forget your password.</div>
+        <div id="seed-display" style="background:#0f1117;border:2px solid #6366f1;border-radius:12px;padding:20px 24px;margin:16px 0;font-size:15px;line-height:1.9;color:#e2e8f0;font-weight:500;word-spacing:4px;text-align:left"></div>
+        <button class="btn btn-primary" id="seed-ack" onclick="goManage()" disabled style="width:100%;margin-top:8px">I have saved my seed phrase</button>
+      </div>
+    </div>
   </div>
 </div>
 <script>
@@ -1430,13 +1121,16 @@ function gTo(n){{
 
 function chkS1(){{
   const name=v('nodeName');
-  const ok=/^[a-z0-9-]+$/.test(name);
+  const pw=v('password');
+  const ok=/^[a-z0-9-]+$/.test(name)&&pw.length>=8;
   document.getElementById('b1').disabled=!ok;
   const hint=document.getElementById('nameHint');
   if(!hint)return;
-  if(!ok){{hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';return;}}
+  if(!/^[a-z0-9-]+$/.test(name)){{hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';return;}}
   if(('nomad-client-'+name).length>63){{hint.textContent='Node name must be at most 50 characters for Wind Tunnel hostname (nomad-client- prefix).';document.getElementById('b1').disabled=true;return;}}
   hint.textContent='Lowercase letters, numbers and hyphens only. Used as hostname slug.';
+  const pwHint=document.getElementById('pwHint');
+  if(pwHint)pwHint.textContent=pw.length>=8?'This password protects your node management panel.':'Password must be at least 8 characters.';
 }}
 
 function wtHostname(name){{
@@ -1450,6 +1144,7 @@ function bRev(){{
   set('rv-nn',v('nodeName')||'—');
   set('rv-sk',sk?sk.split(' ')[0]+' ••••':'(not provided)');
   set('rv-unyt',agent||'(not provided — compensation unavailable)');
+  set('rv-pw',v('password')?'••••••••':'—');
   set('rv-hw',v('hw')==='WIND_TUNNEL'?'Wind Tunnel':'Standard EdgeNode');
   const wtRow=document.getElementById('rv-wt-row');
   if(v('hw')==='WIND_TUNNEL'){{
@@ -1461,7 +1156,9 @@ function bRev(){{
 async function doSubmit(){{
   const nodeName=v('nodeName');
   const agent=v('unytAgentId');
+  const password=v('password');
   if(!nodeName)return alert('Node name is required.');
+  if(!password||password.length<8)return alert('Password must be at least 8 characters.');
   if(!/^[a-z0-9-]+$/.test(nodeName))return alert('Node name must be lowercase letters, numbers and hyphens only.');
   if(('nomad-client-'+nodeName).length>63)return alert('Node name must be at most 50 characters for Wind Tunnel hostname.');
   const btn=document.getElementById('bsub');
@@ -1470,6 +1167,7 @@ async function doSubmit(){{
   document.getElementById('spin').style.display='block';
   const p={{
     nodeName,
+    password,
     sshKey:v('sshKey'),
     unytAgentId:agent,
     hwMode:v('hw'),
@@ -1478,8 +1176,14 @@ async function doSubmit(){{
   }};
   try{{
     const r=await fetch('/submit',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}});
-    if(r.ok){{gTo(3);setTimeout(()=>window.location.href='/manage',2000);}}
-    else{{throw new Error('Server error '+r.status+': '+(await r.text()));}}
+    const data=await r.json().catch(()=>({{}}));
+    if(r.ok&&data.seed_phrase){{
+      document.getElementById('seed-display').textContent=data.seed_phrase;
+      document.getElementById('seed-ack').disabled=false;
+      gTo(3);
+    }}
+    else if(r.ok){{throw new Error('Server did not return a seed phrase.');}}
+    else{{throw new Error(data.error||('Server error '+r.status));}}
   }}catch(e){{
     btn.disabled=false;
     document.getElementById('slbl-btn').style.display='inline';
@@ -1487,6 +1191,7 @@ async function doSubmit(){{
     alert('Error: '+e.message);
   }}
 }}
+function goManage(){{window.location.href='/manage';}}
 </script>
 </body></html>"#,
         css        = COMMON_CSS,
@@ -1537,14 +1242,15 @@ fn build_manage_html(state: &AppState) -> String {
     let sel_std = if hw_mode != "WIND_TUNNEL" { " sel" } else { "" };
     let sel_wt  = if hw_mode == "WIND_TUNNEL"  { " sel" } else { "" };
     let hw_mode_display = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" };
-    let happs_disabled = hw_mode == "WIND_TUNNEL";
-    let happs_disabled_msg = if happs_disabled {
-        r#"<div class="info-box" style="margin-bottom:14px">hApp hosting is only available in Standard EdgeNode mode. Switch to Standard EdgeNode mode above to host applications.</div>"#
+    let moss_disabled = hw_mode == "WIND_TUNNEL";
+    let moss_disabled_msg = if moss_disabled {
+        r#"<div class="info-box" style="margin-bottom:14px">Moss Groups are only available in Standard EdgeNode mode. Switch to Standard EdgeNode mode above to join and manage groups.</div>"#
     } else if !edgenode_running() {
         r#"<div class="err-box" style="margin-bottom:14px">EdgeNode is not running. Switch to Standard EdgeNode mode and ensure the container is started.</div>"#
     } else {
         ""
     };
+    let moss_enabled_js = if !moss_disabled && edgenode_running() { "true" } else { "false" };
 
     let ssh_count  = ssh_keys.len();
     let ssh_plural = if ssh_count == 1 { "" } else { "s" };
@@ -1582,19 +1288,20 @@ fn build_manage_html(state: &AppState) -> String {
 .key-val{{flex:1;font-size:12px;font-family:monospace;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .btn-sm{{padding:5px 10px;font-size:12px}}
 .no-keys{{font-size:13px;color:#475569;padding:8px 0;margin-bottom:8px}}
-.happ-row{{padding:12px 0;border-bottom:1px solid #1e2030}}
-.happ-row:last-child{{border-bottom:none}}
-.happ-name{{font-size:14px;font-weight:600;color:#e2e8f0}}
-.happ-meta{{font-size:12px;color:#64748b;margin-top:4px}}
-.happ-actions{{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}}
-.badge-running{{background:#0d2618;border:1px solid #166534;color:#86efac}}
-.badge-paused{{background:#1a1d27;border:1px solid #3d4468;color:#94a3b8}}
-.badge-error{{background:#2d1515;border:1px solid #7f1d1d;color:#fca5a5}}
-.badge-installing{{background:#1e1d3f;border:1px solid #4338ca;color:#a5b4fc}}
-.tab-bar{{display:flex;gap:8px;margin-bottom:12px}}
-.tab-btn{{padding:6px 12px;border-radius:6px;border:1px solid #2d3148;background:#0f1117;color:#94a3b8;cursor:pointer;font-size:12px;font-family:inherit}}
-.tab-btn.active{{border-color:#6366f1;color:#e2e8f0;background:#1e1d3f}}
-.log-box{{background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:10px;font-size:11px;font-family:monospace;color:#94a3b8;max-height:200px;overflow:auto;white-space:pre-wrap;margin-top:8px}}
+.moss-output{{background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:12px;font-size:11px;font-family:monospace;color:#94a3b8;max-height:320px;overflow:auto;white-space:pre-wrap;margin-top:12px;min-height:80px}}
+.moss-stat{{margin-bottom:12px}}
+.moss-stat-label{{display:block;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}}
+.moss-stat-val{{background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:10px;font-size:11px;font-family:monospace;color:#94a3b8;max-height:140px;overflow:auto;white-space:pre-wrap;margin:0}}
+.moss-controls{{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}}
+.seed-banner{{display:none;padding:16px 32px;background:#1e1d3f;border-bottom:1px solid #4338ca}}
+.seed-banner.vis{{display:block}}
+.seed-banner p{{font-size:13px;color:#c7d2fe;line-height:1.6;margin-bottom:12px}}
+.seed-modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center;padding:20px}}
+.seed-modal.vis{{display:flex}}
+.seed-modal-card{{background:#13162a;border:1px solid #4338ca;border-radius:16px;padding:28px;max-width:520px;width:100%;max-height:90vh;overflow-y:auto}}
+.seed-modal-card h2{{font-size:20px;font-weight:700;color:#86efac;margin-bottom:10px}}
+.seed-modal-card p{{font-size:13px;color:#94a3b8;line-height:1.6;margin-bottom:12px}}
+.seed-display{{background:#0f1117;border:2px solid #6366f1;border-radius:12px;padding:20px 24px;margin:16px 0;font-size:15px;line-height:1.9;color:#e2e8f0;font-weight:500;word-spacing:4px}}
 </style></head><body style="align-items:flex-start;padding:0">
 <div class="card" style="max-width:680px;border-radius:0 0 16px 16px;min-height:100vh">
   <div class="page-hdr">
@@ -1607,6 +1314,10 @@ fn build_manage_html(state: &AppState) -> String {
   <div class="info-row">
     <div class="info-item">Mode <span id="info-hw">{hw_mode_display}</span></div>
     <div class="info-item">Unyt <span id="info-unyt">{unyt_badge_text}</span></div>
+  </div>
+  <div class="seed-banner" id="seed-migrate-banner">
+    <p><strong>Upgrade Security:</strong> This node does not have a recovery seed phrase yet. Generate one now so you can reset your password if you forget it.</p>
+    <button type="button" class="btn btn-primary" id="seed-generate-btn" onclick="generateSeedPhrase()">Generate Recovery Seed Phrase</button>
   </div>
 
   <!-- NODE NAME -->
@@ -1662,39 +1373,37 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
   </div>
 
-  <!-- HOSTED HAPPS -->
+  <!-- MOSS GROUPS -->
   <div class="section">
-    <div class="section-hdr" onclick="toggleSection('happs')">
-      <div class="section-title"><span>📦</span> Hosted hApps</div>
-      <span class="section-arrow" id="arr-happs">▼</span>
+    <div class="section-hdr" onclick="toggleSection('moss')">
+      <div class="section-title"><span>🌿</span> Moss Groups (Always-On)</div>
+      <span class="section-arrow" id="arr-moss">▼</span>
     </div>
-    <div class="section-body" id="sec-happs" style="display:block">
-      {happs_disabled_msg}
-      <div id="happs-list"><p style="font-size:13px;color:#475569">Loading hosted applications…</p></div>
-      <div style="margin-top:16px;padding-top:16px;border-top:1px solid #2d3148">
-        <div class="section-title" style="margin-bottom:12px;font-size:13px"><span>➕</span> Add hApp</div>
-        <div class="tab-bar">
-          <button class="tab-btn active" id="tab-paste" onclick="switchManifestTab('paste')">Paste manifest</button>
-          <button class="tab-btn" id="tab-manual" onclick="switchManifestTab('manual')">Manual entry</button>
+    <div class="section-body" id="sec-moss" style="display:block">
+      {moss_disabled_msg}
+      <div class="info-box" style="margin-bottom:14px">Join a Moss group to run always-on hApps on this EdgeNode. Use the invite link from your group administrator.</div>
+
+      <div class="section-title" style="margin-bottom:12px;font-size:13px"><span>🔗</span> Join a Group</div>
+      <label>Moss Group Invite Link *</label>
+      <input type="url" id="mossInviteLink" placeholder="https://…">
+      <label>Node Profile Name <span style="color:#475569;font-weight:400">(optional)</span></label>
+      <input type="text" id="mossProfileName" placeholder="Always-On Node">
+      <label>Node Description <span style="color:#475569;font-weight:400">(optional)</span></label>
+      <input type="text" id="mossNodeDescription" placeholder="Always-On Holo Edge Node">
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" id="moss-join-btn" onclick="joinMossGroup()">Join Group</button>
+      </div>
+
+      <div style="margin-top:24px;padding-top:16px;border-top:1px solid #2d3148">
+        <div class="section-title" style="margin-bottom:12px;font-size:13px"><span>📊</span> Moss Dashboard</div>
+        <div id="moss-dashboard"><p style="font-size:13px;color:#475569">Loading status…</p></div>
+        <div class="moss-controls">
+          <button class="btn btn-primary moss-ctrl-btn" id="moss-start-btn" onclick="mossStart()">Start Node</button>
+          <button class="btn btn-secondary moss-ctrl-btn" onclick="mossList()">View Groups</button>
+          <button class="btn btn-secondary moss-ctrl-btn" onclick="mossInfo()">View Node Info</button>
+          <button class="btn btn-secondary moss-ctrl-btn" onclick="mossApps()">View Installed Apps</button>
         </div>
-        <div id="manifest-paste">
-          <label>hApp manifest (JSON)</label>
-          <textarea id="manifestJson" rows="12" placeholder='{{"app":{{"name":"my_app",...}},"economics":{{...}}}}'></textarea>
-        </div>
-        <div id="manifest-manual" style="display:none">
-          <label>app.name</label><input type="text" id="mf-name" placeholder="my_app">
-          <label>app.version</label><input type="text" id="mf-version" placeholder="0.1.0">
-          <label>app.happUrl</label><input type="url" id="mf-happUrl" placeholder="https://.../app.happ">
-          <label>app.modifiers.networkSeed</label><input type="text" id="mf-networkSeed" placeholder="your-network-seed">
-          <label>economics.agreementHash</label><input type="text" id="mf-agreementHash" placeholder="uhCkk...">
-          <label>economics.payorUnytAgentPubKey</label><input type="text" id="mf-payor" placeholder="uhCAk...">
-          <label>economics.priceSheetHash (optional)</label><input type="text" id="mf-priceSheet" placeholder="">
-        </div>
-        <div id="validate-result" style="display:none;margin-top:10px"></div>
-        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn btn-secondary" onclick="validateManifest()" id="validate-btn">Validate</button>
-          <button class="btn btn-primary" onclick="deployManifest()" id="deploy-btn">Deploy</button>
-        </div>
+        <pre id="moss-output" class="moss-output">Command output will appear here.</pre>
       </div>
     </div>
   </div>
@@ -1779,6 +1488,15 @@ fn build_manage_html(state: &AppState) -> String {
   </div>
 </div>
 <div class="toast" id="toast"></div>
+<div class="seed-modal" id="seed-migrate-modal">
+  <div class="seed-modal-card">
+    <h2>Save Your Recovery Seed Phrase</h2>
+    <p>Write down these 12 words in order and store them somewhere safe. This is the only time they will be shown.</p>
+    <div class="err-box">⚠ Without your seed phrase, you cannot recover access to your node if you forget your password.</div>
+    <div class="seed-display" id="seed-migrate-display"></div>
+    <button type="button" class="btn btn-primary" id="seed-migrate-ack" onclick="ackSeedPhrase()" style="width:100%">I have saved my seed phrase</button>
+  </div>
+</div>
 <script>
 let curHw='{hw_mode}';
 
@@ -1790,161 +1508,128 @@ function toggleSection(id){{
   body.style.display=open?'none':'block';
   if(arr)arr.textContent=open?'▶':'▼';
 }}
-['name','hw','unyt','happs','adv','pw','upd'].forEach(id=>toggleSection(id));
-toggleSection('happs');
-document.getElementById('sec-happs').style.display='block';
-document.getElementById('arr-happs').textContent='▼';
+['name','hw','unyt','moss','adv','pw','upd'].forEach(id=>toggleSection(id));
+toggleSection('moss');
+document.getElementById('sec-moss').style.display='block';
+document.getElementById('arr-moss').textContent='▼';
 
-let manifestTab='paste';
-let happsPoll=null;
-
-function switchManifestTab(tab){{
-  manifestTab=tab;
-  document.getElementById('tab-paste').classList.toggle('active',tab==='paste');
-  document.getElementById('tab-manual').classList.toggle('active',tab==='manual');
-  document.getElementById('manifest-paste').style.display=tab==='paste'?'block':'none';
-  document.getElementById('manifest-manual').style.display=tab==='manual'?'block':'none';
-  if(tab==='manual')syncManualToJson();
-  else syncJsonToManual();
-}}
-
-function buildManifestFromFields(){{
-  const name=v('mf-name'),ver=v('mf-version'),url=v('mf-happUrl'),seed=v('mf-networkSeed');
-  const agreement=v('mf-agreementHash'),payor=v('mf-payor'),price=v('mf-priceSheet');
-  return JSON.stringify({{
-    app:{{name,version,happUrl:url,modifiers:{{networkSeed:seed,properties:""}}}},
-    economics:{{payorUnytAgentPubKey:payor,agreementHash:agreement,priceSheetHash:price}}
-  }},null,2);
-}}
-
-function syncManualToJson(){{
-  document.getElementById('manifestJson').value=buildManifestFromFields();
-}}
-
-function syncJsonToManual(){{
-  try{{
-    const m=JSON.parse(document.getElementById('manifestJson').value||'{{}}');
-    const app=m.app||{{}},mod=app.modifiers||{{}},eco=m.economics||{{}};
-    document.getElementById('mf-name').value=app.name||'';
-    document.getElementById('mf-version').value=app.version||'';
-    document.getElementById('mf-happUrl').value=app.happUrl||'';
-    document.getElementById('mf-networkSeed').value=mod.networkSeed||'';
-    document.getElementById('mf-agreementHash').value=eco.agreementHash||'';
-    document.getElementById('mf-payor').value=eco.payorUnytAgentPubKey||'';
-    document.getElementById('mf-priceSheet').value=eco.priceSheetHash||'';
-  }}catch(e){{}}
-}}
-
-function getManifest(){{
-  if(manifestTab==='manual')return buildManifestFromFields();
-  return document.getElementById('manifestJson').value.trim();
-}}
-
-function statusBadge(s){{
-  const m={{running:'badge-running',paused:'badge-paused',error:'badge-error',installing:'badge-installing'}};
-  const labels={{running:'Running',paused:'Paused',error:'Error',installing:'Installing'}};
-  const cls=m[s]||'badge-gray';
-  const lbl=labels[s]||s;
-  return `<span class="section-badge ${{cls}}">${{lbl}}</span>`;
-}}
-
-async function loadHapps(){{
-  try{{
-    const r=await fetch('/manage/happs',{{credentials:'same-origin'}});
-    if(r.status===401){{location.href='/login';return;}}
-    const data=await r.json();
-    const el=document.getElementById('happs-list');
-    if(!data.happs||!data.happs.length){{
-      el.innerHTML='<p style="font-size:13px;color:#475569">No hApps hosted yet. Add one below.</p>';
-      return;
-    }}
-    el.innerHTML=data.happs.map(h=>{{
-      const actions=[];
-      if(h.status==='running')actions.push(`<button class="btn btn-secondary btn-sm" onclick="happAction('disable','${{esc(h.app_id)}}','${{esc(h.id)}}')">Pause</button>`);
-      if(h.status==='paused')actions.push(`<button class="btn btn-secondary btn-sm" onclick="happAction('enable','${{esc(h.app_id)}}','${{esc(h.id)}}')">Resume</button>`);
-      if(h.status!=='installing')actions.push(`<button class="btn btn-danger btn-sm" onclick="happAction('uninstall','${{esc(h.app_id)}}','${{esc(h.id)}}')">Remove</button>`);
-      actions.push(`<button class="btn btn-secondary btn-sm" onclick="showHappLogs('${{esc(h.id)}}')">Logs</button>`);
-      const err=h.last_error?`<div class="err-box" style="margin-top:8px;font-size:11px">${{esc(h.last_error)}}</div>`:'';
-      const logs=`<div id="logs-${{esc(h.id)}}" style="display:none"></div>`;
-      return `<div class="happ-row"><div class="happ-name">${{esc(h.app_name)}} <span style="color:#64748b;font-weight:400">v${{esc(h.app_version)}}</span> ${{statusBadge(h.status)}}</div><div class="happ-meta">Deployed: ${{esc(h.deployed_duration||'—')}} &nbsp;·&nbsp; ID: <code style="font-size:11px">${{esc(h.app_id||'(pending)')}}</code></div>${{err}}<div class="happ-actions">${{actions.join('')}}</div>${{logs}}</div>`;
-    }}).join('');
-    const installing=data.happs.some(h=>h.status==='installing');
-    if(installing&&!happsPoll)happsPoll=setInterval(loadHapps,4000);
-    else if(!installing&&happsPoll){{clearInterval(happsPoll);happsPoll=null;}}
-  }}catch(e){{
-    document.getElementById('happs-list').innerHTML='<p class="err-box">Failed to load hApps: '+esc(e.message)+'</p>';
-  }}
-}}
+const mossEnabled={moss_enabled_js};
+let mossBusy=false;
 
 function esc(s){{return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}}
 
-async function happAction(action,appId,deploymentId){{
-  if(action==='uninstall'&&!confirm('Remove this hApp from the node?'))return;
-  const paths={{enable:'/manage/happs/enable',disable:'/manage/happs/disable',uninstall:'/manage/happs/uninstall'}};
-  try{{
-    const body=action==='uninstall'?{{deploymentId,appId}}:{{appId}};
-    await api(paths[action],body);
-    toast(action==='uninstall'?'hApp removed':(action==='enable'?'hApp resumed':'hApp paused'),true);
-    loadHapps();
-  }}catch(e){{toast('Error: '+e.message,false);}}
+function setMossOutput(text){{
+  const el=document.getElementById('moss-output');
+  if(el)el.textContent=text||'(no output)';
 }}
 
-async function showHappLogs(id){{
-  const el=document.getElementById('logs-'+id);
-  if(!el)return;
-  if(el.style.display==='block'){{el.style.display='none';return;}}
-  el.style.display='block';
-  el.innerHTML='<p style="color:#64748b;font-size:12px">Loading logs…</p>';
-  try{{
-    const r=await fetch('/manage/happs/logs?id='+encodeURIComponent(id),{{credentials:'same-origin'}});
-    const data=await r.json();
-    const text='=== Install log ===\\n'+(data.install_log||'')+'\\n\\n=== Holochain log (tail) ===\\n'+(data.holochain_log||'')+'\\n\\n=== Log-sender log (tail) ===\\n'+(data.log_sender_log||'');
-    el.innerHTML=`<div class="log-box" id="logbox-${{id}}">${{esc(text)}}</div><button class="btn btn-secondary btn-sm" style="margin-top:8px" onclick="copyLog('logbox-${{id}}')">Copy logs</button>`;
-  }}catch(e){{el.innerHTML='<p class="err-box">'+esc(e.message)+'</p>';}}
+function setMossControlsDisabled(disabled){{
+  document.querySelectorAll('.moss-ctrl-btn,#moss-join-btn').forEach(btn=>{{btn.disabled=disabled;}});
 }}
 
-function copyLog(id){{
-  const el=document.getElementById(id);
-  if(!el)return;
-  navigator.clipboard.writeText(el.textContent).then(()=>toast('Copied to clipboard',true)).catch(()=>toast('Copy failed',false));
+async function mossFetch(method,path,payload){{
+  const opts={{method,credentials:'same-origin'}};
+  if(payload!==undefined){{
+    opts.headers={{'Content-Type':'application/json'}};
+    opts.body=JSON.stringify(payload);
+  }}
+  const r=await fetch(path,opts);
+  if(r.status===401){{location.href='/login';throw new Error('Session expired — please log in again');}}
+  const text=await r.text();
+  if(!r.ok){{
+    try{{const j=JSON.parse(text);throw new Error(j.error||text);}}catch(e){{if(e.message)throw e;throw new Error(text||'Server error '+r.status);}}
+  }}
+  try{{return JSON.parse(text);}}catch{{return {{}};}}
 }}
 
-async function validateManifest(){{
-  const raw=getManifest();
-  if(!raw)return toast('Enter or paste a manifest first',false);
-  let parsed;
-  try{{parsed=JSON.parse(raw);}}catch(e){{return toast('Invalid JSON: '+e.message,false);}}
-  const btn=document.getElementById('validate-btn');
-  const res=document.getElementById('validate-result');
-  btn.disabled=true;
+async function mossAction(label,method,path,payload){{
+  if(mossBusy)return;
+  mossBusy=true;
+  setMossControlsDisabled(true);
+  setMossOutput('Running '+label+'…');
   try{{
-    const data=await api('/manage/happs/validate',{{manifest:parsed}});
-    res.style.display='block';
-    res.className=data.valid?'ok-box':'err-box';
-    res.textContent=data.output||'(no output)';
+    const data=await mossFetch(method,path,payload);
+    setMossOutput(data.output||'(no output)');
+    if(path.includes('/info')||path.includes('/apps')||path.includes('/start'))loadMossDashboard();
+    return data;
   }}catch(e){{
-    res.style.display='block';res.className='err-box';res.textContent=e.message;
-  }}finally{{btn.disabled=false;}}
+    setMossOutput('Error: '+e.message);
+    toast('Error: '+e.message,false);
+    throw e;
+  }}finally{{
+    mossBusy=false;
+    setMossControlsDisabled(false);
+  }}
 }}
 
-async function deployManifest(){{
-  const raw=getManifest();
-  if(!raw)return toast('Enter or paste a manifest first',false);
-  let parsed;
-  try{{parsed=JSON.parse(raw);}}catch(e){{return toast('Invalid JSON: '+e.message,false);}}
-  const btn=document.getElementById('deploy-btn');
-  btn.disabled=true;btn.textContent='Deploying…';
+async function loadMossDashboard(){{
+  const el=document.getElementById('moss-dashboard');
+  if(!el||!mossEnabled)return;
+  el.innerHTML='<p style="font-size:13px;color:#475569">Loading status…</p>';
   try{{
-    await api('/manage/happs/deploy',{{manifest:parsed}});
-    toast('Deploy started — watch status below',true);
-    document.getElementById('validate-result').style.display='none';
-    loadHapps();
-    if(!happsPoll)happsPoll=setInterval(loadHapps,4000);
-  }}catch(e){{toast('Error: '+e.message,false);}}
-  finally{{btn.disabled=false;btn.textContent='Deploy';}}
+    const [info,apps]=await Promise.all([
+      mossFetch('GET','/manage/moss/info'),
+      mossFetch('GET','/manage/moss/apps'),
+    ]);
+    const infoText=(info.output||'—').trim();
+    const appsText=(apps.output||'—').trim();
+    el.innerHTML=`
+      <div class="moss-stat">
+        <span class="moss-stat-label">Node status</span>
+        <pre class="moss-stat-val">${{esc(infoText)}}</pre>
+      </div>
+      <div class="moss-stat">
+        <span class="moss-stat-label">Installed apps</span>
+        <pre class="moss-stat-val">${{esc(appsText)}}</pre>
+      </div>`;
+  }}catch(e){{
+    el.innerHTML='<p class="err-box" style="margin:0">'+esc(e.message)+'</p>';
+  }}
 }}
 
-loadHapps();
+async function joinMossGroup(){{
+  if(!mossEnabled)return toast('Moss Groups unavailable in current mode',false);
+  if(mossBusy)return;
+  const invite=v('mossInviteLink');
+  if(!invite)return toast('Moss Group invite link is required',false);
+  const btn=document.getElementById('moss-join-btn');
+  const origText=btn.textContent;
+  mossBusy=true;
+  setMossControlsDisabled(true);
+  btn.textContent='Joining…';
+  setMossOutput('Joining Moss group…');
+  try{{
+    const payload={{invite_link:invite}};
+    const profile=v('mossProfileName');
+    const desc=v('mossNodeDescription');
+    if(profile)payload.profile_name=profile;
+    if(desc)payload.node_description=desc;
+    const data=await mossFetch('POST','/manage/moss/join',payload);
+    setMossOutput(data.output||'(no output)');
+    toast('Joined Moss group',true);
+    loadMossDashboard();
+  }}catch(e){{
+    setMossOutput('Error: '+e.message);
+    toast('Error: '+e.message,false);
+  }}finally{{
+    mossBusy=false;
+    btn.textContent=origText;
+    if(mossEnabled)setMossControlsDisabled(false);
+  }}
+}}
+
+function mossStart(){{mossAction('Start Node','POST','/manage/moss/start');}}
+function mossList(){{mossAction('View Groups','GET','/manage/moss/list');}}
+function mossInfo(){{mossAction('View Node Info','GET','/manage/moss/info');}}
+function mossApps(){{mossAction('View Installed Apps','GET','/manage/moss/apps');}}
+
+if(mossEnabled){{
+  loadMossDashboard();
+}}else{{
+  setMossControlsDisabled(true);
+  const dash=document.getElementById('moss-dashboard');
+  if(dash)dash.innerHTML='<p style="font-size:13px;color:#475569">Dashboard unavailable until EdgeNode is running in Standard mode.</p>';
+}}
 
 const ORIGINAL_NODE_NAME='{node_name_js}';
 
@@ -1989,6 +1674,42 @@ async function api(path,payload){{
   }}
   try{{return JSON.parse(text);}}catch{{return {{}};}}
 }}
+
+async function loadNodeStatus(){{
+  try{{
+    const r=await fetch('/manage/status',{{credentials:'same-origin'}});
+    if(r.status===401){{location.href='/login';return;}}
+    if(!r.ok)return;
+    const data=await r.json();
+    if(data.has_seed_phrase===false){{
+      const banner=document.getElementById('seed-migrate-banner');
+      if(banner)banner.classList.add('vis');
+    }}
+  }}catch(e){{}}
+}}
+
+async function generateSeedPhrase(){{
+  const btn=document.getElementById('seed-generate-btn');
+  if(btn){{btn.disabled=true;btn.textContent='Generating…';}}
+  try{{
+    const data=await api('/manage/auth/generate_seed',{{}});
+    if(!data.seed_phrase)throw new Error('Server did not return a seed phrase');
+    document.getElementById('seed-migrate-display').textContent=data.seed_phrase;
+    document.getElementById('seed-migrate-modal').classList.add('vis');
+    const banner=document.getElementById('seed-migrate-banner');
+    if(banner)banner.classList.remove('vis');
+  }}catch(e){{
+    toast('Error: '+e.message,false);
+    if(btn){{btn.disabled=false;btn.textContent='Generate Recovery Seed Phrase';}}
+  }}
+}}
+
+function ackSeedPhrase(){{
+  document.getElementById('seed-migrate-modal').classList.remove('vis');
+  toast('Recovery seed phrase saved',true);
+}}
+
+loadNodeStatus();
 
 function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
 
@@ -2093,7 +1814,8 @@ async function triggerUpdate(){{
         unyt_badge_text      = unyt_badge_text,
         unyt_agent_id_escaped = html_escape(&unyt_agent_id),
         log_sender_endpoint_escaped = html_escape(&log_sender_endpoint),
-        happs_disabled_msg     = happs_disabled_msg,
+        moss_disabled_msg      = moss_disabled_msg,
+        moss_enabled_js        = moss_enabled_js,
         wt_hostname          = html_escape(&wt_hostname),
         wt_effective_image   = html_escape(&wt_effective_image),
         wt_entrypoint_display = html_escape(&wt_entrypoint_display),
@@ -2109,15 +1831,22 @@ fn handle_submit(
     stream: &mut TcpStream,
     req: &Req,
     state: &AppState,
-    _auth_hash: &Arc<Mutex<String>>,
+    auth_hash: &Arc<Mutex<String>>,
 ) {
+    if state.onboarded.load(Ordering::Relaxed) {
+        send_json_err(stream, 409, "Node is already onboarded"); return;
+    }
+
     let body           = &req.body;
     let node_name      = json_str(body, "nodeName");
     let ssh_key        = json_str(body, "sshKey");
     let hw_mode        = json_str(body, "hwMode");
     let unyt_agent_id  = json_str(body, "unytAgentId");
+    let password       = json_str(body, "password");
 
     if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
+    if password.is_empty() { send_json_err(stream, 400, "password is required"); return; }
+    if password.len() < 8 { send_json_err(stream, 400, "Password must be at least 8 characters"); return; }
     if let Some(msg) = validate_unyt_agent_id(unyt_agent_id) {
         send_json_err(stream, 400, &msg); return;
     }
@@ -2156,6 +1885,15 @@ fn handle_submit(
     // ── Quadlets ─────────────────────────────────────────────────────────────
     let hw_mode_val = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
 
+    let seed_phrase = match generate_seed_phrase() {
+        Ok(p) => p,
+        Err(e) => { send_json_err(stream, 500, &e); return; }
+    };
+    let seed_hash = hash_password(&seed_phrase);
+    let pw_hash = hash_password(password);
+    store_auth_hash(&pw_hash);
+    *auth_hash.lock().unwrap() = pw_hash;
+
     *state.node_name.lock().unwrap()     = node_name.to_string();
     *state.hw_mode.lock().unwrap()       = hw_mode_val.to_string();
     *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
@@ -2166,12 +1904,71 @@ fn handle_submit(
     kv.insert("node_name".into(), node_name.to_string());
     kv.insert("hw_mode".into(), hw_mode_val.to_string());
     kv.insert("unyt_agent_id".into(), unyt_agent_id.to_string());
+    kv.insert("seed_hash".into(), seed_hash);
     write_state_file(&kv);
 
     sync_container_services(hw_mode_val, state);
 
     eprintln!("[onboard] Complete. node={} hw={} unyt={}", node_name, hw_mode, if unyt_agent_id.is_empty() { "(none)" } else { "set" });
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","seed_phrase":"{}"}}"#,
+        json_escape(&seed_phrase)
+    ));
+}
+
+fn handle_auth_recover(
+    stream: &mut TcpStream,
+    req: &Req,
+    auth_hash: &Arc<Mutex<String>>,
+) {
+    let seed_input   = json_str(&req.body, "seed_phrase");
+    let new_password = json_str(&req.body, "new_password");
+
+    if seed_input.is_empty() || new_password.is_empty() {
+        send_json_err(stream, 400, "seed_phrase and new_password are required"); return;
+    }
+    if new_password.len() < 8 {
+        send_json_err(stream, 400, "Password must be at least 8 characters"); return;
+    }
+
+    let stored_seed_hash = read_state_file().get("seed_hash").cloned().unwrap_or_default();
+    if stored_seed_hash.is_empty() {
+        send_json_err(stream, 400, "Password recovery is not available for this node"); return;
+    }
+
+    let normalized = match normalize_seed_phrase(seed_input) {
+        Ok(p) => p,
+        Err(e) => { send_json_err(stream, 400, &e); return; }
+    };
+    if !verify_password(&normalized, &stored_seed_hash) {
+        send_json_err(stream, 401, "Invalid seed phrase"); return;
+    }
+
+    let new_hash = hash_password(new_password);
+    store_auth_hash(&new_hash);
+    *auth_hash.lock().unwrap() = new_hash;
+
+    eprintln!("[auth] Password recovered via seed phrase");
     send_json_ok(stream, r#"{"status":"ok"}"#);
+}
+
+fn handle_auth_generate_seed(stream: &mut TcpStream) {
+    if has_seed_phrase() {
+        send_json_err(stream, 400, "Recovery seed phrase already configured"); return;
+    }
+
+    let seed_phrase = match generate_seed_phrase() {
+        Ok(p) => p,
+        Err(e) => { send_json_err(stream, 500, &e); return; }
+    };
+    let seed_hash = hash_password(&seed_phrase);
+    update_state_key("seed_hash", &seed_hash);
+
+    eprintln!("[auth] Recovery seed phrase generated for legacy node");
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","seed_phrase":"{}"}}"#,
+        json_escape(&seed_phrase)
+    ));
 }
 
 fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
@@ -2185,19 +1982,19 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
         .map(|k| format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>().join(",");
     let log_sender_endpoint = state.log_sender_endpoint.lock().unwrap().clone();
-    let happs_count = read_deployments().len();
     let edgenode_up = edgenode_running();
+    let has_seed = has_seed_phrase();
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"happs_count":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"has_seed_phrase":{}}}"#,
         VERSION,
         node_name.replace('\\', "\\\\").replace('"', "\\\""),
         hw_mode,
         unyt_agent_id.replace('\\', "\\\\").replace('"', "\\\""),
         log_sender_endpoint.replace('\\', "\\\\").replace('"', "\\\""),
         if edgenode_up { "true" } else { "false" },
-        happs_count,
         wt_hostname.replace('\\', "\\\\").replace('"', "\\\""),
-        keys.len(), keys_json, uptime
+        keys.len(), keys_json, uptime,
+        if has_seed { "true" } else { "false" }
     ));
 }
 
@@ -2382,194 +2179,72 @@ fn handle_log_sender(
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
-fn handle_happs_list(stream: &mut TcpStream, state: &AppState) {
-    let deployments = read_deployments();
-    let live = list_installed_happs().unwrap_or_default();
-    let mut items = String::new();
-    for d in &deployments {
-        let status = reconcile_deployment_status(d, &live);
-        let duration = deployed_duration(&d.deployed_at);
-        if !items.is_empty() { items.push(','); }
-        items.push_str(&format!(
-            r#"{{"id":"{}","app_name":"{}","app_version":"{}","app_id":"{}","status":"{}","deployed_at":"{}","deployed_duration":"{}","last_error":"{}"}}"#,
-            json_escape(&d.id),
-            json_escape(&d.app_name),
-            json_escape(&d.app_version),
-            json_escape(&d.app_id),
-            json_escape(&status),
-            json_escape(&d.deployed_at),
-            json_escape(&duration),
-            json_escape(&d.last_error),
-        ));
-    }
-    let hw = state.hw_mode.lock().unwrap().clone();
-    let edgenode_up = edgenode_running();
-    let unyt = state.unyt_agent_id.lock().unwrap().clone();
-    let endpoint = state.log_sender_endpoint.lock().unwrap().clone();
-    let accounting_ready = !unyt.is_empty() && !endpoint.is_empty();
-    send_json_ok(stream, &format!(
-        r#"{{"happs":[{}],"hw_mode":"{}","edgenode_running":{},"accounting_ready":{},"unyt_configured":{},"log_sender_configured":{}}}"#,
-        items,
-        json_escape(&hw),
-        if edgenode_up { "true" } else { "false" },
-        if accounting_ready { "true" } else { "false" },
-        if unyt.is_empty() { "false" } else { "true" },
-        if endpoint.is_empty() { "false" } else { "true" },
-    ));
-}
-
-fn handle_happs_validate(stream: &mut TcpStream, state: &AppState, req: &Req) {
-    if let Some(msg) = happs_prereq_error(state) {
+fn handle_moss_join(stream: &mut TcpStream, state: &AppState, req: &Req) {
+    if let Some(msg) = moss_prereq_error(state) {
         send_json_err(stream, 400, &msg); return;
     }
-    let manifest = json_raw_value(&req.body, "manifest");
-    if manifest.is_empty() {
-        send_json_err(stream, 400, "manifest is required"); return;
+    let invite_link = json_str(&req.body, "invite_link");
+    if invite_link.is_empty() {
+        send_json_err(stream, 400, "invite_link is required"); return;
     }
-    let name = manifest_app_name(&manifest);
-    let version = manifest_app_version(&manifest);
-    if name.is_empty() || version.is_empty() {
-        send_json_err(stream, 400, "manifest must include app.name and app.version"); return;
-    }
-    let container_path = match write_happ_manifest(&name, &version, &manifest) {
-        Ok(p) => p,
-        Err(e) => { send_json_err(stream, 500, &e); return; }
-    };
-    let (ok, output) = validate_happ_manifest(&container_path);
-    if ok {
-        send_json_ok(stream, &format!(
-            r#"{{"valid":true,"output":"{}"}}"#,
-            json_escape(output.trim())
-        ));
-    } else {
-        send_json_ok(stream, &format!(
-            r#"{{"valid":false,"output":"{}"}}"#,
-            json_escape(output.trim())
-        ));
-    }
-}
-
-fn handle_happs_deploy(stream: &mut TcpStream, state: &AppState, req: &Req) {
-    if let Some(msg) = happs_prereq_error(state) {
-        send_json_err(stream, 400, &msg); return;
-    }
-    let manifest = json_raw_value(&req.body, "manifest");
-    if manifest.is_empty() {
-        send_json_err(stream, 400, "manifest is required"); return;
-    }
-    let name = manifest_app_name(&manifest);
-    let version = manifest_app_version(&manifest);
-    if name.is_empty() || version.is_empty() {
-        send_json_err(stream, 400, "manifest must include app.name and app.version"); return;
-    }
-    if manifest_has_economics_agreement(&manifest) {
-        let unyt = state.unyt_agent_id.lock().unwrap().clone();
-        let endpoint = state.log_sender_endpoint.lock().unwrap().clone();
-        if unyt.is_empty() || endpoint.is_empty() {
-            send_json_err(stream, 400, "Manifest includes economics.agreementHash but Unyt Agent ID and Log Collector URL must be configured in HoloFuel first."); return;
+    let profile_name = json_str(&req.body, "profile_name");
+    let node_description = json_str(&req.body, "node_description");
+    let cmd = format!(
+        "wdocker join-group edge-node {}",
+        shell_single_quote(invite_link)
+    );
+    let profile = if profile_name.is_empty() { None } else { Some(profile_name) };
+    let desc = if node_description.is_empty() { None } else { Some(node_description) };
+    match run_wdocker(&cmd, profile, desc) {
+        Ok(out) => {
+            eprintln!("[moss] join-group completed");
+            send_wdocker_ok(stream, &out);
         }
-    }
-    let container_path = match write_happ_manifest(&name, &version, &manifest) {
-        Ok(p) => p,
-        Err(e) => { send_json_err(stream, 500, &e); return; }
-    };
-    let (valid, val_out) = validate_happ_manifest(&container_path);
-    if !valid {
-        send_json_err(stream, 400, &format!("Manifest validation failed: {}", val_out.trim())); return;
-    }
-    let id = generate_deployment_id();
-    let deployment = Deployment {
-        id: id.clone(),
-        app_name: name.clone(),
-        app_version: version.clone(),
-        app_id: String::new(),
-        status: "installing".into(),
-        deployed_at: String::new(),
-        last_error: String::new(),
-        manifest: manifest.clone(),
-    };
-    let mut deployments = read_deployments();
-    upsert_deployment(&mut deployments, deployment);
-    let node_name = state.node_name.lock().unwrap().clone();
-    spawn_install_job(id.clone(), container_path, node_name);
-    eprintln!("[happs] Deploy started for {} v{} (id={})", name, version, id);
-    send_json_ok(stream, &format!(
-        r#"{{"status":"installing","deployment_id":"{}"}}"#,
-        json_escape(&id)
-    ));
-}
-
-fn handle_happs_enable(stream: &mut TcpStream, state: &AppState, req: &Req) {
-    if let Some(msg) = happs_prereq_error(state) {
-        send_json_err(stream, 400, &msg); return;
-    }
-    let app_id = json_str(&req.body, "appId");
-    if app_id.is_empty() {
-        send_json_err(stream, 400, "appId is required"); return;
-    }
-    match enable_happ(app_id) {
-        Ok(out) => send_json_ok(stream, &format!(r#"{{"status":"ok","output":"{}"}}"#, json_escape(out.trim()))),
         Err(e) => send_json_err(stream, 500, &e),
     }
 }
 
-fn handle_happs_disable(stream: &mut TcpStream, state: &AppState, req: &Req) {
-    if let Some(msg) = happs_prereq_error(state) {
+fn handle_moss_start(stream: &mut TcpStream, state: &AppState) {
+    if let Some(msg) = moss_prereq_error(state) {
         send_json_err(stream, 400, &msg); return;
     }
-    let app_id = json_str(&req.body, "appId");
-    if app_id.is_empty() {
-        send_json_err(stream, 400, "appId is required"); return;
-    }
-    match disable_happ(app_id) {
-        Ok(out) => send_json_ok(stream, &format!(r#"{{"status":"ok","output":"{}"}}"#, json_escape(out.trim()))),
+    match run_wdocker("wdocker start edge-node", None, None) {
+        Ok(out) => {
+            eprintln!("[moss] start completed");
+            send_wdocker_ok(stream, &out);
+        }
         Err(e) => send_json_err(stream, 500, &e),
     }
 }
 
-fn handle_happs_uninstall(stream: &mut TcpStream, state: &AppState, req: &Req) {
-    if let Some(msg) = happs_prereq_error(state) {
+fn handle_moss_list(stream: &mut TcpStream, state: &AppState) {
+    if let Some(msg) = moss_prereq_error(state) {
         send_json_err(stream, 400, &msg); return;
     }
-    let deployment_id = json_str(&req.body, "deploymentId");
-    let app_id = json_str(&req.body, "appId");
-    if deployment_id.is_empty() {
-        send_json_err(stream, 400, "deploymentId is required"); return;
+    match run_wdocker("wdocker list-groups edge-node", None, None) {
+        Ok(out) => send_wdocker_ok(stream, &out),
+        Err(e) => send_json_err(stream, 500, &e),
     }
-    let mut deployments = read_deployments();
-    let stored_app_id = deployments.iter()
-        .find(|d| d.id == deployment_id)
-        .map(|d| d.app_id.clone())
-        .unwrap_or_default();
-    let target = if !app_id.is_empty() { app_id.to_string() } else { stored_app_id };
-    if !target.is_empty() {
-        if let Err(e) = uninstall_happ(&target) {
-            send_json_err(stream, 500, &e); return;
-        }
-    }
-    remove_deployment(&mut deployments, deployment_id);
-    eprintln!("[happs] Uninstalled {}", target);
-    send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
-fn handle_happs_logs(stream: &mut TcpStream, state: &AppState, query: &str) {
-    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
-        send_json_err(stream, 400, "hApp logs unavailable in Wind Tunnel mode"); return;
+fn handle_moss_info(stream: &mut TcpStream, state: &AppState) {
+    if let Some(msg) = moss_prereq_error(state) {
+        send_json_err(stream, 400, &msg); return;
     }
-    let id = get_query_param(query, "id");
-    let install_log = if id.is_empty() {
-        "(no deployment id specified)".into()
-    } else {
-        read_happ_install_log(&id)
-    };
-    let holochain_log = tail_container_log("/data/logs/holochain.log", 80);
-    let log_sender_log = tail_container_log("/data/logs/log-sender.log", 40);
-    send_json_ok(stream, &format!(
-        r#"{{"install_log":"{}","holochain_log":"{}","log_sender_log":"{}"}}"#,
-        json_escape(&install_log),
-        json_escape(&holochain_log),
-        json_escape(&log_sender_log),
-    ));
+    match run_wdocker("wdocker info edge-node", None, None) {
+        Ok(out) => send_wdocker_ok(stream, &out),
+        Err(e) => send_json_err(stream, 500, &e),
+    }
+}
+
+fn handle_moss_apps(stream: &mut TcpStream, state: &AppState) {
+    if let Some(msg) = moss_prereq_error(state) {
+        send_json_err(stream, 400, &msg); return;
+    }
+    match run_wdocker("wdocker list-apps edge-node", None, None) {
+        Ok(out) => send_wdocker_ok(stream, &out),
+        Err(e) => send_json_err(stream, 500, &e),
+    }
 }
 
 fn handle_update(stream: &mut TcpStream) {
@@ -2585,7 +2260,7 @@ fn main() {
     eprintln!("[node-manager] Starting v{}", VERSION);
 
     let ap_mode = env::args().any(|a| a == "--ap-mode");
-    let auth_hash = Arc::new(Mutex::new(load_or_create_auth()));
+    let auth_hash = Arc::new(Mutex::new(load_auth()));
     let state = Arc::new(AppState::new(ap_mode));
 
     if state.onboarded.load(Ordering::Relaxed) {
@@ -2609,8 +2284,8 @@ fn main() {
     let repo = env::var(UPDATE_REPO_ENV).unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
     spawn_update_checker(repo);
 
-    let listener = TcpListener::bind("0.0.0.0:8080").expect("Cannot bind to 0.0.0.0:8080");
-    eprintln!("[node-manager] Listening on http://0.0.0.0:8080");
+    let listener = TcpListener::bind("0.0.0.0:80").expect("Cannot bind to 0.0.0.0:80");
+    eprintln!("[node-manager] Listening on http://0.0.0.0:80");
 
     for stream in listener.incoming() {
         let mut stream = match stream { Ok(s) => s, Err(_) => continue };
@@ -2659,6 +2334,10 @@ fn main() {
 
                 ("POST", "/submit") => {
                     handle_submit(&mut stream, &req, &state, &auth_hash);
+                },
+
+                ("POST", "/manage/auth/recover") => {
+                    handle_auth_recover(&mut stream, &req, &auth_hash);
                 },
 
                 // ── Authenticated routes ───────────────────────────────────────
@@ -2710,59 +2389,43 @@ fn main() {
                     }
                 },
 
-                ("GET", "/manage/happs") => {
+                ("POST", "/manage/moss/join") => {
                     if !is_authenticated(&req, &state) {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
-                        handle_happs_list(&mut stream, &state);
+                        handle_moss_join(&mut stream, &state, &req);
                     }
                 },
 
-                ("GET", "/manage/happs/logs") => {
+                ("POST", "/manage/moss/start") => {
                     if !is_authenticated(&req, &state) {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
-                        handle_happs_logs(&mut stream, &state, &req.query);
+                        handle_moss_start(&mut stream, &state);
                     }
                 },
 
-                ("POST", "/manage/happs/validate") => {
+                ("GET", "/manage/moss/list") => {
                     if !is_authenticated(&req, &state) {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
-                        handle_happs_validate(&mut stream, &state, &req);
+                        handle_moss_list(&mut stream, &state);
                     }
                 },
 
-                ("POST", "/manage/happs/deploy") => {
+                ("GET", "/manage/moss/info") => {
                     if !is_authenticated(&req, &state) {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
-                        handle_happs_deploy(&mut stream, &state, &req);
+                        handle_moss_info(&mut stream, &state);
                     }
                 },
 
-                ("POST", "/manage/happs/enable") => {
+                ("GET", "/manage/moss/apps") => {
                     if !is_authenticated(&req, &state) {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
-                        handle_happs_enable(&mut stream, &state, &req);
-                    }
-                },
-
-                ("POST", "/manage/happs/disable") => {
-                    if !is_authenticated(&req, &state) {
-                        send_json_err(&mut stream, 401, "Not authenticated");
-                    } else {
-                        handle_happs_disable(&mut stream, &state, &req);
-                    }
-                },
-
-                ("POST", "/manage/happs/uninstall") => {
-                    if !is_authenticated(&req, &state) {
-                        send_json_err(&mut stream, 401, "Not authenticated");
-                    } else {
-                        handle_happs_uninstall(&mut stream, &state, &req);
+                        handle_moss_apps(&mut stream, &state);
                     }
                 },
 
@@ -2795,6 +2458,14 @@ fn main() {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
                         handle_password(&mut stream, &req, &auth_hash);
+                    }
+                },
+
+                ("POST", "/manage/auth/generate_seed") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_auth_generate_seed(&mut stream);
                     }
                 },
 
