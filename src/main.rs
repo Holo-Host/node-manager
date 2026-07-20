@@ -1834,7 +1834,7 @@ fn handle_submit(
     auth_hash: &Arc<Mutex<String>>,
 ) {
     if state.onboarded.load(Ordering::Relaxed) {
-        send_json_err(stream, 409, "Node is already onboarded"); return;
+        send_json_err(stream, 403, "Node is already onboarded"); return;
     }
 
     let body           = &req.body;
@@ -2487,10 +2487,49 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_unyt_agent_id, validate_wt_hostname};
+    use super::{AppState, Req, handle_submit, validate_unyt_agent_id, validate_wt_hostname};
+    use std::{
+        io::Read,
+        net::{TcpListener, TcpStream},
+        sync::{Arc, Mutex},
+    };
 
     const USER_AGENT_ID: &str = "uhCAkEgwsRQmYpVUGWSdNyziQgQZu1sfXVlVIR0sbEZJBd5N6wYr_";
     const HOLOCHAIN_EXAMPLE: &str = "uhCAkJ9p-IlfMpeP_HeygQt2jqHDXu4-YRAQezq3L0m9nz3wCa0Mh";
+
+    fn submit_status_for_state(onboarded: bool) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let req = Req {
+            method: "POST".into(),
+            path: "/submit".into(),
+            headers: String::new(),
+            body: r#"{"nodeName":"node","password":"password123","hwMode":"STANDARD"}"#.into(),
+        };
+        let state = AppState::new(false);
+        if onboarded {
+            state.onboarded.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        handle_submit(&mut stream, &req, &state, &Arc::new(Mutex::new(String::new())));
+        drop(stream);
+
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        let response = String::from_utf8_lossy(&response);
+        response
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse::<u16>()
+            .unwrap_or(0)
+    }
 
     #[test]
     fn empty_agent_id_is_valid() {
@@ -2537,5 +2576,15 @@ mod tests {
     fn wt_hostname_rejects_too_long_node_name() {
         let name = "a".repeat(51);
         assert!(validate_wt_hostname(&name).is_some());
+    }
+
+    #[test]
+    fn onboarded_nodes_reject_submit_with_forbidden_status() {
+        assert_eq!(submit_status_for_state(true), 403);
+    }
+
+    #[test]
+    fn new_nodes_can_still_submit() {
+        assert_eq!(submit_status_for_state(false), 200);
     }
 }
