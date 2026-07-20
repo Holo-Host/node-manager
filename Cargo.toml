@@ -1,10 +1,10 @@
 [package]
 name = "node-manager"
-version = "6.2.2"
+version = "6.2.4"
 edition = "2021"
 
-# No external dependencies — only std.
-# This is intentional: every dependency adds to binary size and audit surface.
+[dependencies]
+bip39 = "2"
 
 [profile.release]
 opt-level = "z"       # optimise for size, not speed
