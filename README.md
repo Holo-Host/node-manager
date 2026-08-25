@@ -268,6 +268,9 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 | `POST` | `/manage/nodename` | session | Change node name and system hostname |
 | `POST` | `/manage/unyt` | session | Save or update Unyt Agent ID |
 | `POST` | `/manage/log-sender` | session | Save Log Collector URL (`LOG_SENDER_ENDPOINT`) |
+| `GET` | `/manage/apps` | session | List hApps installed through Node Manager |
+| `POST` | `/manage/apps/install` | session | Save and install a pasted hApp config |
+| `POST` | `/manage/apps/remove` | session | Uninstall a Node Manager hApp |
 | `POST` | `/manage/moss/join` | session | Join a Moss group |
 | `POST` | `/manage/moss/start` | session | Start EdgeNode Moss node |
 | `GET` | `/manage/moss/list` | session | List Moss groups |
@@ -294,6 +297,7 @@ Session tokens are stored in-memory and cleared on restart — operators will ne
 | `/etc/containers/systemd/wind-tunnel.container` | Podman Quadlet for Wind Tunnel | 644 |
 | `/home/holo/.ssh/authorized_keys` | SSH public keys for the holo user | 600 |
 | `/var/lib/edgenode/` | EdgeNode persistent data volume | — |
+| `/var/lib/edgenode/node-manager-apps/` | Pasted hApp configs and installed-app registry | 600/700 |
 
 The `seed_hash` field stores a salted SHA-256 hash of the normalized BIP39 seed phrase. The plain-text seed phrase is never written to disk.
 
