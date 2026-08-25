@@ -33,6 +33,8 @@ const SESSION_TTL_SECS: u64 = 86400;
 const UPDATE_INTERVAL_SECS: u64 = 3600;
 const WDOCKER_PASS_FILE: &str = "/etc/node-manager/wdocker_pass";
 const EDGENODE_CONTAINER: &str = "edgenode";
+const HAPP_APPS_DIR: &str = "/var/lib/edgenode/node-manager-apps";
+const HAPP_APPS_REGISTRY: &str = "/var/lib/edgenode/node-manager-apps/installed";
 
 // ── Shared application state ───────────────────────────────────────────────────
 
@@ -674,6 +676,127 @@ fn run_wdocker(
     }
 }
 
+fn validate_happ_name(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("app.name is required".into());
+    }
+    if name.len() > 128 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Some("app.name may only contain letters, numbers, hyphens and underscores".into());
+    }
+    None
+}
+
+fn read_installed_happs() -> Vec<String> {
+    fs::read_to_string(HAPP_APPS_REGISTRY).unwrap_or_default()
+        .lines().map(str::trim).filter(|name| validate_happ_name(name).is_none())
+        .map(String::from).collect()
+}
+
+fn write_installed_happs(names: &[String]) -> Result<(), String> {
+    fs::create_dir_all(HAPP_APPS_DIR).map_err(|e| e.to_string())?;
+    let _ = Command::new("chmod").args(["700", HAPP_APPS_DIR]).output();
+    let content = names.iter().map(|name| format!("{}\n", name)).collect::<String>();
+    fs::write(HAPP_APPS_REGISTRY, content).map_err(|e| e.to_string())?;
+    let _ = Command::new("chmod").args(["600", HAPP_APPS_REGISTRY]).output();
+    Ok(())
+}
+
+fn run_happ_command(command: &str, state: &AppState) -> Result<String, String> {
+    if state.hw_mode.lock().unwrap().as_str() == "WIND_TUNNEL" {
+        return Err("Switch to Standard EdgeNode mode before managing hApps.".into());
+    }
+    if !edgenode_running() {
+        return Err("EdgeNode is not running. Start Standard EdgeNode mode first.".into());
+    }
+    let script = format!("podman exec {} su - nonroot -c {}", EDGENODE_CONTAINER, shell_single_quote(command));
+    match Command::new("sh").args(["-c", &script]).output() {
+        Ok(output) => {
+            let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            if output.status.success() {
+                Ok(text.trim().to_string())
+            } else {
+                Err(if text.trim().is_empty() { format!("hApp command failed (exit {})", output.status) } else { text.trim().to_string() })
+            }
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn handle_happ_install(stream: &mut TcpStream, req: &Req, state: &AppState) {
+    let config = json_unescape(json_str(&req.body, "config")).trim().to_string();
+    if config.is_empty() {
+        send_json_err(stream, 400, "config is required"); return;
+    }
+    if !config.trim_start().starts_with('{') || !json_has_key(&config, "app") {
+        send_json_err(stream, 400, "config must be a hApp JSON object with an app section"); return;
+    }
+    let name = json_str(&config, "name").trim().to_string();
+    if let Some(msg) = validate_happ_name(&name) {
+        send_json_err(stream, 400, &msg); return;
+    }
+    if !json_has_key(&config, "happUrl") {
+        send_json_err(stream, 400, "app.happUrl is required"); return;
+    }
+    if json_has_key(&config, "economics") && state.log_sender_endpoint.lock().unwrap().trim().is_empty() {
+        send_json_err(stream, 400, "Configure a Log Collector URL before installing an economics hApp"); return;
+    }
+
+    if let Err(e) = fs::create_dir_all(HAPP_APPS_DIR) {
+        send_json_err(stream, 500, &format!("Failed to create hApp directory: {}", e)); return;
+    }
+    let host_config = format!("{}/{}_config.json", HAPP_APPS_DIR, name);
+    let previous_config = fs::read_to_string(&host_config).ok();
+    if let Err(e) = fs::write(&host_config, &config) {
+        send_json_err(stream, 500, &format!("Failed to save hApp config: {}", e)); return;
+    }
+    let _ = Command::new("chmod").args(["600", &host_config]).output();
+    let container_config = format!("/data/node-manager-apps/{}_config.json", name);
+    match run_happ_command(&format!("install_happ {}", shell_single_quote(&container_config)), state) {
+        Ok(output) => {
+            let mut names = read_installed_happs();
+            if !names.iter().any(|installed| installed == &name) { names.push(name.clone()); }
+            if let Err(e) = write_installed_happs(&names) {
+                send_json_err(stream, 500, &format!("hApp installed but status could not be saved: {}", e)); return;
+            }
+            eprintln!("[happ] Installed {}", name);
+            send_json_ok(stream, &format!(r#"{{"status":"ok","name":"{}","output":"{}"}}"#, json_escape(&name), json_escape(&output)));
+        }
+        Err(e) => {
+            match previous_config {
+                Some(previous) => { let _ = fs::write(&host_config, previous); }
+                None => { let _ = fs::remove_file(host_config); }
+            }
+            send_json_err(stream, 500, &e);
+        }
+    }
+}
+
+fn handle_happ_remove(stream: &mut TcpStream, req: &Req, state: &AppState) {
+    let name = json_str(&req.body, "name").trim().to_string();
+    if let Some(msg) = validate_happ_name(&name) {
+        send_json_err(stream, 400, &msg); return;
+    }
+    if !read_installed_happs().iter().any(|installed| installed == &name) {
+        send_json_err(stream, 404, "hApp is not registered as installed"); return;
+    }
+    match run_happ_command(&format!("uninstall_happ {}", shell_single_quote(&name)), state) {
+        Ok(output) => {
+            let names: Vec<String> = read_installed_happs().into_iter().filter(|installed| installed != &name).collect();
+            let _ = write_installed_happs(&names);
+            let _ = fs::remove_file(format!("{}/{}_config.json", HAPP_APPS_DIR, name));
+            eprintln!("[happ] Removed {}", name);
+            send_json_ok(stream, &format!(r#"{{"status":"ok","name":"{}","output":"{}"}}"#, json_escape(&name), json_escape(&output)));
+        }
+        Err(e) => send_json_err(stream, 500, &e),
+    }
+}
+
+fn handle_happ_list(stream: &mut TcpStream) {
+    let names = read_installed_happs();
+    let apps = names.iter().map(|name| format!("\"{}\"", json_escape(name))).collect::<Vec<_>>().join(",");
+    send_json_ok(stream, &format!(r#"{{"apps":[{}]}}"#, apps));
+}
+
 fn send_wdocker_ok(stream: &mut TcpStream, output: &str) {
     send_json_ok(stream, &format!(
         r#"{{"status":"ok","output":"{}"}}"#,
@@ -796,7 +919,33 @@ fn json_str<'a>(json: &'a str, key: &str) -> &'a str {
     let needle = format!("\"{}\"", key);
     let pos = match json.find(&needle) { Some(p) => p, None => return "" };
     let after = json[pos + needle.len()..].splitn(2, ':').nth(1).unwrap_or("").trim_start();
-    if after.starts_with('"') { let inner = &after[1..]; &inner[..inner.find('"').unwrap_or(0)] } else { "" }
+    if !after.starts_with('"') { return ""; }
+    let bytes = after.as_bytes();
+    let mut escaped = false;
+    for i in 1..bytes.len() {
+        if escaped { escaped = false; continue; }
+        if bytes[i] == b'\\' { escaped = true; continue; }
+        if bytes[i] == b'"' { return &after[1..i]; }
+    }
+    ""
+}
+
+fn json_unescape(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' { result.push(ch); continue; }
+        match chars.next() {
+            Some('"') => result.push('"'),
+            Some('\\') => result.push('\\'),
+            Some('n') => result.push('\n'),
+            Some('r') => result.push('\r'),
+            Some('t') => result.push('\t'),
+            Some(other) => { result.push('\\'); result.push(other); }
+            None => result.push('\\'),
+        }
+    }
+    result
 }
 
 fn html_escape(s: &str) -> String {
@@ -1254,6 +1403,15 @@ fn build_manage_html(state: &AppState) -> String {
 
     let ssh_count  = ssh_keys.len();
     let ssh_plural = if ssh_count == 1 { "" } else { "s" };
+    let installed_happs = read_installed_happs();
+    let happs_html = if installed_happs.is_empty() {
+        r#"<div class="no-keys">No hApps installed yet. Paste a hApp config below to install one.</div>"#.to_string()
+    } else {
+        installed_happs.iter().map(|name| format!(
+            r#"<div class="key-row"><span class="key-val" style="color:#e2e8f0">{}</span><button class="btn btn-danger btn-sm" onclick="removeHapp('{}')">Remove</button></div>"#,
+            html_escape(name), html_escape(name)
+        )).collect()
+    };
 
     format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1319,6 +1477,21 @@ fn build_manage_html(state: &AppState) -> String {
     <p><strong>Upgrade Security:</strong> This node does not have a recovery seed phrase yet. Generate one now so you can reset your password if you forget it.</p>
     <button type="button" class="btn btn-primary" id="seed-generate-btn" onclick="generateSeedPhrase()">Generate Recovery Seed Phrase</button>
   </div>
+
+    <!-- HAPPS -->
+    <div class="section">
+        <div class="section-hdr" onclick="toggleSection('happs')">
+            <div class="section-title"><span>📦</span> Installed hApps <span class="section-badge badge-green">{happs_count}</span></div>
+            <span class="section-arrow" id="arr-happs">▼</span>
+        </div>
+        <div class="section-body" id="sec-happs" style="display:block">
+            <div id="happ-list">{happs_html}</div>
+            <label>Paste hApp config JSON</label>
+            <textarea id="happ-config" style="min-height:260px" placeholder='{{"app":{{"name":"my_app","version":"0.1.0","happUrl":"https://...","modifiers":{{"networkSeed":"","properties":""}}}},"env":{{"holochain":{{"version":"","flags":[""],"bootstrapUrl":"","relayUrl":""}}}},"economics":{{"payorUnytAgentPubKey":"","agreementHash":"uhCkk...","priceSheetHash":""}}}}'></textarea>
+            <div class="hint">Economics hApps initialize log-sender automatically. Configure the Log Collector URL in Advanced first.</div>
+            <div style="margin-top:10px"><button class="btn btn-primary" id="happ-install-btn" onclick="installHapp()">Install hApp</button></div>
+        </div>
+    </div>
 
   <!-- NODE NAME -->
   <div class="section">
@@ -1508,7 +1681,7 @@ function toggleSection(id){{
   body.style.display=open?'none':'block';
   if(arr)arr.textContent=open?'▶':'▼';
 }}
-['name','hw','unyt','moss','adv','pw','upd'].forEach(id=>toggleSection(id));
+['name','hw','unyt','happs','moss','adv','pw','upd'].forEach(id=>toggleSection(id));
 toggleSection('moss');
 document.getElementById('sec-moss').style.display='block';
 document.getElementById('arr-moss').textContent='▼';
@@ -1713,6 +1886,27 @@ loadNodeStatus();
 
 function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
 
+async function installHapp(){{
+    const config=v('happ-config');
+    if(!config)return toast('Paste a hApp config first',false);
+    const btn=document.getElementById('happ-install-btn');
+    btn.disabled=true;btn.textContent='Installing…';
+    try{{
+        await api('/manage/apps/install',{{config}});
+        toast('hApp installed — reloading…',true);
+        setTimeout(()=>location.reload(),800);
+    }}catch(e){{toast('Error: '+e.message,false);}}
+    finally{{btn.disabled=false;btn.textContent='Install hApp';}}
+}}
+async function removeHapp(name){{
+    if(!confirm('Remove '+name+' from this node?'))return;
+    try{{
+        await api('/manage/apps/remove',{{name}});
+        toast('hApp removed — reloading…',true);
+        setTimeout(()=>location.reload(),800);
+    }}catch(e){{toast('Error: '+e.message,false);}}
+}}
+
 async function addKey(){{
   const key=document.getElementById('newKey').value.trim();
   if(!key)return toast('Paste a public key first',false);
@@ -1822,6 +2016,8 @@ async function triggerUpdate(){{
         wt_status_link       = html_escape(&wt_status_link),
         wt_image_override_escaped = html_escape(&wt_image_override),
         wt_entrypoint_bind_escaped = html_escape(&wt_entrypoint_bind),
+        happs_count         = installed_happs.len(),
+        happs_html          = happs_html,
     )
 }
 
@@ -1984,8 +2180,10 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let log_sender_endpoint = state.log_sender_endpoint.lock().unwrap().clone();
     let edgenode_up = edgenode_running();
     let has_seed = has_seed_phrase();
+    let installed_happs = read_installed_happs();
+    let happs_json = installed_happs.iter().map(|name| format!("\"{}\"", json_escape(name))).collect::<Vec<_>>().join(",");
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"has_seed_phrase":{}}}"#,
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"has_seed_phrase":{},"installed_happs":[{}]}}"#,
         VERSION,
         node_name.replace('\\', "\\\\").replace('"', "\\\""),
         hw_mode,
@@ -1994,7 +2192,7 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
         if edgenode_up { "true" } else { "false" },
         wt_hostname.replace('\\', "\\\\").replace('"', "\\\""),
         keys.len(), keys_json, uptime,
-        if has_seed { "true" } else { "false" }
+        if has_seed { "true" } else { "false" }, happs_json
     ));
 }
 
@@ -2386,6 +2584,30 @@ fn main() {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
                         handle_log_sender(&mut stream, &req, &state);
+                    }
+                },
+
+                ("GET", "/manage/apps") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_happ_list(&mut stream);
+                    }
+                },
+
+                ("POST", "/manage/apps/install") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_happ_install(&mut stream, &req, &state);
+                    }
+                },
+
+                ("POST", "/manage/apps/remove") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_happ_remove(&mut stream, &req, &state);
                     }
                 },
 
