@@ -63,7 +63,7 @@ A two-step browser UI walks the operator through:
 1. **Node identity & access** — node name (used as hostname slug), hardware mode, optional SSH public key, optional Unyt Agent ID, and a user-defined password (minimum 8 characters)
 2. **Review & initialize** — summary before committing
 
-When Wind Tunnel mode is selected, the Nomad client hostname is `nomad-client-{node_name}` (must fit within 63 characters total, so the node name can be at most 50 characters). The optional Unyt Agent ID is stored separately in `client-meta.json` for HoloFuel compensation and is independent of hostname length.
+When Wind Tunnel mode is selected, the operator must first accept the [Wind Tunnel Terms & Conditions](https://holochain.org/wind-tunnel-terms). This agreement is saved once per node. The Nomad client hostname is `nomad-client-{node_name}` (must fit within 63 characters total, so the node name can be at most 50 characters). The optional Unyt Agent ID is stored separately in `client-meta.json` for HoloFuel compensation and is independent of hostname length.
 
 On successful initialization, the server:
 
@@ -80,6 +80,8 @@ If an operator forgets their password, they can use the **Forgot Password?** lin
 ### Legacy node migration
 
 Nodes that were onboarded before the seed-phrase system was introduced do not have a `seed_hash` in state. After upgrading, authenticated operators see an **Upgrade Security: Generate Recovery Seed Phrase** banner on the `/manage` dashboard. Clicking it generates a new seed phrase (one-time display) and stores its hash — the same flow as onboarding, without re-running setup.
+
+Nodes that were running in Wind Tunnel mode before the Wind Tunnel Terms update, and therefore without a saved terms agreement, are switched to Standard EdgeNode mode. The operator must then manually switch back to Wind Tunnel mode, and check the box consenting to the terms, before Wind Tunnel mode can be enabled again on the node.
 
 ### Management panel (`/manage`)
 
