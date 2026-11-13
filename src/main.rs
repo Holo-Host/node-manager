@@ -981,6 +981,15 @@ code{background:#1e2740;padding:1px 5px;border-radius:4px;font-family:monospace;
 .hw-opt{flex:1;padding:12px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;transition:all .2s}
 .hw-opt:hover,.hw-opt.sel{border-color:#6366f1}.hw-opt.sel{background:#1e1d3f}
 .hw-opt-name{font-size:13px;font-weight:600;color:#e2e8f0}.hw-opt-desc{font-size:11px;color:#475569;margin-top:2px}
+.terms-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:1100;align-items:center;justify-content:center;padding:20px}
+.terms-modal.vis{display:flex}
+.terms-modal-card{position:relative;background:#13162a;border:1px solid #4338ca;border-radius:16px;padding:28px;max-width:560px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.terms-modal-card h2{font-size:20px;font-weight:700;color:#f1f5f9;margin:0 36px 16px 0}
+.terms-modal-card p{font-size:14px;color:#cbd5e1;line-height:1.65;margin:0 0 14px}
+.terms-modal-card a{color:#a5b4fc}
+.terms-modal-close{position:absolute;top:14px;right:16px;background:transparent;border:0;color:#94a3b8;font-size:26px;line-height:1;cursor:pointer}
+.terms-modal-accept{display:flex;align-items:center;gap:10px;font-size:15px;color:#f1f5f9;font-weight:600;cursor:pointer;margin-top:18px}
+.terms-modal-accept input{width:18px;height:18px;accent-color:#6366f1;cursor:pointer}
 "#;
 
 // ── Login page ─────────────────────────────────────────────────────────────────
@@ -1049,6 +1058,15 @@ async function doRecover(){{
 // ── Onboarding page ────────────────────────────────────────────────────────────
 
 const UNYT_INFO_COPY: &str = r#"<div class="info-box" style="margin-top:12px"><strong>HoloFuel compensation requires a Unyt Agent ID.</strong> Download the Unyt desktop app, sign in, and copy your Agent ID from the app settings. Setup can finish without it, but you will not receive HoloFuel payments until an Agent ID is saved.</div>"#;
+const WIND_TUNNEL_TERMS_MODAL_HTML: &str = r#"<div class="terms-modal" id="wt-terms-modal" onclick="if(event.target===this)cancelWindTunnelTerms()">
+  <div class="terms-modal-card" role="dialog" aria-modal="true" aria-labelledby="wt-terms-title">
+    <button type="button" class="terms-modal-close" aria-label="Cancel" onclick="cancelWindTunnelTerms()">×</button>
+    <h2 id="wt-terms-title">Wind Tunnel Participation</h2>
+    <p>Running Wind Tunnel on this device makes it available to the Holochain Foundation for testing. Net Zero FZC pays HoloFuel to your payee address for the time this device is online and for the time it spends running tests, at the published rates.</p>
+    <p>By selecting I accept you confirm you are 18 or over, you've read and accept the <a href="https://holochain.org/wind-tunnel-terms" target="_blank" rel="noopener noreferrer">Participation Terms (version 0.1)</a> and the HoloFuel Platform Terms, and the attributed payee address is yours.</p>
+    <label class="terms-modal-accept"><span>I accept</span><input type="checkbox" id="wtTerms" onchange="acceptWindTunnelTerms()"></label>
+  </div>
+</div>"#;
 
 fn build_onboarding_html(ap_mode: bool, terms_accepted: bool) -> String {
     let wifi_block = if ap_mode {
@@ -1058,17 +1076,6 @@ fn build_onboarding_html(ap_mode: bool, terms_accepted: bool) -> String {
     } else {
         r#"<div class="ok-box">✓ Ethernet connected — you're online.</div>"#
     };
-    let wt_terms_html = if terms_accepted {
-        ""
-    } else {
-        r#"<div id="wt-terms-row" style="display:none;margin:12px 0">
-          <label style="display:flex;align-items:flex-start;gap:8px;font-weight:400;margin:0">
-            <input type="checkbox" id="wtTerms" onchange="acceptWindTunnelTerms()" style="width:auto;margin-top:3px">
-            <span>I have read and agree to the <a href="https://holochain.org/wind-tunnel-terms" target="_blank" rel="noopener noreferrer">Terms &amp; Conditions</a> for participating as a Wind Tunnel node</span>
-          </label>
-        </div>"#
-    };
-
     format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Holo Node Setup</title>
@@ -1101,11 +1108,10 @@ fn build_onboarding_html(ap_mode: bool, terms_accepted: bool) -> String {
       <input type="text" id="nodeName" placeholder="e.g. alice, home-node-01" oninput="chkS1()">
       <div class="hint" id="nameHint">Lowercase letters, numbers and hyphens only. Used as hostname slug.</div>
       <label>Mode</label>
-      <select id="hw" onchange="updateHwTerms();chkS1()">
+      <select id="hw" onchange="onHwChange();chkS1()">
         <option value="STANDARD">Standard EdgeNode — always-on Holochain peer</option>
         <option value="WIND_TUNNEL">Holochain Wind Tunnel — network stress-tester</option>
       </select>
-      {wt_terms_html}
       <label>SSH public key <span style="color:#475569;font-weight:400">(recommended)</span></label>
       <textarea id="sshKey" placeholder="ssh-ed25519 AAAA...&#10;Leave blank to add keys later in /manage"></textarea>
       <label>Unyt Agent ID <span style="color:#475569;font-weight:400">(optional)</span></label>
@@ -1156,6 +1162,7 @@ fn build_onboarding_html(ap_mode: bool, terms_accepted: bool) -> String {
     </div>
   </div>
 </div>
+{wt_terms_modal}
 <script>
 function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
 
@@ -1186,9 +1193,18 @@ function wtHostname(name){{
 }}
 
 let wtTermsAccepted={wt_terms_accepted};
-function updateHwTerms(){{
-  const row=document.getElementById('wt-terms-row');
-  if(row)row.style.display=v('hw')==='WIND_TUNNEL'&&!wtTermsAccepted?'':'none';
+function onHwChange(){{
+  if(v('hw')==='WIND_TUNNEL'&&!wtTermsAccepted)showWindTunnelTerms();
+}}
+function showWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.add('vis');
+}}
+function cancelWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.remove('vis');
+  if(!wtTermsAccepted)document.getElementById('hw').value='STANDARD';
+  chkS1();
 }}
 
 async function acceptWindTunnelTerms(){{
@@ -1201,7 +1217,8 @@ async function acceptWindTunnelTerms(){{
     const data=await r.json().catch(()=>({{}}));
     if(!r.ok)throw new Error(data.error||('Server error '+r.status));
     wtTermsAccepted=true;
-    updateHwTerms();
+    const modal=document.getElementById('wt-terms-modal');
+    if(modal)modal.classList.remove('vis');
     chkS1();
   }}catch(e){{
     checkbox.checked=false;
@@ -1272,7 +1289,7 @@ function goManage(){{window.location.href='/manage';}}
         css        = COMMON_CSS,
         wifi_block = wifi_block,
         unyt_copy  = UNYT_INFO_COPY,
-        wt_terms_html = wt_terms_html,
+        wt_terms_modal = WIND_TUNNEL_TERMS_MODAL_HTML,
         wt_terms_accepted = if terms_accepted { "true" } else { "false" },
     )
 }
@@ -1319,17 +1336,6 @@ fn build_manage_html(state: &AppState) -> String {
 
     let sel_std = if hw_mode != "WIND_TUNNEL" { " sel" } else { "" };
     let sel_wt  = if hw_mode == "WIND_TUNNEL"  { " sel" } else { "" };
-    let wt_terms_html = if terms_accepted {
-        String::new()
-    } else {
-        let display = if hw_mode == "WIND_TUNNEL" { "block" } else { "none" };
-        format!(r#"<div id="wt-terms-row" style="display:{};margin:12px 0">
-          <label style="display:flex;align-items:flex-start;gap:8px;font-weight:400;margin:0">
-            <input type="checkbox" id="wtTerms" onchange="acceptWindTunnelTerms()" style="width:auto;margin-top:3px">
-            <span>I have read and agree to the <a href="https://holochain.org/wind-tunnel-terms" target="_blank" rel="noopener noreferrer">Terms &amp; Conditions</a> for participating as a Wind Tunnel node</span>
-          </label>
-        </div>"#, display)
-    };
     let hw_mode_display = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" };
     let moss_disabled = hw_mode == "WIND_TUNNEL";
     let moss_disabled_msg = if moss_disabled {
@@ -1431,16 +1437,15 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
     <div class="section-body" id="sec-hw">
       <div class="hw-opts">
-        <div class="hw-opt{sel_std}" onclick="selHw('STANDARD',this)">
+        <div class="hw-opt{sel_std}" data-mode="STANDARD" onclick="selHw('STANDARD')">
           <div class="hw-opt-name">🌐 Standard EdgeNode</div>
           <div class="hw-opt-desc">Always-on Holochain peer</div>
         </div>
-        <div class="hw-opt{sel_wt}" onclick="selHw('WIND_TUNNEL',this)">
+        <div class="hw-opt{sel_wt}" data-mode="WIND_TUNNEL" onclick="selHw('WIND_TUNNEL')">
           <div class="hw-opt-name">🌀 Wind Tunnel</div>
           <div class="hw-opt-desc">Network stress-tester</div>
         </div>
       </div>
-      {wt_terms_html}
       <div style="margin-top:10px"><button class="btn btn-primary" onclick="saveHardware()">Apply Mode</button></div>
     </div>
   </div>
@@ -1578,6 +1583,7 @@ fn build_manage_html(state: &AppState) -> String {
   </div>
 </div>
 <div class="toast" id="toast"></div>
+{wt_terms_modal}
 <div class="seed-modal" id="seed-migrate-modal">
   <div class="seed-modal-card">
     <h2>Save Your Recovery Seed Phrase</h2>
@@ -1589,6 +1595,7 @@ fn build_manage_html(state: &AppState) -> String {
 </div>
 <script>
 let curHw='{hw_mode}';
+let hwBeforeTerms='{hw_mode}';
 let wtTermsAccepted={wt_terms_accepted};
 
 function toggleSection(id){{
@@ -1816,12 +1823,33 @@ async function removeKey(i){{
   catch(e){{toast('Error: '+e.message,false);}}
 }}
 
-function selHw(mode,el){{
+function selHw(mode){{
+  if(mode==='WIND_TUNNEL'&&!wtTermsAccepted){{
+    hwBeforeTerms=curHw;
+    applyHwSelection(mode);
+    showWindTunnelTerms();
+    return;
+  }}
+  applyHwSelection(mode);
+}}
+
+function applyHwSelection(mode){{
   curHw=mode;
   document.querySelectorAll('.hw-opt').forEach(o=>o.classList.remove('sel'));
-  el.classList.add('sel');
-  const termsRow=document.getElementById('wt-terms-row');
-  if(termsRow)termsRow.style.display=mode==='WIND_TUNNEL'&&!wtTermsAccepted?'':'none';
+  document.querySelectorAll('.hw-opt').forEach(o=>{{
+    if(o.dataset.mode===mode)o.classList.add('sel');
+  }});
+}}
+
+function showWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.add('vis');
+}}
+
+function cancelWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.remove('vis');
+  if(!wtTermsAccepted)applyHwSelection(hwBeforeTerms);
 }}
 
 async function acceptWindTunnelTerms(){{
@@ -1831,8 +1859,8 @@ async function acceptWindTunnelTerms(){{
   try{{
     await api('/manage/wind-tunnel-consent',{{accepted:true}});
     wtTermsAccepted=true;
-    const termsRow=document.getElementById('wt-terms-row');
-    if(termsRow)termsRow.style.display='none';
+    const modal=document.getElementById('wt-terms-modal');
+    if(modal)modal.classList.remove('vis');
     toast('Wind Tunnel Terms & Conditions accepted',true);
   }}catch(e){{
     checkbox.checked=false;
@@ -1919,7 +1947,7 @@ async function triggerUpdate(){{
         hw_mode_display      = hw_mode_display,
         sel_std              = sel_std,
         sel_wt               = sel_wt,
-        wt_terms_html        = wt_terms_html,
+        wt_terms_modal       = WIND_TUNNEL_TERMS_MODAL_HTML,
         wt_terms_accepted    = if terms_accepted { "true" } else { "false" },
         unyt_copy            = UNYT_INFO_COPY,
         unyt_display         = html_escape(&unyt_display),
