@@ -41,6 +41,7 @@ struct AppState {
     start_time:     SystemTime,
     sessions:       Mutex<HashMap<String, SystemTime>>,
     onboarded:      AtomicBool,
+    wind_tunnel_terms_accepted: AtomicBool,
     node_name:      Mutex<String>,
     hw_mode:        Mutex<String>,
     unyt_agent_id:       Mutex<String>,
@@ -57,6 +58,9 @@ impl AppState {
             start_time: SystemTime::now(),
             sessions:   Mutex::new(load_sessions()),
             onboarded:  AtomicBool::new(kv.get("onboarded").map(|v| v == "true").unwrap_or(false)),
+            wind_tunnel_terms_accepted: AtomicBool::new(
+                kv.get("wind_tunnel_terms_accepted").map(|v| v == "true").unwrap_or(false),
+            ),
             node_name:     Mutex::new(kv.get("node_name").cloned().unwrap_or_default()),
             hw_mode:       Mutex::new(kv.get("hw_mode").cloned().unwrap_or_else(|| "STANDARD".into())),
             unyt_agent_id:      Mutex::new(kv.get("unyt_agent_id").cloned().unwrap_or_default()),
@@ -787,9 +791,42 @@ fn json_has_key(json: &str, key: &str) -> bool {
 }
 
 fn json_bool(json: &str, key: &str, default: bool) -> bool {
-    if !json_has_key(json, key) { return default; }
-    let v = json_str(json, key);
-    !matches!(v, "false" | "0")
+    let needle = format!("\"{}\"", key);
+    let Some(pos) = json.find(&needle) else { return default };
+    let after = json[pos + needle.len()..].splitn(2, ':').nth(1).unwrap_or("").trim_start();
+    let value = after.split(|c| c == ',' || c == '}').next().unwrap_or("").trim();
+    match value {
+        "true" | "1" => true,
+        "false" | "0" | "null" => false,
+        _ => default,
+    }
+}
+
+fn validate_wind_tunnel_terms(mode: &str, accepted: bool) -> Result<(), &'static str> {
+    if mode == "WIND_TUNNEL" && !accepted {
+        Err("You must accept the Wind Tunnel Terms & Conditions before enabling this mode")
+    } else {
+        Ok(())
+    }
+}
+
+fn accept_wind_tunnel_terms(state: &AppState) -> Result<(), String> {
+    let mut kv = read_state_file();
+    kv.insert("wind_tunnel_terms_accepted".into(), "true".into());
+    fs::create_dir_all("/etc/node-manager")
+        .map_err(|e| format!("Failed to create node-manager state directory: {}", e))?;
+    let content: String = kv.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
+    fs::write(STATE_FILE, content)
+        .map_err(|e| format!("Failed to save Wind Tunnel terms acceptance: {}", e))?;
+    let chmod = Command::new("chmod")
+        .args(["600", STATE_FILE])
+        .output()
+        .map_err(|e| format!("Failed to secure Wind Tunnel terms state: {}", e))?;
+    if !chmod.status.success() {
+        return Err("Failed to secure Wind Tunnel terms state".into());
+    }
+    state.wind_tunnel_terms_accepted.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 fn json_str<'a>(json: &'a str, key: &str) -> &'a str {
@@ -944,6 +981,15 @@ code{background:#1e2740;padding:1px 5px;border-radius:4px;font-family:monospace;
 .hw-opt{flex:1;padding:12px;background:#0f1117;border:2px solid #2d3148;border-radius:10px;cursor:pointer;transition:all .2s}
 .hw-opt:hover,.hw-opt.sel{border-color:#6366f1}.hw-opt.sel{background:#1e1d3f}
 .hw-opt-name{font-size:13px;font-weight:600;color:#e2e8f0}.hw-opt-desc{font-size:11px;color:#475569;margin-top:2px}
+.terms-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:1100;align-items:center;justify-content:center;padding:20px}
+.terms-modal.vis{display:flex}
+.terms-modal-card{position:relative;background:#13162a;border:1px solid #4338ca;border-radius:16px;padding:28px;max-width:560px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.terms-modal-card h2{font-size:20px;font-weight:700;color:#f1f5f9;margin:0 36px 16px 0}
+.terms-modal-card p{font-size:14px;color:#cbd5e1;line-height:1.65;margin:0 0 14px}
+.terms-modal-card a{color:#a5b4fc}
+.terms-modal-close{position:absolute;top:14px;right:16px;background:transparent;border:0;color:#94a3b8;font-size:26px;line-height:1;cursor:pointer}
+.terms-modal-accept{display:flex;align-items:center;gap:10px;font-size:15px;color:#f1f5f9;font-weight:600;cursor:pointer;margin-top:18px}
+.terms-modal-accept input{width:18px;height:18px;accent-color:#6366f1;cursor:pointer}
 "#;
 
 // ── Login page ─────────────────────────────────────────────────────────────────
@@ -1012,8 +1058,17 @@ async function doRecover(){{
 // ── Onboarding page ────────────────────────────────────────────────────────────
 
 const UNYT_INFO_COPY: &str = r#"<div class="info-box" style="margin-top:12px"><strong>HoloFuel compensation requires a Unyt Agent ID.</strong> Download the Unyt desktop app, sign in, and copy your Agent ID from the app settings. Setup can finish without it, but you will not receive HoloFuel payments until an Agent ID is saved.</div>"#;
+const WIND_TUNNEL_TERMS_MODAL_HTML: &str = r#"<div class="terms-modal" id="wt-terms-modal" onclick="if(event.target===this)cancelWindTunnelTerms()">
+  <div class="terms-modal-card" role="dialog" aria-modal="true" aria-labelledby="wt-terms-title">
+    <button type="button" class="terms-modal-close" aria-label="Cancel" onclick="cancelWindTunnelTerms()">×</button>
+    <h2 id="wt-terms-title">Wind Tunnel Participation</h2>
+    <p>Running Wind Tunnel on this device makes it available to the Holochain Foundation for testing. Net Zero FZC pays HoloFuel to your payee address for the time this device is online and for the time it spends running tests, at the published rates.</p>
+    <p>By selecting I accept you confirm you are 18 or over, you've read and accept the <a href="https://holochain.org/wind-tunnel-terms" target="_blank" rel="noopener noreferrer">Participation Terms (version 0.1)</a> and the HoloFuel Platform Terms, and the attributed payee address is yours.</p>
+    <label class="terms-modal-accept"><span>I accept</span><input type="checkbox" id="wtTerms" onchange="acceptWindTunnelTerms()"></label>
+  </div>
+</div>"#;
 
-fn build_onboarding_html(ap_mode: bool) -> String {
+fn build_onboarding_html(ap_mode: bool, terms_accepted: bool) -> String {
     let wifi_block = if ap_mode {
         r#"<div class="err-box">⚠ No Ethernet — connect to Wi-Fi to continue.</div>
 <label>Wi-Fi SSID</label><input type="text" id="wifiSsid" placeholder="Network name">
@@ -1021,7 +1076,6 @@ fn build_onboarding_html(ap_mode: bool) -> String {
     } else {
         r#"<div class="ok-box">✓ Ethernet connected — you're online.</div>"#
     };
-
     format!(r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Holo Node Setup</title>
@@ -1054,7 +1108,7 @@ fn build_onboarding_html(ap_mode: bool) -> String {
       <input type="text" id="nodeName" placeholder="e.g. alice, home-node-01" oninput="chkS1()">
       <div class="hint" id="nameHint">Lowercase letters, numbers and hyphens only. Used as hostname slug.</div>
       <label>Mode</label>
-      <select id="hw">
+      <select id="hw" onchange="onHwChange();chkS1()">
         <option value="STANDARD">Standard EdgeNode — always-on Holochain peer</option>
         <option value="WIND_TUNNEL">Holochain Wind Tunnel — network stress-tester</option>
       </select>
@@ -1108,6 +1162,7 @@ fn build_onboarding_html(ap_mode: bool) -> String {
     </div>
   </div>
 </div>
+{wt_terms_modal}
 <script>
 function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
 
@@ -1122,7 +1177,7 @@ function gTo(n){{
 function chkS1(){{
   const name=v('nodeName');
   const pw=v('password');
-  const ok=/^[a-z0-9-]+$/.test(name)&&pw.length>=8;
+  const ok=/^[a-z0-9-]+$/.test(name)&&pw.length>=8&&(v('hw')!=='WIND_TUNNEL'||wtTermsAccepted);
   document.getElementById('b1').disabled=!ok;
   const hint=document.getElementById('nameHint');
   if(!hint)return;
@@ -1135,6 +1190,42 @@ function chkS1(){{
 
 function wtHostname(name){{
   return 'nomad-client-'+name;
+}}
+
+let wtTermsAccepted={wt_terms_accepted};
+function onHwChange(){{
+  if(v('hw')==='WIND_TUNNEL'&&!wtTermsAccepted)showWindTunnelTerms();
+}}
+function showWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.add('vis');
+}}
+function cancelWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.remove('vis');
+  if(!wtTermsAccepted)document.getElementById('hw').value='STANDARD';
+  chkS1();
+}}
+
+async function acceptWindTunnelTerms(){{
+  const checkbox=document.getElementById('wtTerms');
+  if(!checkbox||!checkbox.checked)return;
+  checkbox.disabled=true;
+  chkS1();
+  try{{
+    const r=await fetch('/manage/wind-tunnel-consent',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{accepted:true}})}});
+    const data=await r.json().catch(()=>({{}}));
+    if(!r.ok)throw new Error(data.error||('Server error '+r.status));
+    wtTermsAccepted=true;
+    const modal=document.getElementById('wt-terms-modal');
+    if(modal)modal.classList.remove('vis');
+    chkS1();
+  }}catch(e){{
+    checkbox.checked=false;
+    checkbox.disabled=false;
+    chkS1();
+    alert('Error: '+e.message);
+  }}
 }}
 
 function bRev(){{
@@ -1171,6 +1262,7 @@ async function doSubmit(){{
     sshKey:v('sshKey'),
     unytAgentId:agent,
     hwMode:v('hw'),
+    windTunnelTermsAccepted:wtTermsAccepted,
     wifiSsid:v('wifiSsid'),
     wifiPass:v('wifiPass'),
   }};
@@ -1197,6 +1289,8 @@ function goManage(){{window.location.href='/manage';}}
         css        = COMMON_CSS,
         wifi_block = wifi_block,
         unyt_copy  = UNYT_INFO_COPY,
+        wt_terms_modal = WIND_TUNNEL_TERMS_MODAL_HTML,
+        wt_terms_accepted = if terms_accepted { "true" } else { "false" },
     )
 }
 
@@ -1205,6 +1299,7 @@ function goManage(){{window.location.href='/manage';}}
 fn build_manage_html(state: &AppState) -> String {
     let node_name     = state.node_name.lock().unwrap().clone();
     let hw_mode       = state.hw_mode.lock().unwrap().clone();
+    let terms_accepted = state.wind_tunnel_terms_accepted.load(Ordering::Relaxed);
     let unyt_agent_id  = state.unyt_agent_id.lock().unwrap().clone();
     let log_sender_endpoint = state.log_sender_endpoint.lock().unwrap().clone();
     let ssh_keys       = read_ssh_keys();
@@ -1342,11 +1437,11 @@ fn build_manage_html(state: &AppState) -> String {
     </div>
     <div class="section-body" id="sec-hw">
       <div class="hw-opts">
-        <div class="hw-opt{sel_std}" onclick="selHw('STANDARD',this)">
+        <div class="hw-opt{sel_std}" data-mode="STANDARD" onclick="selHw('STANDARD')">
           <div class="hw-opt-name">🌐 Standard EdgeNode</div>
           <div class="hw-opt-desc">Always-on Holochain peer</div>
         </div>
-        <div class="hw-opt{sel_wt}" onclick="selHw('WIND_TUNNEL',this)">
+        <div class="hw-opt{sel_wt}" data-mode="WIND_TUNNEL" onclick="selHw('WIND_TUNNEL')">
           <div class="hw-opt-name">🌀 Wind Tunnel</div>
           <div class="hw-opt-desc">Network stress-tester</div>
         </div>
@@ -1488,6 +1583,7 @@ fn build_manage_html(state: &AppState) -> String {
   </div>
 </div>
 <div class="toast" id="toast"></div>
+{wt_terms_modal}
 <div class="seed-modal" id="seed-migrate-modal">
   <div class="seed-modal-card">
     <h2>Save Your Recovery Seed Phrase</h2>
@@ -1499,6 +1595,8 @@ fn build_manage_html(state: &AppState) -> String {
 </div>
 <script>
 let curHw='{hw_mode}';
+let hwBeforeTerms='{hw_mode}';
+let wtTermsAccepted={wt_terms_accepted};
 
 function toggleSection(id){{
   const body=document.getElementById('sec-'+id);
@@ -1725,10 +1823,50 @@ async function removeKey(i){{
   catch(e){{toast('Error: '+e.message,false);}}
 }}
 
-function selHw(mode,el){{
+function selHw(mode){{
+  if(mode==='WIND_TUNNEL'&&!wtTermsAccepted){{
+    hwBeforeTerms=curHw;
+    applyHwSelection(mode);
+    showWindTunnelTerms();
+    return;
+  }}
+  applyHwSelection(mode);
+}}
+
+function applyHwSelection(mode){{
   curHw=mode;
   document.querySelectorAll('.hw-opt').forEach(o=>o.classList.remove('sel'));
-  el.classList.add('sel');
+  document.querySelectorAll('.hw-opt').forEach(o=>{{
+    if(o.dataset.mode===mode)o.classList.add('sel');
+  }});
+}}
+
+function showWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.add('vis');
+}}
+
+function cancelWindTunnelTerms(){{
+  const modal=document.getElementById('wt-terms-modal');
+  if(modal)modal.classList.remove('vis');
+  if(!wtTermsAccepted)applyHwSelection(hwBeforeTerms);
+}}
+
+async function acceptWindTunnelTerms(){{
+  const checkbox=document.getElementById('wtTerms');
+  if(!checkbox||!checkbox.checked)return;
+  checkbox.disabled=true;
+  try{{
+    await api('/manage/wind-tunnel-consent',{{accepted:true}});
+    wtTermsAccepted=true;
+    const modal=document.getElementById('wt-terms-modal');
+    if(modal)modal.classList.remove('vis');
+    toast('Wind Tunnel Terms & Conditions accepted',true);
+  }}catch(e){{
+    checkbox.checked=false;
+    checkbox.disabled=false;
+    toast('Error: '+e.message,false);
+  }}
 }}
 
 async function saveUnyt(){{
@@ -1761,8 +1899,9 @@ async function applyWindTunnel(){{
 }}
 
 async function saveHardware(){{
+  if(curHw==='WIND_TUNNEL'&&!wtTermsAccepted)return toast('Accept the Wind Tunnel Terms & Conditions before enabling this mode',false);
   try{{
-    await api('/manage/hardware',{{mode:curHw}});
+    await api('/manage/hardware',{{mode:curHw,windTunnelTermsAccepted:wtTermsAccepted}});
     document.getElementById('hw-badge').textContent=curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
     document.getElementById('info-hw').textContent=curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
     toast('Mode updated',true);
@@ -1808,6 +1947,8 @@ async function triggerUpdate(){{
         hw_mode_display      = hw_mode_display,
         sel_std              = sel_std,
         sel_wt               = sel_wt,
+        wt_terms_modal       = WIND_TUNNEL_TERMS_MODAL_HTML,
+        wt_terms_accepted    = if terms_accepted { "true" } else { "false" },
         unyt_copy            = UNYT_INFO_COPY,
         unyt_display         = html_escape(&unyt_display),
         unyt_badge           = unyt_badge,
@@ -1853,6 +1994,17 @@ fn handle_submit(
     if let Some(msg) = validate_wt_hostname(node_name) {
         send_json_err(stream, 400, &msg); return;
     }
+    let hw_mode_val = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
+    let terms_accepted = state.wind_tunnel_terms_accepted.load(Ordering::Relaxed)
+        || json_bool(body, "windTunnelTermsAccepted", false);
+    if let Err(msg) = validate_wind_tunnel_terms(hw_mode_val, terms_accepted) {
+        send_json_err(stream, 400, msg); return;
+    }
+    if terms_accepted && !state.wind_tunnel_terms_accepted.load(Ordering::Relaxed) {
+        if let Err(msg) = accept_wind_tunnel_terms(state) {
+            send_json_err(stream, 500, &msg); return;
+        }
+    }
 
     // ── WiFi (AP mode) ───────────────────────────────────────────────────────
     let wifi_ssid = json_str(body, "wifiSsid");
@@ -1883,8 +2035,6 @@ fn handle_submit(
     }
 
     // ── Quadlets ─────────────────────────────────────────────────────────────
-    let hw_mode_val = if hw_mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
-
     let seed_phrase = match generate_seed_phrase() {
         Ok(p) => p,
         Err(e) => { send_json_err(stream, 500, &e); return; }
@@ -1905,6 +2055,10 @@ fn handle_submit(
     kv.insert("hw_mode".into(), hw_mode_val.to_string());
     kv.insert("unyt_agent_id".into(), unyt_agent_id.to_string());
     kv.insert("seed_hash".into(), seed_hash);
+    if terms_accepted {
+        kv.insert("wind_tunnel_terms_accepted".into(), "true".into());
+        state.wind_tunnel_terms_accepted.store(true, Ordering::Relaxed);
+    }
     write_state_file(&kv);
 
     sync_container_services(hw_mode_val, state);
@@ -2089,8 +2243,28 @@ fn handle_hardware(
 ) {
     let mode = json_str(&req.body, "mode");
     let mode = if mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
+    let terms_accepted = state.wind_tunnel_terms_accepted.load(Ordering::Relaxed)
+        || json_bool(&req.body, "windTunnelTermsAccepted", false);
+    if let Err(msg) = validate_wind_tunnel_terms(mode, terms_accepted) {
+        send_json_err(stream, 400, msg); return;
+    }
+    if terms_accepted && !state.wind_tunnel_terms_accepted.load(Ordering::Relaxed) {
+        if let Err(msg) = accept_wind_tunnel_terms(state) {
+            send_json_err(stream, 500, &msg); return;
+        }
+    }
     apply_hardware_mode(mode, state);
     eprintln!("[manage] Hardware mode switched to {}", mode);
+    send_json_ok(stream, r#"{"status":"ok"}"#);
+}
+
+fn handle_wind_tunnel_consent(stream: &mut TcpStream, req: &Req, state: &AppState) {
+    if !json_bool(&req.body, "accepted", false) {
+        send_json_err(stream, 400, "Wind Tunnel Terms & Conditions acceptance is required"); return;
+    }
+    if let Err(msg) = accept_wind_tunnel_terms(state) {
+        send_json_err(stream, 500, &msg); return;
+    }
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
@@ -2264,6 +2438,13 @@ fn main() {
     let state = Arc::new(AppState::new(ap_mode));
 
     if state.onboarded.load(Ordering::Relaxed) {
+        let current_hw_mode = state.hw_mode.lock().unwrap().clone();
+        if current_hw_mode == "WIND_TUNNEL"
+            && !state.wind_tunnel_terms_accepted.load(Ordering::Relaxed)
+        {
+            eprintln!("[migration] Wind Tunnel terms not accepted; switching node to STANDARD");
+            apply_hardware_mode("STANDARD", &state);
+        }
         let hw_mode = state.hw_mode.lock().unwrap().clone();
         sync_container_services(&hw_mode, &state);
 
@@ -2304,7 +2485,13 @@ fn main() {
                     if state.onboarded.load(Ordering::Relaxed) {
                         send_redirect(&mut stream, "/manage");
                     } else {
-                        send_html(&mut stream, &build_onboarding_html(state.ap_mode));
+                        send_html(
+                            &mut stream,
+                            &build_onboarding_html(
+                                state.ap_mode,
+                                state.wind_tunnel_terms_accepted.load(Ordering::Relaxed),
+                            ),
+                        );
                     }
                 },
 
@@ -2445,6 +2632,14 @@ fn main() {
                     }
                 },
 
+                ("POST", "/manage/wind-tunnel-consent") => {
+                    if state.onboarded.load(Ordering::Relaxed) && !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_wind_tunnel_consent(&mut stream, &req, &state);
+                    }
+                },
+
                 ("POST", "/manage/wind-tunnel") => {
                     if !is_authenticated(&req, &state) {
                         send_json_err(&mut stream, 401, "Not authenticated");
@@ -2487,7 +2682,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, Req, handle_submit, validate_unyt_agent_id, validate_wt_hostname};
+    use super::{
+        AppState, Req, handle_submit, json_bool, validate_unyt_agent_id,
+        validate_wind_tunnel_terms, validate_wt_hostname,
+    };
     use std::{
         io::Read,
         net::{TcpListener, TcpStream},
@@ -2564,6 +2762,20 @@ mod tests {
         assert!(validate_unyt_agent_id(&with_slash).is_some());
         let with_space = USER_AGENT_ID.replacen('Y', " ", 1);
         assert!(validate_unyt_agent_id(&with_space).is_some());
+    }
+
+    #[test]
+    fn wind_tunnel_requires_terms_acceptance() {
+        assert!(validate_wind_tunnel_terms("WIND_TUNNEL", false).is_err());
+        assert!(validate_wind_tunnel_terms("WIND_TUNNEL", true).is_ok());
+        assert!(validate_wind_tunnel_terms("STANDARD", false).is_ok());
+    }
+
+    #[test]
+    fn json_bool_reads_true_and_false_values() {
+        assert!(json_bool(r#"{"accepted":true}"#, "accepted", false));
+        assert!(!json_bool(r#"{"accepted":false}"#, "accepted", true));
+        assert!(json_bool(r#"{}"#, "accepted", true));
     }
 
     #[test]
