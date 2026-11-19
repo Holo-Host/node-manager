@@ -986,6 +986,7 @@ code{background:#1e2740;padding:1px 5px;border-radius:4px;font-family:monospace;
 .terms-modal-card{position:relative;background:#13162a;border:1px solid #4338ca;border-radius:16px;padding:28px;max-width:560px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.5)}
 .terms-modal-card h2{font-size:20px;font-weight:700;color:#f1f5f9;margin:0 36px 16px 0}
 .terms-modal-card p{font-size:14px;color:#cbd5e1;line-height:1.65;margin:0 0 14px}
+.terms-modal-card p.terms-modal-notice{font-size:12px;color:#94a3b8}
 .terms-modal-card a{color:#a5b4fc}
 .terms-modal-close{position:absolute;top:14px;right:16px;background:transparent;border:0;color:#94a3b8;font-size:26px;line-height:1;cursor:pointer}
 .terms-modal-accept{display:flex;align-items:center;gap:10px;font-size:15px;color:#f1f5f9;font-weight:600;cursor:pointer;margin-top:18px}
@@ -1064,6 +1065,7 @@ const WIND_TUNNEL_TERMS_MODAL_HTML: &str = r#"<div class="terms-modal" id="wt-te
     <h2 id="wt-terms-title">Wind Tunnel Participation</h2>
     <p>Running Wind Tunnel on this device makes it available to the Holochain Foundation for testing. Net Zero FZC pays HoloFuel to your payee address for the time this device is online and for the time it spends running tests, at the published rates.</p>
     <p>By selecting I accept you confirm you are 18 or over, you've read and accept the <a href="https://holochain.org/wind-tunnel-terms" target="_blank" rel="noopener noreferrer">Participation Terms (version 0.1)</a> and the HoloFuel Platform Terms, and the attributed payee address is yours.</p>
+    <p class="terms-modal-notice">Notices about the Programme go to the email address verified for this payee address's HoloFuel account.</p>
     <label class="terms-modal-accept"><span>I accept</span><input type="checkbox" id="wtTerms" onchange="acceptWindTunnelTerms()"></label>
   </div>
 </div>"#;
