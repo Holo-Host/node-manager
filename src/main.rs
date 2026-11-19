@@ -42,6 +42,7 @@ struct AppState {
     sessions:       Mutex<HashMap<String, SystemTime>>,
     onboarded:      AtomicBool,
     wind_tunnel_terms_accepted: AtomicBool,
+    wind_tunnel_terms_accepted_at: Mutex<String>,
     node_name:      Mutex<String>,
     hw_mode:        Mutex<String>,
     unyt_agent_id:       Mutex<String>,
@@ -60,6 +61,9 @@ impl AppState {
             onboarded:  AtomicBool::new(kv.get("onboarded").map(|v| v == "true").unwrap_or(false)),
             wind_tunnel_terms_accepted: AtomicBool::new(
                 kv.get("wind_tunnel_terms_accepted").map(|v| v == "true").unwrap_or(false),
+            ),
+            wind_tunnel_terms_accepted_at: Mutex::new(
+                kv.get("wind_tunnel_terms_accepted_at").cloned().unwrap_or_default(),
             ),
             node_name:     Mutex::new(kv.get("node_name").cloned().unwrap_or_default()),
             hw_mode:       Mutex::new(kv.get("hw_mode").cloned().unwrap_or_else(|| "STANDARD".into())),
@@ -438,11 +442,12 @@ fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn write_wind_tunnel_client_meta(unyt_agent_id: &str) {
+fn write_wind_tunnel_client_meta(unyt_agent_id: &str, terms_accepted_at: &str) {
     let id = json_escape(unyt_agent_id.trim());
+    let terms_accepted_at = json_escape(terms_accepted_at.trim());
     let json = format!(
-        "{{\n  \"client\": {{\n    \"meta\": {{\n      \"unyt_agent_id\": \"{}\"\n    }}\n  }}\n}}\n",
-        id
+        "{{\n  \"client\": {{\n    \"meta\": {{\n      \"unyt_agent_id\": \"{}\",\n      \"wind_tunnel_terms_accepted_at\": \"{}\"\n    }}\n  }}\n}}\n",
+        id, terms_accepted_at
     );
     let _ = fs::create_dir_all("/etc/node-manager");
     let _ = fs::write(WIND_TUNNEL_CLIENT_META, json);
@@ -523,7 +528,8 @@ fn resolve_wind_tunnel_config(state: &AppState) -> WindTunnelConfig {
 fn write_container_quadlets(hw_mode: &str, state: &AppState) {
     let cfg = resolve_wind_tunnel_config(state);
     let unyt = state.unyt_agent_id.lock().unwrap().clone();
-    write_wind_tunnel_client_meta(&unyt);
+    let terms_accepted_at = state.wind_tunnel_terms_accepted_at.lock().unwrap().clone();
+    write_wind_tunnel_client_meta(&unyt, &terms_accepted_at);
     let edgenode_image = resolve_edgenode_image();
     let log_sender = state.log_sender_endpoint.lock().unwrap().clone();
     let edgenode_autostart = hw_mode != "WIND_TUNNEL";
@@ -813,6 +819,19 @@ fn validate_wind_tunnel_terms(mode: &str, accepted: bool) -> Result<(), &'static
 fn accept_wind_tunnel_terms(state: &AppState) -> Result<(), String> {
     let mut kv = read_state_file();
     kv.insert("wind_tunnel_terms_accepted".into(), "true".into());
+    let terms_accepted_at = {
+        let mut timestamp = state.wind_tunnel_terms_accepted_at.lock().unwrap();
+        if timestamp.is_empty() {
+            *timestamp = kv
+                .get("wind_tunnel_terms_accepted_at")
+                .cloned()
+                .filter(|value| !value.is_empty())
+                .map(Ok)
+                .unwrap_or_else(current_utc_timestamp)?;
+        }
+        timestamp.clone()
+    };
+    kv.insert("wind_tunnel_terms_accepted_at".into(), terms_accepted_at);
     fs::create_dir_all("/etc/node-manager")
         .map_err(|e| format!("Failed to create node-manager state directory: {}", e))?;
     let content: String = kv.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
@@ -827,6 +846,43 @@ fn accept_wind_tunnel_terms(state: &AppState) -> Result<(), String> {
     }
     state.wind_tunnel_terms_accepted.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+fn current_utc_timestamp() -> Result<String, String> {
+    format_utc_timestamp(SystemTime::now())
+}
+
+fn format_utc_timestamp(time: SystemTime) -> Result<String, String> {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("Failed to determine Wind Tunnel terms acceptance time: {}", e))?
+        .as_secs();
+    let days = seconds / 86_400;
+    let seconds_of_day = seconds % 86_400;
+
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        seconds_of_day / 3_600,
+        seconds_of_day % 3_600 / 60,
+        seconds_of_day % 60
+    ))
 }
 
 fn json_str<'a>(json: &'a str, key: &str) -> &'a str {
@@ -2059,6 +2115,10 @@ fn handle_submit(
     kv.insert("seed_hash".into(), seed_hash);
     if terms_accepted {
         kv.insert("wind_tunnel_terms_accepted".into(), "true".into());
+        let timestamp = state.wind_tunnel_terms_accepted_at.lock().unwrap().clone();
+        if !timestamp.is_empty() {
+            kv.insert("wind_tunnel_terms_accepted_at".into(), timestamp);
+        }
         state.wind_tunnel_terms_accepted.store(true, Ordering::Relaxed);
     }
     write_state_file(&kv);
@@ -2685,13 +2745,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Req, handle_submit, json_bool, validate_unyt_agent_id,
+        AppState, Req, format_utc_timestamp, handle_submit, json_bool, validate_unyt_agent_id,
         validate_wind_tunnel_terms, validate_wt_hostname,
     };
     use std::{
         io::Read,
         net::{TcpListener, TcpStream},
         sync::{Arc, Mutex},
+        time::{Duration, UNIX_EPOCH},
     };
 
     const USER_AGENT_ID: &str = "uhCAkEgwsRQmYpVUGWSdNyziQgQZu1sfXVlVIR0sbEZJBd5N6wYr_";
@@ -2771,6 +2832,15 @@ mod tests {
         assert!(validate_wind_tunnel_terms("WIND_TUNNEL", false).is_err());
         assert!(validate_wind_tunnel_terms("WIND_TUNNEL", true).is_ok());
         assert!(validate_wind_tunnel_terms("STANDARD", false).is_ok());
+    }
+
+    #[test]
+    fn formats_terms_acceptance_timestamp_as_utc() {
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1_709_218_800);
+        assert_eq!(
+            format_utc_timestamp(timestamp).unwrap(),
+            "2024-02-29T15:00:00Z"
+        );
     }
 
     #[test]
