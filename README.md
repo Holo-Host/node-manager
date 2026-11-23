@@ -204,20 +204,20 @@ Every release publishes two binary assets:
 1. Make your changes on a `feature/*` branch off `develop`, then merge into `develop`.
 
 2. When ready to release, merge `develop` into `main` and update the version in **two places** — they must match exactly:
-   - `const VERSION: &str = "6.1.0";` in `src/main.rs`
-   - `version = "6.1.0"` in `Cargo.toml`
+   - `const VERSION: &str = "6.2.6";` in `src/main.rs`
+   - `version = "6.2.6"` in `Cargo.toml`
 
 3. Commit:
    ```bash
    git add src/main.rs Cargo.toml
-   git commit -m "release: v6.1.0 — <one line summary of changes>"
+   git commit -m "release: v6.2.6 — <one line summary of changes>"
    ```
 
 4. Tag and push:
    ```bash
-   git tag v6.1.0
+   git tag v6.2.6
    git push origin main
-   git push origin v6.1.0
+   git push origin v6.2.6
    ```
 
 5. GitHub Actions (`.github/workflows/release.yml`) picks up the tag, builds both binaries using musl static linking, creates a GitHub Release, and attaches both binary assets automatically. No manual upload needed.

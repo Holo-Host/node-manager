@@ -16,7 +16,7 @@ use bip39::{Language, Mnemonic};
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "6.2.5";
+const VERSION: &str = "6.2.6";
 const WT_HOSTNAME_MAX: usize = 63;
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
