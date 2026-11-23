@@ -263,7 +263,7 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 | `POST` | `/logout` | session | Clear session cookie |
 | `POST` | `/manage/auth/recover` | — | Reset password using seed phrase + new password |
 | `GET` | `/manage` | session | Management panel HTML |
-| `GET` | `/manage/status` | session | JSON node state snapshot (includes `has_seed_phrase`) |
+| `GET` | `/manage/status` | session | JSON node state snapshot, including observed container health, `hw_mode_enabled`, and the latest hardware-mode error |
 | `POST` | `/manage/auth/generate_seed` | session | Generate recovery seed for legacy nodes (one-time) |
 | `POST` | `/manage/ssh/add` | session | Add SSH public key |
 | `POST` | `/manage/ssh/remove` | session | Remove SSH key by index |
@@ -281,6 +281,8 @@ The `UPDATE_REPO` environment variable overrides the default (`holo-host/node-ma
 | `POST` | `/manage/update` | session | Trigger immediate update check |
 
 Session tokens are stored in-memory and cleared on restart — operators will need to log in again after an update.
+
+Hardware mode status is based on both the corresponding systemd service and Podman container actually running, not only the requested mode stored in node state. Failed Quadlet writes, systemd operations, and container starts are returned to the management UI and logged with service/journal diagnostics. Node Manager retries the requested mode every 30 seconds until synchronization succeeds.
 
 ---
 

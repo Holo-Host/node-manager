@@ -3,7 +3,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    process::Command,
+    process::{Command, Output},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -49,6 +49,8 @@ struct AppState {
     log_sender_endpoint: Mutex<String>,
     wt_image_override:   Mutex<String>,
     wt_entrypoint_bind:  Mutex<String>,
+    hardware_error:      Mutex<String>,
+    hardware_sync:       Mutex<()>,
 }
 
 impl AppState {
@@ -71,6 +73,8 @@ impl AppState {
             log_sender_endpoint: Mutex::new(kv.get("log_sender_endpoint").cloned().unwrap_or_default()),
             wt_image_override:  Mutex::new(kv.get("wt_image_override").cloned().unwrap_or_default()),
             wt_entrypoint_bind: Mutex::new(kv.get("wt_entrypoint_bind").cloned().unwrap_or_default()),
+            hardware_error:     Mutex::new(String::new()),
+            hardware_sync:      Mutex::new(()),
         }
     }
 }
@@ -439,20 +443,50 @@ fn validate_wt_hostname(node_name: &str) -> Option<String> {
 }
 
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut escaped = String::new();
+    for ch in s.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            ch if ch <= '\u{1f}' => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
-fn write_wind_tunnel_client_meta(unyt_agent_id: &str, terms_accepted_at: &str) {
+fn write_wind_tunnel_client_meta(unyt_agent_id: &str, terms_accepted_at: &str) -> Result<(), String> {
     let id = json_escape(unyt_agent_id.trim());
     let terms_accepted_at = json_escape(terms_accepted_at.trim());
     let json = format!(
         "{{\n  \"client\": {{\n    \"meta\": {{\n      \"unyt_agent_id\": \"{}\",\n      \"wind_tunnel_terms_accepted_at\": \"{}\"\n    }}\n  }}\n}}\n",
         id, terms_accepted_at
     );
-    let _ = fs::create_dir_all("/etc/node-manager");
-    let _ = fs::write(WIND_TUNNEL_CLIENT_META, json);
-    let _ = Command::new("chmod").args(["600", WIND_TUNNEL_CLIENT_META]).output();
-    let _ = fs::remove_file(WIND_TUNNEL_LEGACY_ENV);
+    fs::create_dir_all("/etc/node-manager")
+        .map_err(|e| format!("Failed to create node-manager directory: {}", e))?;
+    fs::write(WIND_TUNNEL_CLIENT_META, json)
+        .map_err(|e| format!("Failed to write {}: {}", WIND_TUNNEL_CLIENT_META, e))?;
+    run_checked_command(
+        "chmod",
+        &["600", WIND_TUNNEL_CLIENT_META],
+        "Secure Wind Tunnel client metadata",
+    )?;
+    match fs::remove_file(WIND_TUNNEL_LEGACY_ENV) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "Failed to remove legacy Wind Tunnel config {}: {}",
+                WIND_TUNNEL_LEGACY_ENV, e
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_node_name(node_name: &str) -> Option<String> {
@@ -525,11 +559,11 @@ fn resolve_wind_tunnel_config(state: &AppState) -> WindTunnelConfig {
     WindTunnelConfig { hostname, image, entrypoint_bind }
 }
 
-fn write_container_quadlets(hw_mode: &str, state: &AppState) {
+fn write_container_quadlets(hw_mode: &str, state: &AppState) -> Result<(), String> {
     let cfg = resolve_wind_tunnel_config(state);
     let unyt = state.unyt_agent_id.lock().unwrap().clone();
     let terms_accepted_at = state.wind_tunnel_terms_accepted_at.lock().unwrap().clone();
-    write_wind_tunnel_client_meta(&unyt, &terms_accepted_at);
+    write_wind_tunnel_client_meta(&unyt, &terms_accepted_at)?;
     let edgenode_image = resolve_edgenode_image();
     let log_sender = state.log_sender_endpoint.lock().unwrap().clone();
     let edgenode_autostart = hw_mode != "WIND_TUNNEL";
@@ -541,8 +575,14 @@ fn write_container_quadlets(hw_mode: &str, state: &AppState) {
         cfg.entrypoint_bind.as_deref(),
         wt_autostart,
     );
-    let _ = fs::write(format!("{}/edgenode.container", QUADLET_DIR), edgenode_quadlet);
-    let _ = fs::write(format!("{}/wind-tunnel.container", QUADLET_DIR), wt_quadlet);
+    fs::create_dir_all(QUADLET_DIR)
+        .map_err(|e| format!("Failed to create Quadlet directory {}: {}", QUADLET_DIR, e))?;
+    let edgenode_path = format!("{}/edgenode.container", QUADLET_DIR);
+    fs::write(&edgenode_path, edgenode_quadlet)
+        .map_err(|e| format!("Failed to write Quadlet {}: {}", edgenode_path, e))?;
+    let wt_path = format!("{}/wind-tunnel.container", QUADLET_DIR);
+    fs::write(&wt_path, wt_quadlet)
+        .map_err(|e| format!("Failed to write Quadlet {}: {}", wt_path, e))?;
     eprintln!(
         "[quadlet] hw_mode={} edgenode_autostart={} wt_autostart={}",
         hw_mode, edgenode_autostart, wt_autostart
@@ -551,44 +591,84 @@ fn write_container_quadlets(hw_mode: &str, state: &AppState) {
     if let Some(ep) = cfg.entrypoint_bind.as_deref() {
         eprintln!("[quadlet] entrypoint bind={}", ep);
     }
+    Ok(())
 }
 
-fn apply_wind_tunnel_config(state: &AppState) {
-    let hw_mode = state.hw_mode.lock().unwrap().clone();
-    write_container_quadlets(&hw_mode, state);
-    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-    if hw_mode == "WIND_TUNNEL" {
-        restart_wind_tunnel_if_running();
+fn remember_hardware_error(state: &AppState, error: &str) {
+    eprintln!("[container] hardware configuration failed: {}", error);
+    *state.hardware_error.lock().unwrap() = error.to_string();
+}
+
+fn apply_wind_tunnel_config(state: &AppState) -> Result<(), String> {
+    let _sync = state.hardware_sync.lock().unwrap();
+    let result = (|| {
+        let hw_mode = state.hw_mode.lock().unwrap().clone();
+        write_container_quadlets(&hw_mode, state)?;
+        run_checked_command("systemctl", &["daemon-reload"], "Reload systemd units")?;
+        if hw_mode == "WIND_TUNNEL" {
+            restart_wind_tunnel_if_running()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        remember_hardware_error(state, error);
     }
+    result
 }
 
-fn restart_wind_tunnel_if_running() {
+fn restart_wind_tunnel_if_running() -> Result<(), String> {
     let status = Command::new("systemctl")
         .args(["is-active", "wind-tunnel.service"])
         .output();
-    if status.map(|o| o.status.success()).unwrap_or(false) {
-        let _ = Command::new("systemctl").args(["restart", "wind-tunnel.service"]).output();
-        eprintln!("[quadlet] wind-tunnel.service restarted");
+    match status {
+        Ok(o) if o.status.success() => {
+            run_checked_command(
+                "systemctl",
+                &["restart", "wind-tunnel.service"],
+                "Restart wind-tunnel.service",
+            )?;
+            eprintln!("[quadlet] wind-tunnel.service restarted");
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("Check wind-tunnel.service state: {}", e)),
     }
+    Ok(())
 }
 
-fn restart_edgenode_if_running() {
+fn restart_edgenode_if_running() -> Result<(), String> {
     let status = Command::new("systemctl")
         .args(["is-active", "edgenode.service"])
         .output();
-    if status.map(|o| o.status.success()).unwrap_or(false) {
-        let _ = Command::new("systemctl").args(["restart", "edgenode.service"]).output();
-        eprintln!("[quadlet] edgenode.service restarted");
+    match status {
+        Ok(o) if o.status.success() => {
+            run_checked_command(
+                "systemctl",
+                &["restart", "edgenode.service"],
+                "Restart edgenode.service",
+            )?;
+            eprintln!("[quadlet] edgenode.service restarted");
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("Check edgenode.service state: {}", e)),
     }
+    Ok(())
 }
 
-fn apply_edgenode_config(state: &AppState) {
-    let hw_mode = state.hw_mode.lock().unwrap().clone();
-    write_container_quadlets(&hw_mode, state);
-    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-    if hw_mode != "WIND_TUNNEL" {
-        restart_edgenode_if_running();
+fn apply_edgenode_config(state: &AppState) -> Result<(), String> {
+    let _sync = state.hardware_sync.lock().unwrap();
+    let result = (|| {
+        let hw_mode = state.hw_mode.lock().unwrap().clone();
+        write_container_quadlets(&hw_mode, state)?;
+        run_checked_command("systemctl", &["daemon-reload"], "Reload systemd units")?;
+        if hw_mode != "WIND_TUNNEL" {
+            restart_edgenode_if_running()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        remember_hardware_error(state, error);
     }
+    result
 }
 
 fn validate_log_sender_endpoint(url: &str) -> Option<String> {
@@ -606,11 +686,7 @@ fn validate_log_sender_endpoint(url: &str) -> Option<String> {
 // ── EdgeNode / Moss bridge ─────────────────────────────────────────────────────
 
 fn edgenode_running() -> bool {
-    Command::new("systemctl")
-        .args(["is-active", "edgenode.service"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    mode_health("STANDARD").running
 }
 
 fn shell_single_quote(s: &str) -> String {
@@ -746,48 +822,275 @@ fn container_services_for_mode(hw_mode: &str) -> (&'static str, &'static str) {
     }
 }
 
-fn container_service_active(hw_mode: &str) -> bool {
-    let (active, _) = container_services_for_mode(hw_mode);
-    Command::new("systemctl")
-        .args(["is-active", active])
+fn output_details(output: &Output) -> String {
+    let mut details = output.status.to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stdout.is_empty() {
+        details.push_str(&format!("\nstdout: {}", stdout));
+    }
+    if !stderr.is_empty() {
+        details.push_str(&format!("\nstderr: {}", stderr));
+    }
+    details
+}
+
+fn run_checked_command(program: &str, args: &[&str], action: &str) -> Result<Output, String> {
+    let output = Command::new(program)
+        .args(args)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .map_err(|e| format!("{}: failed to execute {}: {}", action, program, e))?;
+    if !output.status.success() {
+        return Err(format!("{} failed: {}", action, output_details(&output)));
+    }
+    Ok(output)
 }
 
-fn sync_container_services(hw_mode: &str, state: &AppState) {
-    write_container_quadlets(hw_mode, state);
-    let _ = fs::write("/var/lib/edgenode/mode_switch.txt", hw_mode);
-    let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-    let (active, inactive) = container_services_for_mode(hw_mode);
-    let _ = Command::new("systemctl").args(["stop", inactive]).output();
-    let _ = Command::new("systemctl").args(["reset-failed", active]).output();
-    let out = Command::new("systemctl").args(["start", active]).output();
-    match &out {
-        Ok(o) if o.status.success() => {
-            eprintln!("[container] started {} stopped {}", active, inactive);
+fn service_diagnostics(service: &str) -> String {
+    let mut details = String::new();
+    for (program, args, label) in [
+        ("systemctl", vec!["status", "--no-pager", "--full", service], "systemctl status"),
+        ("journalctl", vec!["-u", service, "-n", "40", "--no-pager"], "journalctl"),
+    ] {
+        match Command::new(program).args(&args).output() {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if !text.is_empty() {
+                    details.push_str(&format!("\n{}:\n{}", label, text));
+                }
+                if !stderr.is_empty() {
+                    details.push_str(&format!("\n{} stderr:\n{}", label, stderr));
+                }
+            }
+            Err(e) => details.push_str(&format!("\n{} could not run: {}", label, e)),
         }
-        Ok(o) => {
-            eprintln!(
-                "[container] start {} failed: {}{}",
-                active,
-                String::from_utf8_lossy(&o.stderr),
-                String::from_utf8_lossy(&o.stdout),
-            );
+    }
+    let service_name = service.strip_suffix(".service").unwrap_or(service);
+    match Command::new("journalctl")
+        .args(["-b", "-t", "systemd", "-n", "200", "--no-pager"])
+        .output()
+    {
+        Ok(output) => {
+            let journal = String::from_utf8_lossy(&output.stdout);
+            let relevant: Vec<_> = journal
+                .lines()
+                .filter(|line| {
+                    let line = line.to_ascii_lowercase();
+                    line.contains("quadlet") || line.contains(&service_name.to_ascii_lowercase())
+                })
+                .collect();
+            if !relevant.is_empty() {
+                details.push_str(&format!(
+                    "\nsystemd Quadlet/generator logs:\n{}",
+                    relevant.join("\n")
+                ));
+            }
         }
-        Err(e) => eprintln!("[container] start {} error: {}", active, e),
+        Err(e) => details.push_str(&format!("\nsystemd journal could not run: {}", e)),
+    }
+    details
+}
+
+struct ModeHealth {
+    running: bool,
+    error: Option<String>,
+}
+
+fn mode_health(hw_mode: &str) -> ModeHealth {
+    let (service, _) = container_services_for_mode(hw_mode);
+    let container = if hw_mode == "WIND_TUNNEL" {
+        "wind-tunnel"
+    } else {
+        "edgenode"
+    };
+    let mut errors = Vec::new();
+    let service_active = match Command::new("systemctl")
+        .args(["is-active", service])
+        .output()
+    {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "active" =>
+        {
+            true
+        }
+        Ok(output) => {
+            let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            errors.push(format!(
+                "{} is not active ({}): {}",
+                service,
+                state,
+                output_details(&output)
+            ));
+            false
+        }
+        Err(e) => {
+            errors.push(format!("Failed to check {}: {}", service, e));
+            false
+        }
+    };
+    let container_running = match Command::new("podman")
+        .args(["inspect", "--format", "{{.State.Status}}", container])
+        .output()
+    {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "running" =>
+        {
+            true
+        }
+        Ok(output) => {
+            errors.push(format!(
+                "Podman container {} is not running: {}",
+                container,
+                output_details(&output)
+            ));
+            false
+        }
+        Err(e) => {
+            errors.push(format!(
+                "Failed to inspect Podman container {}: {}",
+                container, e
+            ));
+            false
+        }
+    };
+    ModeHealth {
+        running: service_active && container_running,
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("\n"))
+        },
     }
 }
 
-fn apply_hardware_mode(new_mode: &str, state: &AppState) {
-    let current = state.hw_mode.lock().unwrap().clone();
+fn selected_mode_error(hw_mode: &str, edge: &ModeHealth, wind: &ModeHealth) -> Option<String> {
+    let (selected, other) = if hw_mode == "WIND_TUNNEL" {
+        (wind, edge)
+    } else {
+        (edge, wind)
+    };
+    if selected.running && !other.running {
+        return None;
+    }
+    let mut errors = Vec::new();
+    if let Some(error) = &selected.error {
+        errors.push(error.clone());
+    }
+    if selected.running && other.running {
+        errors.push("Both hardware-mode containers are running; exactly one must be active.".into());
+    } else if other.running {
+        errors.push(format!(
+            "Configured hardware mode {} is not running, but the other mode is active.",
+            hw_mode
+        ));
+    }
+    if errors.is_empty() {
+        errors.push(format!("{} is not enabled.", hw_mode));
+    }
+    Some(errors.join("\n"))
+}
+
+fn sync_container_services_inner(hw_mode: &str, state: &AppState) -> Result<(), String> {
+    let result = (|| {
+        write_container_quadlets(hw_mode, state)?;
+        fs::write("/var/lib/edgenode/mode_switch.txt", hw_mode)
+            .map_err(|e| format!("Failed to write hardware mode marker: {}", e))?;
+        run_checked_command("systemctl", &["daemon-reload"], "Reload systemd units")?;
+        let (active, inactive) = container_services_for_mode(hw_mode);
+        match Command::new("systemctl")
+            .args(["is-active", inactive])
+            .output()
+        {
+            Ok(output)
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() == "active" =>
+            {
+                run_checked_command(
+                    "systemctl",
+                    &["stop", inactive],
+                    &format!("Stop {}", inactive),
+                )?;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("Check {} state: {}", inactive, e)),
+        }
+        let mut command_errors = Vec::new();
+        if let Err(error) = run_checked_command(
+            "systemctl",
+            &["reset-failed", active],
+            &format!("Reset failed state for {}", active),
+        ) {
+            command_errors.push(error);
+        }
+        if let Err(error) = run_checked_command(
+            "systemctl",
+            &["start", active],
+            &format!("Start {}", active),
+        ) {
+            command_errors.push(error);
+            return Err(format!(
+                "{}{}",
+                command_errors.join("\n"),
+                service_diagnostics(active)
+            ));
+        }
+        let edge = mode_health("STANDARD");
+        let wind = mode_health("WIND_TUNNEL");
+        if let Some(error) = selected_mode_error(hw_mode, &edge, &wind) {
+            command_errors.push(format!(
+                "Hardware mode {} did not become active:\n{}",
+                hw_mode, error
+            ));
+        }
+        if !command_errors.is_empty() {
+            return Err(format!(
+                "{}{}",
+                command_errors.join("\n"),
+                service_diagnostics(active)
+            ));
+        }
+        eprintln!("[container] started {} stopped {}", active, inactive);
+        Ok(())
+    })();
+
+    match &result {
+        Ok(()) => state.hardware_error.lock().unwrap().clear(),
+        Err(error) => {
+            eprintln!("[container] hardware mode {} failed: {}", hw_mode, error);
+            *state.hardware_error.lock().unwrap() = error.clone();
+        }
+    }
+    result
+}
+
+fn sync_container_services(state: &AppState) -> Result<(), String> {
+    let _sync = state.hardware_sync.lock().unwrap();
+    let hw_mode = state.hw_mode.lock().unwrap().clone();
+    sync_container_services_inner(&hw_mode, state)
+}
+
+fn persist_hardware_mode(hw_mode: &str) -> Result<(), String> {
+    let mut kv = read_state_file();
+    kv.insert("hw_mode".into(), hw_mode.into());
+    fs::create_dir_all("/etc/node-manager")
+        .map_err(|e| format!("Failed to create node-manager state directory: {}", e))?;
+    let content: String = kv.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
+    fs::write(STATE_FILE, content)
+        .map_err(|e| format!("Failed to save hardware mode: {}", e))?;
+    run_checked_command("chmod", &["600", STATE_FILE], "Secure node-manager state")?;
+    Ok(())
+}
+
+fn apply_hardware_mode(new_mode: &str, state: &AppState) -> Result<(), String> {
+    let _sync = state.hardware_sync.lock().unwrap();
+    persist_hardware_mode(new_mode)?;
     *state.hw_mode.lock().unwrap() = new_mode.to_string();
-    update_state_key("hw_mode", new_mode);
-    if current != new_mode {
-        let (active, inactive) = container_services_for_mode(new_mode);
-        eprintln!("[manage] Switching {} → {}", inactive, active);
-        sync_container_services(new_mode, state);
-    }
+    let (active, inactive) = container_services_for_mode(new_mode);
+    eprintln!("[manage] Switching {} → {}", inactive, active);
+    sync_container_services_inner(new_mode, state)
 }
 
 // ── JSON / HTML helpers ────────────────────────────────────────────────────────
@@ -1394,7 +1697,7 @@ fn build_manage_html(state: &AppState) -> String {
 
     let sel_std = if hw_mode != "WIND_TUNNEL" { " sel" } else { "" };
     let sel_wt  = if hw_mode == "WIND_TUNNEL"  { " sel" } else { "" };
-    let hw_mode_display = if hw_mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "EdgeNode" };
+    let hw_mode_display = "Checking…";
     let moss_disabled = hw_mode == "WIND_TUNNEL";
     let moss_disabled_msg = if moss_disabled {
         r#"<div class="info-box" style="margin-bottom:14px">Moss Groups are only available in Standard EdgeNode mode. Switch to Standard EdgeNode mode above to join and manage groups.</div>"#
@@ -1433,6 +1736,7 @@ fn build_manage_html(state: &AppState) -> String {
 .section-badge{{font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px}}
 .badge-green{{background:#0d2618;border:1px solid #166534;color:#86efac}}
 .badge-gray{{background:#1a1d27;border:1px solid #3d4468;color:#64748b}}
+.badge-red{{background:#2d1515;border:1px solid #7f1d1d;color:#fca5a5}}
 .section-arrow{{color:#475569;font-size:12px}}
 .section-body{{padding:4px 32px 20px;display:none}}
 .key-row{{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #1e2030}}
@@ -1465,7 +1769,7 @@ fn build_manage_html(state: &AppState) -> String {
     <form method="POST" action="/logout" style="margin:0"><button type="submit" class="logout">Log out</button></form>
   </div>
   <div class="info-row">
-    <div class="info-item">Mode <span id="info-hw">{hw_mode_display}</span></div>
+    <div class="info-item">Active mode <span id="info-hw">{hw_mode_display}</span></div>
     <div class="info-item">Unyt <span id="info-unyt">{unyt_badge_text}</span></div>
   </div>
   <div class="seed-banner" id="seed-migrate-banner">
@@ -1490,20 +1794,21 @@ fn build_manage_html(state: &AppState) -> String {
   <!-- MODE -->
   <div class="section">
     <div class="section-hdr" onclick="toggleSection('hw')">
-      <div class="section-title"><span>⚙️</span> Mode <span class="section-badge badge-green" id="hw-badge">{hw_mode_display}</span></div>
+      <div class="section-title"><span>⚙️</span> Mode <span class="section-badge badge-gray" id="hw-badge">{hw_mode_display}</span></div>
       <span class="section-arrow" id="arr-hw">▼</span>
     </div>
     <div class="section-body" id="sec-hw">
       <div class="hw-opts">
         <div class="hw-opt{sel_std}" data-mode="STANDARD" onclick="selHw('STANDARD')">
           <div class="hw-opt-name">🌐 Standard EdgeNode</div>
-          <div class="hw-opt-desc">Always-on Holochain peer</div>
+          <div class="hw-opt-desc">Always-on Holochain peer · <span id="hw-standard-status">Checking…</span></div>
         </div>
         <div class="hw-opt{sel_wt}" data-mode="WIND_TUNNEL" onclick="selHw('WIND_TUNNEL')">
           <div class="hw-opt-name">🌀 Wind Tunnel</div>
-          <div class="hw-opt-desc">Network stress-tester</div>
+          <div class="hw-opt-desc">Network stress-tester · <span id="hw-wind-status">Checking…</span></div>
         </div>
       </div>
+      <div class="err-box" id="hw-error" style="display:none;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:12px"></div>
       <div style="margin-top:10px"><button class="btn btn-primary" onclick="saveHardware()">Apply Mode</button></div>
     </div>
   </div>
@@ -1835,13 +2140,38 @@ async function loadNodeStatus(){{
   try{{
     const r=await fetch('/manage/status',{{credentials:'same-origin'}});
     if(r.status===401){{location.href='/login';return;}}
-    if(!r.ok)return;
+    if(!r.ok)throw new Error('Status request failed ('+r.status+')');
     const data=await r.json();
+    const edge=data.edgenode_running===true;
+    const wind=data.wind_tunnel_running===true;
+    const active=edge&&!wind?'EdgeNode':wind&&!edge?'Wind Tunnel':edge&&wind?'Conflicting modes':'No mode enabled';
+    const badge=document.getElementById('hw-badge');
+    const info=document.getElementById('info-hw');
+    const error=document.getElementById('hw-error');
+    const enabled=data.hw_mode_enabled===true;
+    badge.textContent=active;
+    badge.classList.remove('badge-green','badge-gray','badge-red');
+    badge.classList.add(edge!==wind?'badge-green':active==='Conflicting modes'?'badge-red':'badge-gray');
+    info.textContent=active;
+    document.getElementById('hw-standard-status').textContent=edge?'RUNNING':'Not running';
+    document.getElementById('hw-wind-status').textContent=wind?'RUNNING':'Not running';
+    if(enabled&&!data.hw_mode_error){{error.style.display='none';error.textContent='';}}
+    else{{
+      error.style.display='block';
+      error.textContent=data.hw_mode_error||'The requested hardware mode is not running. Node Manager will retry automatically.';
+    }}
     if(data.has_seed_phrase===false){{
       const banner=document.getElementById('seed-migrate-banner');
       if(banner)banner.classList.add('vis');
     }}
-  }}catch(e){{}}
+  }}catch(e){{
+    const badge=document.getElementById('hw-badge');
+    const info=document.getElementById('info-hw');
+    const error=document.getElementById('hw-error');
+    if(badge){{badge.textContent='Status unavailable';badge.classList.remove('badge-green','badge-gray');badge.classList.add('badge-red');}}
+    if(info)info.textContent='Status unavailable';
+    if(error){{error.style.display='block';error.textContent='Could not retrieve hardware mode status: '+e.message;}}
+  }}
 }}
 
 async function generateSeedPhrase(){{
@@ -1866,6 +2196,7 @@ function ackSeedPhrase(){{
 }}
 
 loadNodeStatus();
+setInterval(loadNodeStatus,15000);
 
 function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
 
@@ -1959,11 +2290,10 @@ async function applyWindTunnel(){{
 async function saveHardware(){{
   if(curHw==='WIND_TUNNEL'&&!wtTermsAccepted)return toast('Accept the Wind Tunnel Terms & Conditions before enabling this mode',false);
   try{{
-    await api('/manage/hardware',{{mode:curHw,windTunnelTermsAccepted:wtTermsAccepted}});
-    document.getElementById('hw-badge').textContent=curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
-    document.getElementById('info-hw').textContent=curHw==='WIND_TUNNEL'?'Wind Tunnel':'EdgeNode';
-    toast('Mode updated',true);
-  }}catch(e){{toast('Error: '+e.message,false);}}
+    const result=await api('/manage/hardware',{{mode:curHw,windTunnelTermsAccepted:wtTermsAccepted}});
+    await loadNodeStatus();
+    toast(result.hw_mode_enabled?'Mode enabled':'Mode requested; waiting for the container',result.hw_mode_enabled);
+  }}catch(e){{await loadNodeStatus();toast('Error: '+e.message,false);}}
 }}
 
 async function changePassword(){{
@@ -2123,7 +2453,9 @@ fn handle_submit(
     }
     write_state_file(&kv);
 
-    sync_container_services(hw_mode_val, state);
+    if let Err(error) = sync_container_services(state) {
+        eprintln!("[onboard] Hardware mode is not active yet: {}", error);
+    }
 
     eprintln!("[onboard] Complete. node={} hw={} unyt={}", node_name, hw_mode, if unyt_agent_id.is_empty() { "(none)" } else { "set" });
     send_json_ok(stream, &format!(
@@ -2195,20 +2527,34 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let uptime    = state.start_time.elapsed().unwrap_or_default().as_secs();
     let keys      = read_ssh_keys();
     let keys_json: String = keys.iter()
-        .map(|k| format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")))
+        .map(|k| format!("\"{}\"", json_escape(k)))
         .collect::<Vec<_>>().join(",");
     let log_sender_endpoint = state.log_sender_endpoint.lock().unwrap().clone();
-    let edgenode_up = edgenode_running();
+    let edge_health = mode_health("STANDARD");
+    let wind_health = mode_health("WIND_TUNNEL");
+    let mode_error = selected_mode_error(&hw_mode, &edge_health, &wind_health);
+    let hw_mode_enabled = mode_error.is_none();
+    let last_error = state.hardware_error.lock().unwrap().clone();
+    let reported_error = if !last_error.is_empty() {
+        last_error
+    } else if hw_mode_enabled {
+        String::new()
+    } else {
+        mode_error.unwrap_or_default()
+    };
     let has_seed = has_seed_phrase();
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","unyt_agent_id":"{}","log_sender_endpoint":"{}","edgenode_running":{},"wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"has_seed_phrase":{}}}"#,
-        VERSION,
-        node_name.replace('\\', "\\\\").replace('"', "\\\""),
-        hw_mode,
-        unyt_agent_id.replace('\\', "\\\\").replace('"', "\\\""),
-        log_sender_endpoint.replace('\\', "\\\\").replace('"', "\\\""),
-        if edgenode_up { "true" } else { "false" },
-        wt_hostname.replace('\\', "\\\\").replace('"', "\\\""),
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","hw_mode_enabled":{},"hw_mode_error":"{}","edgenode_running":{},"wind_tunnel_running":{},"unyt_agent_id":"{}","log_sender_endpoint":"{}","wt_hostname":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"has_seed_phrase":{}}}"#,
+        json_escape(VERSION),
+        json_escape(&node_name),
+        json_escape(&hw_mode),
+        if hw_mode_enabled { "true" } else { "false" },
+        json_escape(&reported_error),
+        if edge_health.running { "true" } else { "false" },
+        if wind_health.running { "true" } else { "false" },
+        json_escape(&unyt_agent_id),
+        json_escape(&log_sender_endpoint),
+        json_escape(&wt_hostname),
         keys.len(), keys_json, uptime,
         if has_seed { "true" } else { "false" }
     ));
@@ -2267,7 +2613,10 @@ fn handle_nodename(
 
     update_state_key("node_name", node_name);
     *state.node_name.lock().unwrap() = node_name.to_string();
-    apply_wind_tunnel_config(state);
+    if let Err(error) = apply_wind_tunnel_config(state) {
+        send_json_err(stream, 500, &error);
+        return;
+    }
 
     let wt_hostname = build_wt_hostname(node_name);
     eprintln!("[manage] Node name updated to {} (wt_hostname={})", node_name, wt_hostname);
@@ -2291,8 +2640,14 @@ fn handle_unyt(
     update_state_key("unyt_agent_id", unyt_agent_id);
     *state.unyt_agent_id.lock().unwrap() = unyt_agent_id.to_string();
 
-    apply_wind_tunnel_config(state);
-    apply_edgenode_config(state);
+    if let Err(error) = apply_wind_tunnel_config(state) {
+        send_json_err(stream, 500, &error);
+        return;
+    }
+    if let Err(error) = apply_edgenode_config(state) {
+        send_json_err(stream, 500, &error);
+        return;
+    }
 
     eprintln!("[manage] Unyt Agent ID updated.");
     send_json_ok(stream, r#"{"status":"ok"}"#);
@@ -2315,9 +2670,12 @@ fn handle_hardware(
             send_json_err(stream, 500, &msg); return;
         }
     }
-    apply_hardware_mode(mode, state);
+    if let Err(error) = apply_hardware_mode(mode, state) {
+        send_json_err(stream, 503, &error);
+        return;
+    }
     eprintln!("[manage] Hardware mode switched to {}", mode);
-    send_json_ok(stream, r#"{"status":"ok"}"#);
+    send_json_ok(stream, r#"{"status":"ok","hw_mode_enabled":true}"#);
 }
 
 fn handle_wind_tunnel_consent(stream: &mut TcpStream, req: &Req, state: &AppState) {
@@ -2356,7 +2714,10 @@ fn handle_wind_tunnel(
     }
 
     if json_bool(body, "apply", true) {
-        apply_wind_tunnel_config(state);
+        if let Err(error) = apply_wind_tunnel_config(state) {
+            send_json_err(stream, 500, &error);
+            return;
+        }
     }
 
     let cfg = resolve_wind_tunnel_config(state);
@@ -2410,7 +2771,10 @@ fn handle_log_sender(
     }
     update_state_key("log_sender_endpoint", endpoint);
     *state.log_sender_endpoint.lock().unwrap() = endpoint.to_string();
-    apply_edgenode_config(state);
+    if let Err(error) = apply_edgenode_config(state) {
+        send_json_err(stream, 500, &error);
+        return;
+    }
     eprintln!("[manage] Log sender endpoint updated");
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
@@ -2505,23 +2869,39 @@ fn main() {
             && !state.wind_tunnel_terms_accepted.load(Ordering::Relaxed)
         {
             eprintln!("[migration] Wind Tunnel terms not accepted; switching node to STANDARD");
-            apply_hardware_mode("STANDARD", &state);
+            if let Err(error) = apply_hardware_mode("STANDARD", &state) {
+                eprintln!("[migration] Hardware mode switch failed: {}", error);
+            }
         }
-        let hw_mode = state.hw_mode.lock().unwrap().clone();
-        sync_container_services(&hw_mode, &state);
+        if let Err(error) = sync_container_services(&state) {
+            eprintln!("[container] Initial hardware mode sync failed: {}", error);
+        }
+    }
 
-        let state_retry = Arc::clone(&state);
-        let hw_retry = hw_mode.clone();
-        thread::spawn(move || {
-            for secs in [30u64, 60, 120] {
-                thread::sleep(Duration::from_secs(secs));
-                if !container_service_active(&hw_retry) {
-                    eprintln!("[container] retry sync after {}s", secs);
-                    sync_container_services(&hw_retry, &state_retry);
+    let state_retry = Arc::clone(&state);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            if !state_retry.onboarded.load(Ordering::Relaxed) {
+                continue;
+            }
+            let hw_retry = state_retry.hw_mode.lock().unwrap().clone();
+            let edge = mode_health("STANDARD");
+            let wind = mode_health("WIND_TUNNEL");
+            let mode_error = selected_mode_error(&hw_retry, &edge, &wind);
+            let last_error = state_retry.hardware_error.lock().unwrap().clone();
+            if mode_error.is_some() || !last_error.is_empty() {
+                eprintln!(
+                    "[container] retrying {}: {}",
+                    hw_retry,
+                    mode_error.as_deref().unwrap_or(&last_error)
+                );
+                if let Err(error) = sync_container_services(&state_retry) {
+                    eprintln!("[container] Automatic retry failed: {}", error);
                 }
             }
-        });
-    }
+        }
+    });
 
     // Spawn background update checker
     let repo = env::var(UPDATE_REPO_ENV).unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
@@ -2745,8 +3125,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Req, format_utc_timestamp, handle_submit, json_bool, validate_unyt_agent_id,
-        validate_wind_tunnel_terms, validate_wt_hostname,
+        AppState, ModeHealth, Req, format_utc_timestamp, handle_submit, json_bool, json_escape,
+        selected_mode_error, validate_unyt_agent_id, validate_wind_tunnel_terms,
+        validate_wt_hostname,
     };
     use std::{
         io::Read,
@@ -2848,6 +3229,31 @@ mod tests {
         assert!(json_bool(r#"{"accepted":true}"#, "accepted", false));
         assert!(!json_bool(r#"{"accepted":false}"#, "accepted", true));
         assert!(json_bool(r#"{}"#, "accepted", true));
+    }
+
+    #[test]
+    fn json_escape_preserves_valid_json_for_command_errors() {
+        assert_eq!(
+            json_escape("quadlet \"failed\"\nreason\t\x01"),
+            "quadlet \\\"failed\\\"\\nreason\\t\\u0001"
+        );
+    }
+
+    #[test]
+    fn hardware_mode_is_enabled_only_when_selected_mode_is_the_only_running_mode() {
+        let running = ModeHealth { running: true, error: None };
+        let stopped = ModeHealth {
+            running: false,
+            error: Some("service inactive".into()),
+        };
+        assert!(selected_mode_error("STANDARD", &running, &stopped).is_none());
+        assert!(selected_mode_error("WIND_TUNNEL", &stopped, &running).is_none());
+        assert!(selected_mode_error("STANDARD", &stopped, &running)
+            .unwrap()
+            .contains("Configured hardware mode STANDARD is not running"));
+        assert!(selected_mode_error("WIND_TUNNEL", &stopped, &stopped)
+            .unwrap()
+            .contains("service inactive"));
     }
 
     #[test]
