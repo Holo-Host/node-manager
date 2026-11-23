@@ -601,7 +601,7 @@ fn remember_hardware_error(state: &AppState, error: &str) {
 
 fn apply_wind_tunnel_config(state: &AppState) -> Result<(), String> {
     let _sync = state.hardware_sync.lock().unwrap();
-    let result = (|| {
+    let result: Result<(), String> = (|| {
         let hw_mode = state.hw_mode.lock().unwrap().clone();
         write_container_quadlets(&hw_mode, state)?;
         run_checked_command("systemctl", &["daemon-reload"], "Reload systemd units")?;
@@ -656,7 +656,7 @@ fn restart_edgenode_if_running() -> Result<(), String> {
 
 fn apply_edgenode_config(state: &AppState) -> Result<(), String> {
     let _sync = state.hardware_sync.lock().unwrap();
-    let result = (|| {
+    let result: Result<(), String> = (|| {
         let hw_mode = state.hw_mode.lock().unwrap().clone();
         write_container_quadlets(&hw_mode, state)?;
         run_checked_command("systemctl", &["daemon-reload"], "Reload systemd units")?;
