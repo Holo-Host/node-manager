@@ -2510,14 +2510,16 @@ fn main() {
         let hw_mode = state.hw_mode.lock().unwrap().clone();
         sync_container_services(&hw_mode, &state);
 
+        // Re-read hw_mode on each retry: the operator may switch modes after
+        // startup, and a stale copy would revert the containers to the old mode.
         let state_retry = Arc::clone(&state);
-        let hw_retry = hw_mode.clone();
         thread::spawn(move || {
             for secs in [30u64, 60, 120] {
                 thread::sleep(Duration::from_secs(secs));
-                if !container_service_active(&hw_retry) {
+                let hw = state_retry.hw_mode.lock().unwrap().clone();
+                if !container_service_active(&hw) {
                     eprintln!("[container] retry sync after {}s", secs);
-                    sync_container_services(&hw_retry, &state_retry);
+                    sync_container_services(&hw, &state_retry);
                 }
             }
         });
